@@ -11,6 +11,9 @@ T9 扩展：verify_with_usage(screenshot, criteria) -> VerifyVerdict——
 返回判定 + 本次调用 token 用量（resp.usage），供 worker 写
 evidence.brain_tokens / cost_est；verify 委托其实现（协议不变）。
 供应商响应缺 usage 字段时按零用量记账（旧替身/代理兼容），不影响判定。
+2026-10-06 扩展：suggest / suggest_with_usage——读取链兜底诊断，输出
+FallbackSuggestion {diagnosis, action, target, confidence}（同 json_object
+与解析容忍机制）。
 
 错误策略（不吞）：非法输出（非 JSON / 字段类型错 / 空 content）与供应商
 错误（openai.APIError 族）一律抛 BrainUnavailableError，由调用方
@@ -22,11 +25,24 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from hr_workbuddy import FallbackSuggestion
+
 from app.brain.usage import BrainUsage, VerifyVerdict
 
 VERIFY_PROMPT = (
     "你是招聘系统的视觉校验器。请根据截图判断以下标准是否满足，"
     '输出 JSON 对象 {{"ok": bool, "reason": str}}。\n标准：{criteria}'
+)
+
+# 读取链兜底诊断 prompt（2026-10-06）：结构化建议 + 动作优先级约束
+SUGGEST_PROMPT = (
+    "你是招聘系统页面自动化的视觉诊断助手。自动化操作失败，请根据截图诊断"
+    "页面当前状态，并给出一个修复动作建议。输出 JSON 对象 "
+    '{{"diagnosis": str, "action": str, "target": str, "confidence": float}}。'
+    "action 取值：click_text（target=需要点击的元素上的文本，优先选用）；"
+    "click_coords（target=\"x,y\"，截图像素坐标，左上角为原点——仅在无法给出"
+    "稳定文本时选用）；none（无法确定）。confidence 为 0-1 置信度。\n"
+    "失败上下文：{context}"
 )
 
 # 输出契约（以 prompt 声明 + 解析层校验兑现；T12 后不再作为 response_format 发出
@@ -116,16 +132,60 @@ class OpenAIBrain:
         self._last_usage = _extract_usage(resp)
         return VerifyVerdict(ok=verdict.ok, usage=self._last_usage)
 
+    def suggest(self, screenshot: bytes, context: str) -> FallbackSuggestion:
+        """读取链兜底诊断（协议入口，不带用量）。"""
+        return self.suggest_with_usage(screenshot, context)[0]
+
+    def suggest_with_usage(
+        self, screenshot: bytes, context: str
+    ) -> tuple[FallbackSuggestion, BrainUsage]:
+        """诊断 + 用量（供 cost 记账）；错误策略同 verify（抛 BrainUnavailableError）。"""
+        from openai import APIError
+
+        data_url = "data:image/png;base64," + base64.b64encode(screenshot).decode("ascii")
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": SUGGEST_PROMPT.format(context=context)},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+            suggestion = _parse_suggestion(content)
+        except APIError as e:
+            raise BrainUnavailableError(f"供应商错误：{e}") from e
+        except (ValidationError, ValueError, TypeError, IndexError, AttributeError) as e:
+            raise BrainUnavailableError(f"非法输出：{e}") from e
+        self._last_usage = _extract_usage(resp)
+        return suggestion, self._last_usage
+
 
 def _parse_verdict(content: Any) -> BrainVerdict:
     """解析校验输出：容忍 ```json 代码围栏包裹，其余按契约严格校验（extra=forbid）。"""
+    return BrainVerdict.model_validate_json(_strip_code_fences(content))
+
+
+def _parse_suggestion(content: Any) -> FallbackSuggestion:
+    """解析兜底建议：容忍 ```json 围栏；契约 extra=forbid（非法动作值即拒）。"""
+    return FallbackSuggestion.model_validate_json(_strip_code_fences(content))
+
+
+def _strip_code_fences(content: Any) -> str:
+    """剥离 ```json / ``` 代码围栏（T12 实测：模型偶尔包裹）。"""
     text = str(content or "").strip()
     if text.startswith("```"):
         text = text.strip("`").strip()
         if text.lower().startswith("json"):
             text = text[4:]
         text = text.strip()
-    return BrainVerdict.model_validate_json(text)
+    return text
 
 
 def _extract_usage(resp: Any) -> BrainUsage:

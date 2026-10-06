@@ -20,6 +20,7 @@ from hr_workbuddy import (
     AtomicTaskType,
     BrainClient,
     CandidateStatus,
+    FallbackSuggestion,
     LiepinDriver,
     MinimalResume,
     ScreenRequest,
@@ -238,6 +239,9 @@ class _StubLiepinDriver:
 class _StubBrain:
     def verify(self, screenshot: bytes, criteria: str) -> bool:
         return True
+
+    def suggest(self, screenshot: bytes, context: str):
+        return FallbackSuggestion(diagnosis="stub", action="none", confidence=0.0)
 
 
 class TestProtocols:

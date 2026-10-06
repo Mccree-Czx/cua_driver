@@ -7,7 +7,10 @@ execute(task, deps) -> TaskResult：
 - 动作/校验失败抛 TaskExecutionError（携带已烧 token 用量，worker 据此
   组装 failed 结果）；BrainUnavailableError 原样上抛（worker 降级为
   deferred 重判，不按动作失败计）；RiskControlDetectedError（平台风控/
-  安全验证页）原样上抛（worker 立即转人工，绝不重试）。
+  安全验证页）与 WindowUnavailableError（窗口不可达）原样上抛（worker
+  立即转人工，绝不重试）；LocatorFailedError（页面/元素定位失败）：读取链
+  白名单任务走 LLM 视觉兜底一次（app/fallback.py），修复后重试 perform，
+  仍失败抛 FallbackExhaustedError（转人工不重试）；发送类/下载类不兜底。
 
 每类型的"动作后截图 → verify"：
 - 判定型动作（check_login / check_attachment）返回 bool 即页面判定结果，
@@ -37,7 +40,8 @@ from hr_workbuddy import AtomicTask, AtomicTaskType, BrainClient, LiepinDriver, 
 from app.brain.openai_brain import BrainUnavailableError
 from app.brain.usage import BrainUsage
 from app.cost import accumulate
-from app.drivers.cua_sdk import RiskControlDetectedError
+from app.drivers.cua_sdk import LocatorFailedError, RiskControlDetectedError, WindowUnavailableError
+from app.fallback import LlmFallback
 from app.verify import verify_success
 
 
@@ -65,6 +69,10 @@ class TaskExecutionError(Exception):
         self.sent_at = sent_at
 
 
+class FallbackExhaustedError(TaskExecutionError):
+    """LLM 兜底后重试仍失败：worker 映射 failed_needs_manual，不重试（防兜底循环）。"""
+
+
 @dataclass(frozen=True)
 class Artifact:
     """待上传的 artifact：kind（snapshot|resume）+ 文件名 + 字节（不透明透传）。"""
@@ -76,7 +84,7 @@ class Artifact:
 
 @dataclass
 class ExecutorDeps:
-    """执行器副作用注入点：驱动 / 大脑 / 截图源 / 上传回调 / 定价 / 时钟。"""
+    """执行器副作用注入点：驱动 / 大脑 / 截图源 / 上传回调 / 定价 / 时钟 / 兜底。"""
 
     driver: LiepinDriver
     brain: BrainClient  # verify_success 优先走 verify_with_usage 扩展（用量账目）
@@ -84,6 +92,7 @@ class ExecutorDeps:
     upload_artifact: Callable[[UUID, str, str, bytes], str]  # (task_id, kind, filename, data) -> object_key
     price_per_1k_tokens: float = 0.0
     now: Callable[[], datetime] = datetime.now
+    fallback: LlmFallback | None = None  # 读取链 LLM 兜底（real 注入；mock/E2E 为 None）
 
 
 def _candidate_id(task: AtomicTask) -> str:
@@ -190,6 +199,41 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
 }
 
 
+_FALLBACK_TASK_TYPES = frozenset(
+    {
+        AtomicTaskType.CHECK_LOGIN,
+        AtomicTaskType.LIST_UNREAD,
+        AtomicTaskType.READ_RESUME,
+        AtomicTaskType.CHECK_ATTACHMENT,
+    }
+)  # 读取链白名单：仅此四类可走 LLM 兜底（发送/下载类不兜底）
+
+
+def _recover_or_raise(
+    task: AtomicTask, error: LocatorFailedError, deps: ExecutorDeps, spec: ActionSpec
+) -> tuple[Any, BrainUsage, dict]:
+    """LocatorFailedError → LLM 兜底（仅白名单读取任务）→ 重试 perform 一次。
+
+    - 无 fallback / 非白名单 / 兜底未执行动作 → 原错误上抛（既有失败流程不变）；
+    - 执行了修复动作 → 重试 perform；仍定位失败 → FallbackExhaustedError
+      （worker 转人工，绝不重试——防"兜底-重试"循环）。
+    """
+    fallback = deps.fallback
+    if fallback is None or task.type not in _FALLBACK_TASK_TYPES:
+        raise error
+    outcome = fallback.recover(task, error)
+    if outcome is None or not outcome.executed:
+        raise error
+    try:
+        raw = spec.perform(deps.driver, task)
+    except LocatorFailedError as retry_error:
+        raise FallbackExhaustedError(
+            f"{task.type.value} LLM 兜底后仍定位失败（兜底动作：{outcome.action}）：{retry_error}",
+            outcome.usage,
+        ) from retry_error
+    return raw, outcome.usage, outcome.meta()
+
+
 def execute(task: AtomicTask, deps: ExecutorDeps) -> TaskResult:
     """执行单任务：动作 → 截图 → verify → evidence → artifact 上传。
 
@@ -202,8 +246,16 @@ def execute(task: AtomicTask, deps: ExecutorDeps) -> TaskResult:
     usage = BrainUsage()
     post_send = False  # perform 已返回 = 动作已真实发生（SEND_MESSAGE 即消息已发出）
     sent_at: str | None = None
+    fallback_meta: dict | None = None
     try:
-        raw = spec.perform(deps.driver, task)
+        try:
+            raw = spec.perform(deps.driver, task)
+        except LocatorFailedError as locator_error:
+            # 读取链定位失败：LLM 视觉兜底一次（非白名单/未修复则原错误上抛）
+            raw, fallback_usage, fallback_meta = _recover_or_raise(
+                task, locator_error, deps, spec
+            )
+            usage = usage + fallback_usage
         if task.type is AtomicTaskType.SEND_MESSAGE:
             post_send = True  # 驱动契约：send_message 返回即发送完成
             sent_at = deps.now().isoformat()
@@ -218,6 +270,8 @@ def execute(task: AtomicTask, deps: ExecutorDeps) -> TaskResult:
                 sent_at=sent_at,
             )
         evidence = spec.evidence(deps, raw)
+        if fallback_meta is not None:
+            evidence["llm_fallback"] = fallback_meta  # 兜底已介入的可观测账目
         accumulate(evidence, usage, deps.price_per_1k_tokens)
         artifact = spec.artifact(task, raw)
         if artifact is not None:
@@ -230,6 +284,8 @@ def execute(task: AtomicTask, deps: ExecutorDeps) -> TaskResult:
         raise
     except RiskControlDetectedError:
         raise  # 风控/安全验证页：原样上抛（worker 立即转人工，绝不重试）
+    except WindowUnavailableError:
+        raise  # 窗口不可达：原样上抛（保守化，worker 转人工，不重试）
     except BrainUnavailableError as e:
         if post_send:
             raise TaskExecutionError(

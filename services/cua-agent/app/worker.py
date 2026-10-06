@@ -62,9 +62,19 @@ from app.brain.mock import MockBrain
 from app.brain.openai_brain import BrainUnavailableError, OpenAIBrain
 from app.config import get_settings
 from app.cost import usage_evidence
-from app.drivers.cua_sdk import CuaLiepinDriver, RiskControlDetectedError
+from app.drivers.cua_sdk import (
+    CuaLiepinDriver,
+    RiskControlDetectedError,
+    WindowUnavailableError,
+)
 from app.drivers.fake import FakeLiepinDriver, png_bytes
-from app.executor import ExecutorDeps, TaskExecutionError, execute
+from app.executor import (
+    ExecutorDeps,
+    FallbackExhaustedError,
+    TaskExecutionError,
+    execute,
+)
+from app.fallback import LlmFallback
 from app.world import load_world
 from hr_workbuddy import AtomicTask, AtomicTaskType, TaskResult
 from hr_workbuddy.rate_limit import TokenBucket
@@ -77,6 +87,9 @@ BUCKET_WINDOW_SECONDS = 3600
 BUCKET_KEY_PREFIX = "msg-touch"
 BRAIN_DEFER_SECONDS = 60  # 大脑不可用 → 60s 后 deferred 重判
 MOCK_CAPTURE_SEED = "mock-verify-capture"  # mock 模式动作后截图：确定性 PNG
+# 全局风控熔断标志（2026-10-06 二次事件）：检测到风控页即写入，队列任务零操作
+# 跳过；仅人工在安全验证完成后清除（runbook §5.6）
+RISK_PAUSE_KEY = "cua:risk:paused"
 
 
 @dataclass
@@ -87,6 +100,8 @@ class WorkerDeps:
     pipeline: Pipeline
     bucket: TokenBucket
     requeue: Callable[[AtomicTask, int], Awaitable[None]]
+    risk_paused: Callable[[], Awaitable[bool]]  # 全局风控熔断查询（cua:risk:paused）
+    risk_pause: Callable[[], Awaitable[None]]  # 检测到风控页时写入熔断标志
     uniform: Callable[[float, float], float] = random.uniform
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     rate_per_hour: int = 20
@@ -143,6 +158,28 @@ async def run_task(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskR
 
 async def _run_task_inner(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskResult:
     """run_task 主体（不含末尾间隔冷却）。"""
+    # 0. 全局风控熔断：检测到风控页后，队列其余任务零操作直接转人工（二次事件教训）
+    if await deps.risk_paused():
+        result = TaskResult(
+            task_id=task.task_id,
+            outcome="failed_needs_manual",
+            evidence={
+                "risk_control": True,
+                "globally_paused": True,
+                "attempt": attempt,
+                "duration_s": 0.0,
+            },
+            error=(
+                "平台风控全局熔断中（cua:risk:paused）：本任务被跳过未执行；"
+                "待人工完成安全验证并清除标志后重跑"
+            ),
+        )
+        try:
+            deps.pipeline.post_result(task.task_id, result)
+        except Exception as e:  # 回调失败按重试处理（与末尾 post 策略一致）
+            raise Retry(defer=deps.retry_defer_seconds or None) from e
+        return result
+
     # 1. 动作前延时
     lo, hi = TOUCH_DELAY_RANGE if task.type is AtomicTaskType.SEND_MESSAGE else READ_DELAY_RANGE
     await deps.sleep(deps.uniform(lo, hi))
@@ -160,7 +197,12 @@ async def _run_task_inner(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -
     try:
         result = execute(task, deps.executor)
     except RiskControlDetectedError as e:
-        # 平台风控/安全验证页：立即转人工，绝不自动重试（重试=继续冲击风控画像）
+        # 平台风控/安全验证页：立即转人工 + 写全局熔断标志（队列其余任务零操作跳过）
+        try:
+            await deps.risk_pause()
+        except Exception as pause_exc:  # 写标志失败不掩盖原错误（当前任务仍转人工）
+            print(f"[cua] 全局熔断标志写入失败：{pause_exc!r}", flush=True)
+        print(f"[cua] {task.type.value} 检测到风控/安全验证页：{e}", flush=True)
         evidence = {
             "risk_control": True,
             "attempt": attempt,
@@ -172,10 +214,44 @@ async def _run_task_inner(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -
             evidence=evidence,
             error=f"检测到风控/安全验证页：{e}",
         )
+    except WindowUnavailableError as e:
+        # 窗口不可达（off_space_or_ax_unresolved）：保守化转人工，不重试；
+        # 不触发全局熔断（可能只是用户切屏等良性原因，非风控信号）
+        print(f"[cua] {task.type.value} 窗口不可达，转人工：{e}", flush=True)
+        evidence = {
+            "window_unavailable": True,
+            "attempt": attempt,
+            "duration_s": round(deps.clock() - start, 3),
+        }
+        result = TaskResult(
+            task_id=task.task_id,
+            outcome="failed_needs_manual",
+            evidence=evidence,
+            error=f"窗口不可达（保守化：不自动重试）：{e}",
+        )
     except BrainUnavailableError as e:
         await deps.requeue(task, BRAIN_DEFER_SECONDS)
         return _deferred_result(task, f"视觉大脑不可用，deferred 重判：{e}")
+    except FallbackExhaustedError as e:
+        # LLM 兜底后仍失败：转人工不重试（防"兜底-重试"循环，2026-10-06 新增）
+        print(f"[cua] {task.type.value} LLM 兜底后仍失败，转人工：{e.message}", flush=True)
+        evidence = usage_evidence(e.usage, deps.executor.price_per_1k_tokens)
+        evidence["attempt"] = attempt
+        evidence["duration_s"] = round(deps.clock() - start, 3)
+        evidence["fallback_exhausted"] = True
+        result = TaskResult(
+            task_id=task.task_id,
+            outcome="failed_needs_manual",
+            evidence=evidence,
+            error=e.message,
+        )
     except TaskExecutionError as e:
+        # 失败可见性：真实模式诊断依赖此日志（3s 级快速失败时任务日志只有计时）
+        print(
+            f"[cua] {task.type.value} attempt={attempt} 动作失败：{e.message}"
+            f"（原始异常：{e.__cause__!r}）",
+            flush=True,
+        )
         evidence = usage_evidence(e.usage, deps.executor.price_per_1k_tokens)
         evidence["attempt"] = attempt
         evidence["duration_s"] = round(deps.clock() - start, 3)
@@ -236,12 +312,14 @@ def build_worker_deps(ctx: dict) -> WorkerDeps:
         driver = FakeLiepinDriver(load_world(settings.world_path))
         brain = MockBrain()  # mock 模式默认通过；剧本判定经 script 注入
         capture = lambda: png_bytes(seed=MOCK_CAPTURE_SEED)
+        fallback = None  # 兜底仅真实模式（mock/E2E 不注入）
     else:
         driver = CuaLiepinDriver()
         brain = OpenAIBrain(
             settings.brain_base_url, settings.brain_api_key, settings.brain_model
         )
         capture = driver.capture_desktop_png  # T12：真实桌面截图（PNG 字节，capture_binding 注记以文件为准）
+        fallback = LlmFallback(driver=driver, brain=brain)  # 读取链视觉兜底（白名单在 executor）
 
     pipeline = PipelineClient(settings.pipeline_url)
     redis_pool = ctx["redis"]
@@ -252,6 +330,12 @@ def build_worker_deps(ctx: dict) -> WorkerDeps:
             ARQ_JOB_FUNCTION, task.model_dump(mode="json"), _defer_by=defer_seconds
         )
 
+    async def risk_paused() -> bool:
+        return bool(await redis_pool.exists(RISK_PAUSE_KEY))
+
+    async def risk_pause() -> None:
+        await redis_pool.set(RISK_PAUSE_KEY, "1")
+
     deps = WorkerDeps(
         executor=ExecutorDeps(
             driver=driver,
@@ -259,10 +343,13 @@ def build_worker_deps(ctx: dict) -> WorkerDeps:
             capture=capture,
             upload_artifact=pipeline.post_artifact,
             price_per_1k_tokens=settings.brain_price_per_1k_tokens,
+            fallback=fallback,
         ),
         pipeline=pipeline,
         bucket=TokenBucket(redis_pool),
         requeue=requeue,
+        risk_paused=risk_paused,
+        risk_pause=risk_pause,
         rate_per_hour=settings.msg_rate_per_hour,
         task_gap_seconds=0.0 if settings.e2e_instant else settings.task_gap_seconds,
         retry_defer_seconds=0 if settings.e2e_instant else settings.retry_defer_seconds,

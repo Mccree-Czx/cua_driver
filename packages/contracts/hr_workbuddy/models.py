@@ -63,6 +63,21 @@ class TaskResult(BaseModel):
     error: str | None
 
 
+class FallbackSuggestion(BaseModel):
+    """LLM 读取链兜底建议（结构化输出契约，2026-10-06 二次风控事件后新增）。
+
+    action：click_text（target 为需点击元素上文本）/ click_coords（target 为
+    "x,y" 截图像素坐标，左上原点）/ none（仅诊断不动作）。confidence 0-1。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    diagnosis: str
+    action: Literal["click_text", "click_coords", "none"] = "none"
+    target: str = ""
+    confidence: float = 0.0
+
+
 class MinimalResume(BaseModel):
     """在线简历最小字段集（恰 7 字段），落 job_candidate.online_resume_minimal。"""
 

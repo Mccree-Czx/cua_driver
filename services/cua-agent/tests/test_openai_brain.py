@@ -133,3 +133,54 @@ def test_mock_brain_scripted_by_criteria():
 def test_mock_brain_default_verdict():
     assert MockBrain().verify(b"png", "anything") is True
     assert MockBrain(default=False).verify(b"png", "anything") is False
+
+
+# —— suggest：读取链兜底诊断（2026-10-06 新增）——
+
+
+def test_suggest_parses_structured_suggestion():
+    chat = FakeChat(
+        content=(
+            '{"diagnosis": "需先勾选全部候选人", "action": "click_text",'
+            ' "target": "全部", "confidence": 0.85}'
+        )
+    )
+    suggestion = make_brain(chat).suggest(PNG, "任务 list_unread 失败：未找到浏览简历按钮")
+    assert suggestion.action == "click_text"
+    assert suggestion.target == "全部"
+    assert suggestion.confidence == 0.85
+
+
+def test_suggest_request_shape_and_fenced_output():
+    """请求形状：context 入 prompt、截图 base64、json_object；围栏输出容忍。"""
+    chat = FakeChat(
+        content='```json\n{"diagnosis": "d", "action": "none", "target": "", "confidence": 0.1}\n```'
+    )
+    brain = make_brain(chat)
+    suggestion, usage = brain.suggest_with_usage(PNG, "任务 read_resume 失败：锚点缺失")
+    assert suggestion.action == "none"
+    assert usage.total_tokens == 0  # 假响应无 usage → 零记账
+    kwargs = chat.captured
+    assert kwargs["model"] == MODEL
+    text = kwargs["messages"][0]["content"][0]["text"]
+    assert "任务 read_resume 失败：锚点缺失" in text
+    assert kwargs["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",  # 非 JSON
+        '{"diagnosis": "d", "action": "launch_missile", "target": "x", "confidence": 1}',
+        '{"action": "none"}',  # 缺 diagnosis
+        None,
+    ],
+)
+def test_suggest_invalid_output_raises(content):
+    with pytest.raises(BrainUnavailableError):
+        make_brain(FakeChat(content=content)).suggest(PNG, "ctx")
+
+
+def test_mock_brain_suggest_default_none():
+    suggestion = MockBrain().suggest(b"png", "ctx")
+    assert suggestion.action == "none" and suggestion.confidence == 0.0

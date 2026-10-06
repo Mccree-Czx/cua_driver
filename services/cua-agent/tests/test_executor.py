@@ -20,12 +20,20 @@ from arq.worker import Retry
 
 from app.brain.mock import MockBrain
 from app.brain.openai_brain import BrainUnavailableError
-from app.drivers.cua_sdk import RiskControlDetectedError, has_risk_control
+from app.brain.usage import BrainUsage
+from app.drivers.cua_sdk import (
+    LocatorFailedError,
+    RiskControlDetectedError,
+    WindowUnavailableError,
+    _translate_driver_error,
+    has_risk_control,
+)
 from app.drivers.fake import FakeLiepinDriver
+from app.fallback import FallbackOutcome, LlmFallback
 from app.worker import WorkerDeps, execute_task, run_task
 from app.executor import ExecutorDeps
 from app.world import AttachmentSpec, ConversationScript, ReplyEvent, World
-from hr_workbuddy import AtomicTask, AtomicTaskType, MinimalResume
+from hr_workbuddy import AtomicTask, AtomicTaskType, FallbackSuggestion, MinimalResume
 
 TASK_ID = uuid4()
 CANDIDATE = "uid_a"
@@ -105,6 +113,33 @@ class FakeRequeue:
         self.calls.append((task, defer_seconds))
 
 
+class FakeRiskGate:
+    """全局风控熔断记录器：paused 可预置；pause() 记录并翻转。"""
+
+    def __init__(self, paused: bool = False) -> None:
+        self.paused = paused
+        self.pause_calls = 0
+
+    async def is_paused(self) -> bool:
+        return self.paused
+
+    async def pause(self) -> None:
+        self.pause_calls += 1
+        self.paused = True
+
+
+class FakeFallback:
+    """兜底记录器：recovers 预置 outcome；记录 (task, error) 调用。"""
+
+    def __init__(self, outcome: FallbackOutcome | None = None) -> None:
+        self._outcome = outcome
+        self.calls: list = []
+
+    def recover(self, task: AtomicTask, error: Exception) -> FallbackOutcome | None:
+        self.calls.append((task, error))
+        return self._outcome
+
+
 class FakePipeline:
     """假 pipeline HTTP：记录 result / artifact 回调，artifact 返回预设对象键。"""
 
@@ -142,7 +177,13 @@ class FakeUniform:
         return 0.0
 
 
-def make_deps(*, bucket: FakeBucket | None = None, uniform: FakeUniform | None = None) -> dict:
+def make_deps(
+    *,
+    bucket: FakeBucket | None = None,
+    uniform: FakeUniform | None = None,
+    risk_gate: FakeRiskGate | None = None,
+    fallback: FakeFallback | None = None,
+) -> dict:
     """组装 WorkerDeps：driver 读世界剧本，brain 默认通过，全部副作用注入。"""
     world = make_world()
     driver = FakeLiepinDriver(world)
@@ -152,6 +193,7 @@ def make_deps(*, bucket: FakeBucket | None = None, uniform: FakeUniform | None =
     uniform = uniform or FakeUniform()
     requeue = FakeRequeue()
     bucket = bucket or FakeBucket(True)
+    risk_gate = risk_gate or FakeRiskGate()
     clock = lambda: 3600.0 * 10 + 30.0  # 任意固定时刻：距下一小时边界 3570s
     now = lambda: datetime(2026, 10, 5, 10, 0, 30, tzinfo=timezone.utc)
     executor = ExecutorDeps(
@@ -161,6 +203,7 @@ def make_deps(*, bucket: FakeBucket | None = None, uniform: FakeUniform | None =
         upload_artifact=pipeline.post_artifact,
         price_per_1k_tokens=0.002,
         now=now,
+        fallback=fallback,
     )
     return dict(
         driver=driver,
@@ -170,11 +213,15 @@ def make_deps(*, bucket: FakeBucket | None = None, uniform: FakeUniform | None =
         sleep=sleep,
         uniform=uniform,
         now=now,
+        risk_gate=risk_gate,
+        fallback=fallback,
         deps=WorkerDeps(
             executor=executor,
             pipeline=pipeline,
             bucket=bucket,
             requeue=requeue,
+            risk_paused=risk_gate.is_paused,
+            risk_pause=risk_gate.pause,
             uniform=uniform,
             sleep=sleep,
             clock=clock,
@@ -552,3 +599,220 @@ def test_retry_uses_configured_defer_not_immediate():
     with pytest.raises(Retry) as excinfo:
         run(make_task(AtomicTaskType.READ_RESUME), fixtures)
     assert excinfo.value.defer_score == 90_000
+
+
+# —— 全局熔断 / 窗口不可达 / LLM 兜底（2026-10-06 二次风控事件防线加固）——
+
+
+def test_risk_control_writes_global_pause_flag():
+    """风控检测：写全局熔断标志（risk_pause 被调）+ failed_needs_manual。"""
+    fixtures = make_deps()
+
+    def boom(*args, **kwargs):
+        raise RiskControlDetectedError("检测到账号行为异常验证页")
+
+    fixtures["deps"].executor.driver.read_online_resume = boom
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)
+
+    assert result.outcome == "failed_needs_manual"
+    assert fixtures["risk_gate"].pause_calls == 1
+    assert fixtures["risk_gate"].paused is True
+
+
+def test_globally_paused_task_skips_without_driver_calls():
+    """全局熔断中：任务零操作（driver 禁调）+ 直接转人工 + 已回调落账 + 零延时。"""
+    fixtures = make_deps(risk_gate=FakeRiskGate(paused=True))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("熔断中不得调用 driver")
+
+    fixtures["deps"].executor.driver.list_unread_conversations = forbidden
+    result = run(make_task(AtomicTaskType.LIST_UNREAD), fixtures)
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["globally_paused"] is True
+    assert result.evidence["risk_control"] is True
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_needs_manual"
+    assert fixtures["sleep"].calls == []  # 连动作前延时都不发生
+
+
+def test_window_unavailable_fails_manual_without_retry():
+    """窗口不可达（off_space）：保守化 failed_needs_manual，不重试、不全局熔断。"""
+    fixtures = make_deps()
+
+    def boom(*args, **kwargs):
+        raise WindowUnavailableError("窗口不可达（off_space_or_ax_unresolved）")
+
+    fixtures["deps"].executor.driver.read_online_resume = boom
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)  # 不抛 Retry
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["window_unavailable"] is True
+    assert fixtures["risk_gate"].pause_calls == 0
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_needs_manual"
+
+
+def test_translate_driver_error_maps_off_space_code():
+    """SDK 错误翻译纯函数：off_space_or_ax_unresolved → WindowUnavailableError；其余原样。"""
+
+    class OffSpaceStub(Exception):
+        error_code = "off_space_or_ax_unresolved"
+
+    class OtherStub(Exception):
+        error_code = "invalid_tree"
+
+    assert isinstance(_translate_driver_error(OffSpaceStub("x")), WindowUnavailableError)
+    other = OtherStub("x")
+    assert _translate_driver_error(other) is other
+    plain = RuntimeError("普通错误")
+    assert _translate_driver_error(plain) is plain
+
+
+def test_locator_failure_llm_fallback_recovers():
+    """读取链定位失败 → LLM 兜底执行修复 → 重试 perform 成功 → success + 兜底账目。"""
+    calls = {"n": 0}
+    fixtures = make_deps(
+        fallback=FakeFallback(
+            FallbackOutcome(
+                diagnosis="需先勾选候选人再点浏览简历",
+                action="click_text",
+                target="全部",
+                confidence=0.9,
+                executed=True,
+                usage=BrainUsage(prompt_tokens=30, completion_tokens=12, total_tokens=42),
+            )
+        )
+    )
+    real = fixtures["driver"].list_unread_conversations
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LocatorFailedError("聊天页未找到「浏览简历」按钮")
+        return real()
+
+    fixtures["deps"].executor.driver.list_unread_conversations = flaky
+    result = run(make_task(AtomicTaskType.LIST_UNREAD), fixtures)
+
+    assert result.outcome == "success"
+    assert calls["n"] == 2  # 首次失败 + 兜底后重试一次
+    assert len(fixtures["fallback"].calls) == 1
+    assert result.evidence["llm_fallback"]["action"] == "click_text"
+    assert result.evidence["brain_tokens"] == 42  # 兜底 suggest 用量计入账目
+
+
+def test_send_message_locator_failure_skips_fallback():
+    """发送类任务定位失败：不兜底（fallback 零调用），按既有失败流程（可重试）。"""
+    fixtures = make_deps(fallback=FakeFallback(None))
+
+    def boom(*args, **kwargs):
+        raise LocatorFailedError("候选人详情未找到「继续沟通」按钮")
+
+    fixtures["deps"].executor.driver.send_message = boom
+    with pytest.raises(Retry):  # attempt 0 → failed_retryable → 重试
+        run(make_task(AtomicTaskType.SEND_MESSAGE, context={"text": "您好"}), fixtures)
+    assert fixtures["fallback"].calls == []
+
+
+def test_fallback_exhausted_after_retry_fails_manual():
+    """兜底执行后重试仍定位失败：转人工 failed_needs_manual，不重试（防循环）。"""
+    fixtures = make_deps(
+        fallback=FakeFallback(
+            FallbackOutcome(
+                diagnosis="尝试点击修复",
+                action="click_text",
+                target="全部",
+                confidence=0.9,
+                executed=True,
+            )
+        )
+    )
+
+    def boom(*args, **kwargs):
+        raise LocatorFailedError("始终找不到锚点")
+
+    fixtures["deps"].executor.driver.read_online_resume = boom
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)  # 不抛 Retry
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["fallback_exhausted"] is True
+    assert len(fixtures["fallback"].calls) == 1
+
+
+# —— LlmFallback 模块（置信度闸 / 坐标解析 / 风控上抛）——
+
+
+class FakeDriverForFallback:
+    """兜底驱动替身：截图可注入异常；记录文本/坐标点击调用。"""
+
+    def __init__(
+        self, *, screenshot: bytes = b"png", screenshot_error: Exception | None = None
+    ) -> None:
+        self._screenshot = screenshot
+        self._screenshot_error = screenshot_error
+        self.text_calls: list[str] = []
+        self.px_calls: list[tuple[float, float]] = []
+
+    def capture_desktop_png(self) -> bytes:
+        if self._screenshot_error is not None:
+            raise self._screenshot_error
+        return self._screenshot
+
+    def click_text_contains(self, text: str) -> bool:
+        self.text_calls.append(text)
+        return True
+
+    def click_at_screenshot_px(self, x: float, y: float) -> bool:
+        self.px_calls.append((x, y))
+        return True
+
+
+def test_llm_fallback_confidence_gate_skips_action():
+    """置信度低于阈值：不执行动作（executed False），诊断仍返回。"""
+    driver = FakeDriverForFallback()
+    brain = MockBrain(
+        suggest_result=FallbackSuggestion(
+            diagnosis="不太确定", action="click_text", target="全部", confidence=0.3
+        )
+    )
+    outcome = LlmFallback(driver=driver, brain=brain).recover(
+        make_task(AtomicTaskType.LIST_UNREAD), RuntimeError("x")
+    )
+    assert outcome is not None and outcome.executed is False
+    assert driver.text_calls == []
+
+
+def test_llm_fallback_click_coords_parses_target():
+    """坐标动作：target "x,y" 解析成功才执行；坏值不执行。"""
+    driver = FakeDriverForFallback()
+    brain = MockBrain(
+        suggest_result=FallbackSuggestion(
+            diagnosis="点坐标", action="click_coords", target="840,1700", confidence=0.8
+        )
+    )
+    outcome = LlmFallback(driver=driver, brain=brain).recover(
+        make_task(AtomicTaskType.READ_RESUME), RuntimeError("x")
+    )
+    assert outcome.executed is True
+    assert driver.px_calls == [(840.0, 1700.0)]
+
+    brain_bad = MockBrain(
+        suggest_result=FallbackSuggestion(
+            diagnosis="坏坐标", action="click_coords", target="abc", confidence=0.8
+        )
+    )
+    outcome_bad = LlmFallback(driver=driver, brain=brain_bad).recover(
+        make_task(AtomicTaskType.READ_RESUME), RuntimeError("x")
+    )
+    assert outcome_bad.executed is False
+
+
+def test_llm_fallback_risk_control_propagates():
+    """兜底流程撞风控：RiskControlDetectedError 上抛（绝不被吞）。"""
+    driver = FakeDriverForFallback(screenshot_error=RiskControlDetectedError("风控页"))
+    with pytest.raises(RiskControlDetectedError):
+        LlmFallback(driver=driver, brain=MockBrain()).recover(
+            make_task(AtomicTaskType.LIST_UNREAD), RuntimeError("x")
+        )

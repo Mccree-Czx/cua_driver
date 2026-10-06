@@ -4,6 +4,7 @@ from hr_workbuddy.models import (
     AtomicTask,
     AtomicTaskType,
     CandidateStatus,
+    FallbackSuggestion,
     MinimalResume,
     ScreenRequest,
     ScreeningResult,
@@ -19,6 +20,7 @@ __all__ = [
     "ScreenRequest",
     "ScreeningResult",
     "CandidateStatus",
+    "FallbackSuggestion",
     "LiepinDriver",
     "BrainClient",
 ]

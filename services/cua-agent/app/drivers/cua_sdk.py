@@ -73,6 +73,27 @@ def has_risk_control(tree_text: str) -> bool:
     return any(m in tree_text for m in RISK_CONTROL_MARKERS)
 
 
+class WindowUnavailableError(RuntimeError):
+    """窗口不可达（off_space_or_ax_unresolved）：风控/登录跳转或用户切屏的伴生状态。
+
+    保守化口径（2026-10-06 二次风控事件教训）：此类错误不自动重试，worker 转人工。
+    """
+
+
+class LocatorFailedError(RuntimeError):
+    """页面/元素定位失败（锚点缺失、页面结构变化）：读取链可走 LLM 视觉兜底一次。"""
+
+
+OFF_SPACE_ERROR_CODE = "off_space_or_ax_unresolved"
+
+
+def _translate_driver_error(exc: Exception) -> Exception:
+    """SDK DriverError 翻译：off_space_or_ax_unresolved → WindowUnavailableError。"""
+    if getattr(exc, "error_code", None) == OFF_SPACE_ERROR_CODE:
+        return WindowUnavailableError(f"窗口不可达（{OFF_SPACE_ERROR_CODE}）：{exc}")
+    return exc
+
+
 class _RuntimeBridge:
     """专用事件循环线程：所有 SDK 调用经此串行执行（同步函数 call / 协程 run）。"""
 
@@ -128,6 +149,7 @@ class CuaLiepinDriver:
     CHAT_PATH = "lpt.liepin.com/chat"  # 聊天页 URL 片段（实测 /chat/im）
     BATCH_PATH = "resume/showbatchresumelist"  # 批量预览简历页 URL 片段
     SETTLE_SECONDS = 2.0  # SPA 页内切换/导航后的渲染等待（实测 1-2s）
+    SCREENSHOT_PX_PER_POINT = 2.0  # 桌面截图像素:屏幕点比例（Retina 实测 2880px:1440pt；换环境需校准）
     ATTACHMENT_EXTS = (".pdf", ".doc", ".docx", ".zip")  # 附件简历文件扩展名
 
     def __init__(self) -> None:
@@ -461,18 +483,24 @@ class CuaLiepinDriver:
         """元素级 AXPress（实测对导航链接/按钮/选项卡生效；后台执行不打扰用户）。"""
         from cua_driver import ActionTarget, ClickInput, ClickPosition, InputDeliveryMode
 
-        self._bridge.run(
-            self._driver.click(
-                ClickInput(
-                    target=ActionTarget.WINDOW(pid, wid),
-                    position=ClickPosition.ELEMENT(element.element_token),
-                    delivery_mode=InputDeliveryMode.BACKGROUND,
-                    session=None,
-                    button=None,
-                    count=None,
+        try:
+            self._bridge.run(
+                self._driver.click(
+                    ClickInput(
+                        target=ActionTarget.WINDOW(pid, wid),
+                        position=ClickPosition.ELEMENT(element.element_token),
+                        delivery_mode=InputDeliveryMode.BACKGROUND,
+                        session=None,
+                        button=None,
+                        count=None,
+                    )
                 )
             )
-        )
+        except Exception as e:
+            mapped = _translate_driver_error(e)
+            if mapped is e:
+                raise
+            raise mapped from e
 
     def _tab_names(self, state: Any) -> list[str]:
         """批量页顶部候选人选项卡名。
@@ -522,7 +550,7 @@ class CuaLiepinDriver:
                     tab = e
                     break
         if tab is None:
-            raise RuntimeError(f"批量页未找到选项卡「{name}」（页面结构变化？）")
+            raise LocatorFailedError(f"批量页未找到选项卡「{name}」（页面结构变化？）")
         self._press(pid, wid, tab)
         time.sleep(self.SETTLE_SECONDS)
         return self._live_state(pid, wid)
@@ -600,7 +628,7 @@ class CuaLiepinDriver:
                 time.sleep(self.SETTLE_SECONDS + 1.0)
                 state = self._live_state(pid, wid)
                 names = self._tab_names_retry(pid, wid, state)
-        raise RuntimeError(
+        raise LocatorFailedError(
             f"批量页未找到简历编号 {candidate_liepin_id} 对应候选人（含重载重试）"
         )
 
@@ -618,12 +646,12 @@ class CuaLiepinDriver:
         state = self._live_state(pid, wid)
         tab = self._find(state, role="AXRadioButton", label="在线沟通")
         if tab is None:
-            raise RuntimeError("未找到「在线沟通」标签页（无法回到消息列表页）")
+            raise LocatorFailedError("未找到「在线沟通」标签页（无法回到消息列表页）")
         self._press(pid, wid, tab)
         time.sleep(self.SETTLE_SECONDS)
         state = self._live_state(pid, wid)
         if self.CHAT_PATH not in self._current_url(state):
-            raise RuntimeError(f"切换后未回到消息列表页（URL={self._current_url(state)[:120]}）")
+            raise LocatorFailedError(f"切换后未回到消息列表页（URL={self._current_url(state)[:120]}）")
 
     def _attachment_filename(self, state: Any) -> str | None:
         """详情附件文件名（取带附件扩展名的最靠后静态文本=详情区条目）。"""
@@ -644,7 +672,9 @@ class CuaLiepinDriver:
         """确保位于批量预览简历页：已有批量标签页优先切回；否则经聊天页→「浏览简历」。
 
         实测：批量页以新标签页打开（标签名「批量预览简历」）——逐任务复用标签页
-        切换（快）优于重复点击「浏览简历」（会新开页）。任一锚点缺失即抛错（失败即停）。
+        切换（快）优于重复点击「浏览简历」（会新开页）。「浏览简历」不可见时
+        （无会话选中/未展开通知面板）先点「收到简历」通知行露出消息面板。
+        任一锚点缺失即抛错（失败即停）。
         """
         state = self._live_state(pid, wid)
         url = self._current_url(state)
@@ -661,26 +691,126 @@ class CuaLiepinDriver:
         if self.CHAT_PATH not in url:
             nav = self._find(state, role="AXLink", label_contains="沟通")
             if nav is None:
-                raise RuntimeError(f"不在聊天/批量页且未找到「沟通」导航（URL={url[:120]}）")
+                raise LocatorFailedError(f"不在聊天/批量页且未找到「沟通」导航（URL={url[:120]}）")
             self._press(pid, wid, nav)
             time.sleep(self.SETTLE_SECONDS)
             state = self._live_state(pid, wid)
             url = self._current_url(state)
             if self.CHAT_PATH not in url and self.BATCH_PATH not in url:
-                raise RuntimeError(f"点击「沟通」后未到达聊天页（URL={url[:120]}）")
+                raise LocatorFailedError(f"点击「沟通」后未到达聊天页（URL={url[:120]}）")
         if self.BATCH_PATH in url:
             return state
         btn = self._find(state, role="AXButton", label="浏览简历")
         if btn is None:
-            raise RuntimeError("聊天页未找到「浏览简历」按钮（会话未选中或页面结构变化）")
+            # T12 补丁（2026-10-06）：无批量标签页且「浏览简历」不可见——先点
+            # 「收到简历」通知行露出消息面板（实测底部含「浏览简历」；即批量页
+            # pgRef=b_pc_im_message_capply_batch_view_btn 入口）。
+            if not self._open_batch_notification(pid, wid, state):
+                raise LocatorFailedError("聊天页未找到「浏览简历」按钮（会话未选中或页面结构变化）")
+            state = self._live_state(pid, wid)
+            btn = self._find(state, role="AXButton", label="浏览简历")
+        if btn is None:
+            raise LocatorFailedError("点击通知行后仍未找到「浏览简历」按钮（页面结构变化？）")
+        # 实测（2026-10-06）：「浏览简历」为批量动作——未勾选候选人时点击无效果；
+        # 先勾底部「全部」复选框（AXCheckBox，与顶部同名筛选 AXRadioButton 区分；
+        # value=1 已勾选则跳过，避免反选）。
+        check_all = self._find(state, role="AXCheckBox", label="全部")
+        if check_all is not None and str(getattr(check_all, "value", "0")) != "1":
+            self._press(pid, wid, check_all)
+            time.sleep(0.5)
         self._press(pid, wid, btn)
         time.sleep(self.SETTLE_SECONDS + 1.0)
         state = self._live_state(pid, wid)
         if self.BATCH_PATH not in self._current_url(state):
-            raise RuntimeError(
+            raise LocatorFailedError(
                 f"点击「浏览简历」后未进入批量页（URL={self._current_url(state)[:120]}）"
             )
         return state
+
+    def _open_batch_notification(self, pid: int, wid: int, state: Any) -> bool:
+        """点「收到简历」批次通知行露出消息面板；找到并已点击返回 True，未找到行返回 False。
+
+        实测（2026-10-06）：通知行元素为 AXStaticText（无 AXPress）——经 System
+        Events 坐标点击；点击后面板底部出现「浏览简历」（批量页入口）。锚点=通知行
+        预览文本「…人的简历」（唯一性高于标题「收到简历」）。
+        """
+        row = None
+        for e in getattr(state, "elements", []) or []:
+            if str(getattr(e, "role", "")) != "AXStaticText":
+                continue
+            lbl = str(getattr(e, "label", "") or "")
+            if "人的简历" in lbl and getattr(e, "frame", None) is not None:
+                row = e
+                break
+        if row is None:
+            return False
+        fr = row.frame
+        cy = fr.y + max(float(getattr(fr, "h", 0) or 0), 16.0) / 2.0
+        self._click_point(pid, wid, fr.x + fr.w / 2.0, cy)
+        time.sleep(self.SETTLE_SECONDS + 0.5)
+        return True
+
+    def _click_point(self, pid: int, wid: int, x: float, y: float) -> None:
+        """坐标点击（System Events；实测通道：无 AXPress 的列表行元素）。
+
+        前提：窗口可见（调用方 ensure_visible）且目标点在窗口内；失败即停。
+        """
+        script = f'tell application "System Events" to click at {{{x:.0f}, {y:.0f}}}'
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"坐标点击失败（osascript rc={result.returncode}）：{result.stderr.strip()[:200]}"
+            )
+
+    def click_text_contains(self, text: str) -> bool:
+        """LLM 兜底通道：按 label 包含定位元素并后台 AXPress；找不到返回 False。
+
+        窗口/风控异常仍上抛（失败即停优先于兜底）；命中即执行（调用方复查效果）。
+        """
+        target = str(text or "").strip()
+        if not target:
+            return False
+        pid, wid = self._ensure_visible_and_resolved()
+        state = self._live_state(pid, wid)
+        for e in getattr(state, "elements", []) or []:
+            lbl = str(getattr(e, "label", "") or "")
+            if target in lbl:
+                self._press(pid, wid, e)
+                time.sleep(self.SETTLE_SECONDS)
+                return True
+        return False
+
+    def click_at_screenshot_px(self, x_px: float, y_px: float) -> bool:
+        """LLM 兜底通道：截图像素坐标 → 屏幕点（÷SCREENSHOT_PX_PER_POINT）→ 坐标点击。
+
+        点须落在目标窗口 bounds 内，否则不点击返回 False（防打错窗口）。
+        """
+        pid, wid = self._ensure_visible_and_resolved()
+        bounds = self._window_bounds(pid, wid)
+        if bounds is None:
+            return False
+        bx, by, bw, bh = bounds
+        x_pt = x_px / self.SCREENSHOT_PX_PER_POINT
+        y_pt = y_px / self.SCREENSHOT_PX_PER_POINT
+        if not (bx <= x_pt <= bx + bw and by <= y_pt <= by + bh):
+            return False
+        self._click_point(pid, wid, x_pt, y_pt)
+        time.sleep(self.SETTLE_SECONDS)
+        return True
+
+    def _window_bounds(
+        self, pid: int, window_id: int
+    ) -> tuple[float, float, float, float] | None:
+        """目标窗口 bounds（屏幕点坐标 x/y/w/h）；未找到返回 None。"""
+        for w in self._browser_windows_all():
+            if getattr(w, "pid", None) == pid and getattr(w, "window_id", None) == window_id:
+                b = getattr(w, "bounds", None)
+                if b is None:
+                    return None
+                return (float(b.x), float(b.y), float(b.width), float(b.height))
+        return None
 
     # —— 协议方法（按 runbook §4 顺序逐步校准）——
 
@@ -690,7 +820,8 @@ class CuaLiepinDriver:
         口径：窗口存在（地址栏含 liepin.com）且树含后台导航锚点（人才推荐/
         搜索人才/职位管理/招聘工作台）任一 → True；登录页锚点（扫码/密码/短信/
         验证码登录）出现 → False；窗口不存在或异常 → False（未知按未登录处理：
-        pipeline 侧只暂停派发 + 告警，方向安全）。
+        pipeline 侧只暂停派发 + 告警，方向安全）；风控页 → 抛
+        RiskControlDetectedError（worker 写全局熔断标志并转人工，绝不重试）。
         """
         try:
             found = self._resolve_liepin_window()
@@ -704,7 +835,10 @@ class CuaLiepinDriver:
             pass  # 可见性失败不阻断判定（树读取在遮挡下也常可用）
         tree = self._tree_text(found[2])
         if has_risk_control(tree):
-            return False  # 风控页≈不可用：按未登录处理（scheduler 暂停派发，人工接管）
+            # 风控页：统一信号（worker 写全局熔断标志 + 转人工，绝不重试；2026-10-06 二次事件）
+            raise RiskControlDetectedError(
+                "检测到猎聘风控/安全验证页（账号行为异常）——停止操作，人工完成安全验证"
+            )
         if any(m in tree for m in self.LOGIN_PAGE_MARKERS):
             return False
         return any(m in tree for m in self.BACKEND_MARKERS)
@@ -721,7 +855,7 @@ class CuaLiepinDriver:
         state = self._reach_batch_page(pid, wid)
         names = self._tab_names_retry(pid, wid, state)
         if not names:
-            raise RuntimeError("批量页未发现候选人选项卡（页面结构变化？）")
+            raise LocatorFailedError("批量页未发现候选人选项卡（页面结构变化？）")
         ids: list[str] = []
         for name in names:
             state = self._press_tab(pid, wid, name)
@@ -729,7 +863,7 @@ class CuaLiepinDriver:
             if lid:
                 ids.append(lid)
         if not ids:
-            raise RuntimeError("批量页未读到任何简历编号（页面结构变化？）")
+            raise LocatorFailedError("批量页未读到任何简历编号（页面结构变化？）")
         self._back_to_chat_page(pid, wid)
         return ids
 
@@ -817,25 +951,37 @@ class CuaLiepinDriver:
         }
         if modifiers:
             payload["modifiers"] = modifiers
-        self._bridge.run(self._driver.call_tool("press_key", json.dumps(payload)))
+        try:
+            self._bridge.run(self._driver.call_tool("press_key", json.dumps(payload)))
+        except Exception as e:
+            mapped = _translate_driver_error(e)
+            if mapped is e:
+                raise
+            raise mapped from e
         time.sleep(0.2)
 
     def _type_text(self, pid: int, wid: int, element: Any, text: str) -> None:
         """向元素输入文本（实测：聚焦后经 CGEvent 注入，AX 读回作辅助校验）。"""
-        self._bridge.run(
-            self._driver.call_tool(
-                "type_text",
-                json.dumps(
-                    {
-                        "text": text,
-                        "pid": pid,
-                        "window_id": wid,
-                        "element_token": element.element_token,
-                        "delivery_mode": "background",
-                    }
-                ),
+        try:
+            self._bridge.run(
+                self._driver.call_tool(
+                    "type_text",
+                    json.dumps(
+                        {
+                            "text": text,
+                            "pid": pid,
+                            "window_id": wid,
+                            "element_token": element.element_token,
+                            "delivery_mode": "background",
+                        }
+                    ),
+                )
             )
-        )
+        except Exception as e:
+            mapped = _translate_driver_error(e)
+            if mapped is e:
+                raise
+            raise mapped from e
 
     def read_online_resume(self, candidate_liepin_id: str) -> tuple[bytes, MinimalResume]:
         """③ 读在线简历：批量页定位候选人 → 提取 7 字段 + 桌面截图。
@@ -864,7 +1010,7 @@ class CuaLiepinDriver:
             if not value
         ]
         if missing:
-            raise RuntimeError(
+            raise LocatorFailedError(
                 f"候选人 {candidate_liepin_id} 字段缺失 {missing}（页面结构可能变化，待视觉复核）"
             )
         screenshot = self.capture_desktop_png()
