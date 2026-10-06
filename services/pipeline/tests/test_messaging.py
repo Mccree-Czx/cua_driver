@@ -69,6 +69,18 @@ def test_render_empty_template_raises():
         render_message(_job(template_msgs={"greet_request": ""}), _candidate(), "greet_request")
 
 
+def test_render_direct_request_default_fallback():
+    """direct_request 未配置 → 内置默认模板兜底（存量岗位兼容，2026-10-06 策略）。"""
+    text = render_message(_job(template_msgs={}), _candidate(), "direct_request")
+    assert text == "您好 张伟，感谢关注高级产品经理岗位，方便发一份简历吗？"
+
+
+def test_render_direct_request_explicit_config_wins():
+    """direct_request 显式配置优先于内置默认。"""
+    job = _job(template_msgs={"direct_request": "定制的直索要 {name}"})
+    assert render_message(job, _candidate(), "direct_request") == "定制的直索要 张伟"
+
+
 def test_render_unknown_placeholder_raises():
     job = _job(template_msgs={"greet_request": "您好 {name}，{company}正在招聘"})
     with pytest.raises(ValueError, match="company"):

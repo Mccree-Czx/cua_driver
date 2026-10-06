@@ -2,10 +2,14 @@
 
 controller 裁定：不真调 LLM、不做真实硬规则判定、不改 T5 生产代码——
 本服务对每个候选人的判定结果由剧本映射硬编码：
-- LP001 → 82 分通过（剧本 A：张伟全链路）
-- LP002 → 55 分拒绝（剧本 B：rejected_llm 零触达）
+- LP001 → 82 分通过（剧本 A：直索要 → 收到后评分）
+- LP002 → 55 分（剧本 B：收到后评分 55 落账）
 - LP003 → 硬规则不通过（剧本 B：rejected_hard 零触达）
-- LP004 → 82 分通过（剧本 B：永不回复 → 72h 关闭）
+- LP004 → 82 分（剧本 B：永不回复 → 72h 关闭）
+
+2026-10-06 策略镜像：llm_scoring=False（inbound 直索要）→ 非硬拒一律返回
+「硬规则通过（未评分）」（与 screening 服务语义逐字一致）；收到简历后的
+补评分调用 llm_scoring=True → 返回剧本分数。
 
 由 scripts/run_m1_e2e.py 以 uvicorn 子进程启动（127.0.0.1:8001）；
 pipeline 经 SCREENING_URL 指向本服务。
@@ -73,6 +77,17 @@ def screen(request: ScreenRequest) -> ScreeningResult:
         raise HTTPException(
             status_code=404,
             detail=f"剧本未定义候选人 {request.resume.liepin_user_id}",
+        )
+    if (
+        not request.llm_scoring
+        and result.status is not CandidateStatus.REJECTED_HARD
+    ):
+        # 镜像 screening 服务：inbound 直索要——仅硬规则，评分后移至简历收到后
+        return _result(
+            hard_pass=True,
+            score=None,
+            judge_reason="硬规则通过（评分后移至简历收到后）",
+            status=CandidateStatus.SCREENED_PASS,
         )
     return result
 

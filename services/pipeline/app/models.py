@@ -37,7 +37,7 @@ JOB_STATUS_ACTIVE = "active"
 
 CANDIDATE_SOURCES = ("inbound", "recommended")
 INTERACTION_DIRECTIONS = ("out", "in")
-INTERACTION_MSG_TYPES = ("greet_request", "reply", "attachment")
+INTERACTION_MSG_TYPES = ("greet_request", "reply", "attachment", "direct_request")
 
 
 class Job(Base):

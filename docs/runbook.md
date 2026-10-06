@@ -215,6 +215,11 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）已完成 7 个页面方法校准（check_login / list_unread / open_conversation / read_online_resume / send_message / check_attachment / download_attachment）；若再现说明代码回退 |
 | 回调 `404 {"detail":"Not Found"}`；E2E 卡在 read_resume「max retries 4 exceeded」 | **本机代理环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向本地代理时，httpx（默认 `trust_env=True`）会把 `127.0.0.1` 的内网回调也发给代理，被拦成 404（实测特征：同一连接首请求 200、其后全 404；`http.client` 与新建连接均正常）。服务侧已用 `trust_env=False` 绕过硬编码内网调用；自建脚本请设 `NO_PROXY=127.0.0.1,localhost,::1`（或 `set HTTP_PROXY=` 清空）。排查命令：`echo $env:HTTP_PROXY` |
 
+### 5.7 两路径流程差异（2026-10-06 策略）
+
+- **inbound（主动咨询者）**：硬规则 → 免前置 LLM 评分 → **直接索要简历**（话术变体 `direct_request`；job 未配置时用内置默认模板）→ 收到 PDF 入库 → **收到后补 LLM 评分**（写 match_score/judge_reason 供 HR；补评分失败仅记标记不重试，M3 人工关注）
+- **outbound（推荐人，M2）**：硬规则 + LLM 两层 → 通过者打招呼+索要（`greet_request`）；未通过判定者零触达（触达成本）
+
 ## 6. 已知限制（M2/T12 前置门禁）
 
 以下三项为 M1 范围内的已知缺陷，**真实模式操作前（T12 真实模式校准、M2 真实发送）必须先修**：

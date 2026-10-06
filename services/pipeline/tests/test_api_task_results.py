@@ -4,8 +4,9 @@
 dependency_overrides 注入 FakeScreening——不触真实 LLM / 真实 screening HTTP。
 
 覆盖任务要求 + Review Focus：
-- score 82 / threshold 70 → new→screened_pass→resume_requested→awaiting_resume
-  完整链、FakeTaskQueue 收到 SEND_MESSAGE、interactions 恰 1 行 out/greet_request
+- inbound 直索要（2026-10-06 策略）：仅硬规则 → new→screened_pass→resume_requested
+  →awaiting_resume 完整链、SEND_MESSAGE 用 direct_request 文案、interactions
+  恰 1 行 out/direct_request（outbound 两层判定与收到后补评分见专用用例）
 - 附件 .docx → 键保留 .docx【Review Focus 1】（pdf 走 put_resume 同测）
 - 同 liepin_user_id 重复 read_resume 幂等【Review Focus 5】
 - degraded → 不推进不发消息；rejected → 零触达
@@ -219,6 +220,7 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert req.jd_text == "负责产品规划与迭代"
     assert req.hard_rules == {"min_education": "本科", "min_years": 3}
     assert req.resume.liepin_user_id == liepin
+    assert req.llm_scoring is False  # inbound 直索要：仅硬规则（2026-10-06 策略）
 
     session.commit()  # 新事务读 API 已提交数据（MySQL RR 快照）
     candidate = session.execute(
@@ -235,8 +237,8 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
         )
     ).scalar_one()
     assert jc.status == CandidateStatus.RESUME_REQUESTED.value  # new→screened_pass→resume_requested
-    assert jc.match_score == 82
-    assert jc.judge_reason == "LLM 评分 82 通过"
+    assert jc.match_score is None  # 前置评分已免（收到简历后补评）
+    assert jc.judge_reason == "硬规则通过（评分后移至简历收到后）"
 
     # —— SEND_MESSAGE 入队：context 带渲染文本 + candidate_liepin_id ——
     assert len(fake_queue.enqueued) == 1
@@ -245,9 +247,9 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert send_task.job_candidate_id == jc.id
     assert send_task.candidate_liepin_id == liepin
     assert send_task.context["candidate_liepin_id"] == liepin
-    assert send_task.context["text"] == f"您好 张伟，看到您在看{title}岗位，方便发一份简历吗？"
+    assert send_task.context["text"] == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"  # direct_request 默认模板
 
-    # —— SEND_MESSAGE 成功 → awaiting_resume + 72h 锚点 + out/greet_request ——
+    # —— SEND_MESSAGE 成功 → awaiting_resume + 72h 锚点 + out/direct_request ——
     resp2 = _post_send_result(client, send_task)
     assert resp2.status_code == 200, resp2.text
 
@@ -264,8 +266,8 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     ).scalars().all()
     assert len(interactions) == 1  # 恰 1 行
     assert interactions[0].direction == "out"
-    assert interactions[0].msg_type == "greet_request"
-    assert interactions[0].content == f"您好 张伟，看到您在看{title}岗位，方便发一份简历吗？"
+    assert interactions[0].msg_type == "direct_request"  # inbound 直索要（2026-10-06 策略）
+    assert interactions[0].content == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"
     assert len(fake_queue.enqueued) == 1  # SEND_MESSAGE 成功后无后继任务（等巡检）
 
     # —— snapshot artifact → snapshots/{liepin}/YYYYMMDD_HHMMSS.png + 落库 + 真实 MinIO ——
@@ -298,9 +300,15 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
 
 
 def test_degraded_stays_new_no_message(client, fake_queue, fake_screening, session):
-    """degraded=True → 存快照+最小字段、status 保持 new、judge_reason=deferred、不发消息。"""
+    """degraded=True → 存快照+最小字段、status 保持 new、judge_reason=deferred、不发消息。
+
+    2026-10-06 策略后 degraded 仅存于 outbound（llm_scoring=True）路径——
+    inbound 直索要不调 LLM；本用例改用 recommended 候选人保持语义。
+    """
     job_id, _ = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
+    session.add(models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended"))
+    session.commit()
     fake_screening.set(liepin, DEGRADED_RESULT)
 
     read_task = _make_read_task(job_id, liepin)
@@ -361,9 +369,15 @@ def test_degraded_stays_new_no_message(client, fake_queue, fake_screening, sessi
 def test_rejected_zero_contact(
     client, fake_queue, fake_screening, session, result, expected_status, expected_score
 ):
-    """rejected_hard / rejected_llm → 对应状态 + judge_reason 落库，零触达。"""
+    """rejected_hard / rejected_llm → 对应状态 + judge_reason 落库，零触达。
+
+    2026-10-06 策略后 rejected_llm 仅存于 outbound（llm_scoring=True）；两种
+    拒绝语义均以 recommended 候选人验证（inbound 直索要不产生 rejected_llm）。
+    """
     job_id, _ = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
+    session.add(models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended"))
+    session.commit()
     fake_screening.set(liepin, result)
 
     read_task = _make_read_task(job_id, liepin)
@@ -384,6 +398,7 @@ def test_rejected_zero_contact(
     assert jc.status == expected_status
     assert jc.judge_reason == result.judge_reason
     assert jc.match_score == expected_score
+    assert fake_screening.requests[0].llm_scoring is True  # outbound 两层判定
     assert fake_queue.enqueued == []  # 零触达：无 SEND_MESSAGE
     assert session.execute(
         select(models.Interaction).where(models.Interaction.job_candidate_id == jc.id)
@@ -975,3 +990,81 @@ def test_artifact_snapshot_creates_candidate_if_missing(client, fake_queue, sess
         got.release_conn()
     finally:
         store.client.remove_object(BUCKET, candidate.snapshot_object_key)
+
+
+# —— 2026-10-06 策略：inbound 直索要 / outbound 打招呼索要 / 收到后补评分 ——
+
+
+def test_outbound_uses_greet_variant_and_llm_scoring(
+    client, fake_queue, fake_screening, session
+):
+    """outbound（recommended）：两层判定（llm_scoring=True）→ 打招呼索要 greet_request。"""
+    job_id, title = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    session.add(models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended"))
+    session.commit()
+    fake_screening.set(liepin, _pass_result(82))
+
+    read_task = _make_read_task(job_id, liepin)
+    fake_queue.record(read_task)
+    assert _post_read_result(client, read_task, liepin).status_code == 200
+    assert fake_screening.requests[0].llm_scoring is True  # outbound 保持两层
+
+    _reload(session)
+    candidate = session.execute(
+        select(models.Candidate).where(models.Candidate.liepin_user_id == liepin)
+    ).scalar_one()
+    assert candidate.source == "recommended"  # 预建行被复用
+    jc = session.execute(
+        select(models.JobCandidate).where(
+            models.JobCandidate.job_id == job_id,
+            models.JobCandidate.candidate_id == candidate.id,
+        )
+    ).scalar_one()
+    assert jc.status == CandidateStatus.RESUME_REQUESTED.value
+    assert jc.match_score == 82  # outbound 仍为前置评分
+    assert jc.judge_reason == "LLM 评分 82 通过"
+    (send_task,) = fake_queue.enqueued
+    assert send_task.context["text"] == f"您好 张伟，看到您在看{title}岗位，方便发一份简历吗？"
+
+    assert _post_send_result(client, send_task).status_code == 200
+    _reload(session)
+    interaction = session.execute(
+        select(models.Interaction).where(models.Interaction.job_candidate_id == jc.id)
+    ).scalar_one()
+    assert interaction.msg_type == "greet_request"  # outbound 原通道
+
+
+def test_inbound_post_receive_scoring_on_artifact(
+    client, fake_queue, fake_screening, session, store
+):
+    """inbound 直索要：收到简历 artifact 后补评分（llm_scoring=True）落 match_score。"""
+    job, candidate, jc = _make_awaiting_jc(session)  # source=inbound、minimal 已存
+    fake_screening.set(candidate.liepin_user_id, _pass_result(82))
+
+    dl_task = AtomicTask(
+        task_id=uuid4(),
+        type=AtomicTaskType.DOWNLOAD_ATTACHMENT,
+        job_id=job.id,
+        job_candidate_id=jc.id,
+        candidate_liepin_id=candidate.liepin_user_id,
+        context={},
+    )
+    fake_queue.record(dl_task)
+    resp = client.post(
+        f"/internal/tasks/{dl_task.task_id}/artifact",
+        files={"file": ("简历.pdf", b"%PDF-1.4 resume", "application/pdf")},
+        data={"task_id": str(dl_task.task_id), "kind": "resume", "filename": "简历.pdf"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    _reload(session)
+    jc2 = session.get(models.JobCandidate, jc.id)
+    assert jc2.status == CandidateStatus.RESUME_RECEIVED.value
+    assert jc2.match_score == 82  # 收到后补评分落账
+    assert jc2.judge_reason == "LLM 评分 82 通过"
+    assert fake_screening.requests[-1].llm_scoring is True  # 补评分调用带评分开关
+    try:
+        store.client.remove_object(BUCKET, jc2.minio_object_key)
+    finally:
+        pass

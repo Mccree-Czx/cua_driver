@@ -101,7 +101,9 @@ class ScreenRequest(BaseModel):
     resume: MinimalResume
     jd_text: str
     hard_rules: dict[str, Any]
-    threshold: int = 70  # R6：jobs.llm_threshold 默认 70 的请求侧表达（spec §4）
+    threshold: int = 70  # R6：jobs.llm_threshold 默认 70 的请求侧表达 （spec §4）
+    llm_scoring: bool = True  # 2026-10-06 策略：inbound 直索要 → False（仅硬规则，
+    # LLM 评分后移至简历收到后）；outbound（推荐人）保持两层判定 → True
 
 
 class ScreeningResult(BaseModel):

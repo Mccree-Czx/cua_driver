@@ -51,7 +51,8 @@ from hr_workbuddy import (
 )
 
 RESUME_TIMEOUT = timedelta(hours=72)  # spec §3：发送后 72h 无附件 → no_response→closed
-GREET_VARIANT = "greet_request"  # 打招呼+索要简历合并模板变体（决策 3）
+GREET_VARIANT = "greet_request"  # 打招呼+索要简历合并模板变体（决策 3；outbound）
+DIRECT_REQUEST_VARIANT = "direct_request"  # inbound 直索要变体（2026-10-06 策略：主动咨询者免前置评分）
 DEFERRED_REASON = "deferred: LLM unavailable"  # 降级判定理由（与 screening 服务一致）
 DEFERRED_MARKER = "deferred"  # 延期重判扫描判据：judge_reason 含此子串
 
@@ -94,8 +95,9 @@ def next_tasks(
 ) -> list[AtomicTask]:
     """按当前状态产出后继任务（M1 路径一）：
 
-    - resume_requested（READ_RESUME 通过后）→ SEND_MESSAGE（渲染 greet_request，
-      context 带渲染文本 + candidate_liepin_id）
+    - resume_requested（READ_RESUME 通过后）→ SEND_MESSAGE（渲染话术：inbound
+      直索要 direct_request / outbound 打招呼索要 greet_request；context 带
+      渲染文本 + candidate_liepin_id）
     - awaiting_resume 且 has_attachment → DOWNLOAD_ATTACHMENT
     - 其余 → []（SEND_MESSAGE 成功后等巡检；artifact 后待 M3 复核）
     """
@@ -103,7 +105,11 @@ def next_tasks(
     if status is CandidateStatus.RESUME_REQUESTED:
         if job is None or candidate is None:
             raise ValueError("resume_requested → SEND_MESSAGE 需要 job/candidate 渲染话术")
-        text = render_message(job, candidate, GREET_VARIANT)
+        # 2026-10-06 策略：主动咨询者（inbound）直索要；推荐人（outbound）打招呼索要
+        variant = (
+            DIRECT_REQUEST_VARIANT if candidate.source == "inbound" else GREET_VARIANT
+        )
+        text = render_message(job, candidate, variant)
         return [
             AtomicTask(
                 task_id=uuid4(),
@@ -254,6 +260,8 @@ def _handle_read_resume_result(
             jd_text=job.jd_text,
             hard_rules=job.hard_rules,
             threshold=job.llm_threshold,
+            # 2026-10-06 策略：inbound 直索要（仅硬规则；LLM 评分后移至简历收到后）
+            llm_scoring=(candidate.source != "inbound"),
         )
     )
     return _apply_screening_result(jc, job, candidate, sres)
@@ -299,11 +307,17 @@ def _handle_send_message_result(
     _advance(jc, StateEvent.AWAIT_RESUME)
     jc.resume_requested_at = now  # 72h 关闭锚点
     jc.last_touch_at = now
+    candidate = session.get(Candidate, jc.candidate_id)
+    if candidate is None:
+        raise MissingEntityError(f"job_candidate {jc.id} 关联的 candidate 行不存在")
     session.add(
         Interaction(
             job_candidate_id=jc.id,
             direction="out",
-            msg_type="greet_request",
+            # 2026-10-06 策略：inbound 直索要（direct_request）/ outbound 打招呼索要
+            msg_type=(
+                DIRECT_REQUEST_VARIANT if candidate.source == "inbound" else GREET_VARIANT
+            ),
             content=dispatched.context.get("text"),
             sent_at=now,
         )
@@ -449,6 +463,7 @@ def handle_artifact(
     *,
     queue: TaskQueue,
     store: ObjectStore,
+    screening: Screener,
     now: datetime | None = None,
 ) -> str | None:
     """D1 artifact 回调入口：kind=snapshot 归档在线简历截图；kind=resume 归档回传附件。"""
@@ -461,7 +476,7 @@ def handle_artifact(
         return _handle_snapshot_artifact(session, dispatched, data, store=store, now=_now(now))
     if kind == "resume":
         return _handle_resume_artifact(
-            session, dispatched, filename, data, store=store, now=_now(now)
+            session, dispatched, filename, data, store=store, screening=screening, now=_now(now)
         )
     raise InvalidEvidenceError(f"未知 artifact kind：{kind!r}（须 snapshot|resume）")
 
@@ -497,6 +512,7 @@ def _handle_resume_artifact(
     data: bytes,
     *,
     store: ObjectStore,
+    screening: Screener,
     now: datetime,
 ) -> str:
     if dispatched.type is not AtomicTaskType.DOWNLOAD_ATTACHMENT:
@@ -559,7 +575,39 @@ def _handle_resume_artifact(
             sent_at=now,
         )
     )
+    # 2026-10-06 策略：inbound 直索要流——收到简历后补 LLM 评分（前置评分已免）。
+    # 仅落 match_score/judge_reason 供 HR/M3；不改状态、不阻塞入库。
+    if candidate.source == "inbound" and jc.match_score is None:
+        _score_received_resume(screening, jc, job, candidate)
     return key
+
+
+def _score_received_resume(
+    screening: Screener, jc: JobCandidate, job: Job, candidate: Candidate
+) -> None:
+    """收到简历后补评分（inbound 直索要流）：仅落 match_score/judge_reason。
+
+    失败（LLM/pipeline 异常/无在线简历快照）记标记不重试——不阻塞入库，交 M3
+    人工关注（标记不含 deferred 子串，不被延期重判扫描误拾）。
+    """
+    if not candidate.online_resume_minimal:
+        jc.judge_reason = "收到后补评分跳过：无在线简历快照（M3 人工复核）"
+        return
+    try:
+        sres = screening.screen(
+            ScreenRequest(
+                job_id=job.id,
+                resume=MinimalResume.model_validate(candidate.online_resume_minimal),
+                jd_text=job.jd_text,
+                hard_rules=job.hard_rules,
+                threshold=job.llm_threshold,
+                llm_scoring=True,
+            )
+        )
+        jc.match_score = sres.score
+        jc.judge_reason = sres.judge_reason
+    except Exception:  # noqa: BLE001 - 补评分失败不阻塞入库（M3 人工关注）
+        jc.judge_reason = "收到后补评分失败（LLM/pipeline 异常；M3 人工复核）"
 
 
 def _minimal_from_evidence(evidence: dict) -> MinimalResume:

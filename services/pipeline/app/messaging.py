@@ -12,8 +12,15 @@ from sqlalchemy.orm import Session
 from app.models import Candidate, Interaction, Job, JobCandidate
 
 # 变量集（最小契约）：{name} 候选人姓名、{title} 岗位名。
-# 模板随 JD 配置（1-2 套，话术零承诺性表述）；新增变量须与 UI/任务契约同步。
+# 模板随 JD 配置（1-2 套，话术零承诺性表述）；新增变量须与 UI/任务契约同步 。
 TEMPLATE_VARIABLES = ("name", "title")
+
+# 内置默认模板：job.template_msgs 未配置该变体时的兜底。
+# 仅 direct_request（2026-10-06 inbound 直索要策略新增变体，兼容存量岗位配置）；
+# greet_request（outbound 打招呼+索要）仍要求显式配置。
+DEFAULT_TEMPLATES = {
+    "direct_request": "您好 {name}，感谢关注{title}岗位，方便发一份简历吗？",
+}
 
 
 class OneMessagePerCandidateError(Exception):
@@ -30,8 +37,14 @@ class _TemplateVars(dict):
 
 
 def render_message(job: Job, candidate: Candidate, variant: str) -> str:
-    """渲染岗位话术模板：template_msgs[variant] 做 {name}、{title} 变量填充。"""
+    """渲染岗位话术模板：template_msgs[variant] 做 {name}、{title} 变量填充。
+
+    job 未配置该变体时，direct_request 用内置默认模板兜底（存量岗位兼容）；
+    其余变体缺失仍抛错。
+    """
     template = (job.template_msgs or {}).get(variant)
+    if not template and variant in DEFAULT_TEMPLATES:
+        template = DEFAULT_TEMPLATES[variant]
     if not template:
         raise ValueError(f"岗位 {job.id} 的 template_msgs 缺少话术模板：{variant!r}")
     if not isinstance(template, str):

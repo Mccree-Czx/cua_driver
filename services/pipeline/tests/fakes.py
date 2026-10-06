@@ -41,7 +41,12 @@ class FakeTaskQueue:
 
 
 class FakeScreening:
-    """按 liepin_user_id 返回预设 ScreeningResult；未预设 → degraded。"""
+    """按 liepin_user_id 返回预设 ScreeningResult；未预设 → degraded。
+
+    2026-10-06 策略镜像：请求 llm_scoring=False（inbound 直索要）时，非硬拒
+    一律返回「硬规则通过（未评分）」——与 screening 服务语义逐字一致；
+    硬拒预设与 llm_scoring=True 的响应原样返回。
+    """
 
     def __init__(self) -> None:
         self.responses: dict[str, ScreeningResult] = {}
@@ -52,4 +57,17 @@ class FakeScreening:
 
     def screen(self, request: ScreenRequest) -> ScreeningResult:
         self.requests.append(request)
-        return self.responses.get(request.resume.liepin_user_id, DEGRADED_RESULT)
+        result = self.responses.get(request.resume.liepin_user_id, DEGRADED_RESULT)
+        if (
+            not request.llm_scoring
+            and result.status is not CandidateStatus.REJECTED_HARD
+        ):
+            return ScreeningResult(
+                hard_pass=True,
+                hard_reasons=[],
+                score=None,
+                judge_reason="硬规则通过（评分后移至简历收到后）",
+                status=CandidateStatus.SCREENED_PASS,
+                degraded=False,
+            )
+        return result

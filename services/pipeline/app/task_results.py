@@ -111,13 +111,21 @@ def post_task_artifact(
     session: Session = Depends(get_session),
     queue=Depends(get_queue),
     store=Depends(get_store),
+    screening=Depends(get_screening),
 ):
     """D1：cua-agent artifact 回调（multipart）。kind=snapshot 归档截图、kind=resume 归档附件。"""
     if form_task_id != task_id:
         raise _http_error(422, "表单 task_id 与路径 task_id 不一致")
     try:
         key = handle_artifact(
-            session, task_id, kind, filename, file.file.read(), queue=queue, store=store
+            session,
+            task_id,
+            kind,
+            filename,
+            file.file.read(),
+            queue=queue,
+            store=store,
+            screening=screening,
         )
     except UnknownTaskError as exc:
         raise _http_error(404, str(exc)) from exc

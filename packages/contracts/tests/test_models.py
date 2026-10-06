@@ -173,6 +173,17 @@ class TestScreenRequest:
         )
         assert req.threshold == 70
 
+    def test_llm_scoring_default_true_and_override(self):
+        """2026-10-06 策略：llm_scoring 默认 True（outbound 两层）；inbound 直索要传 False。"""
+        base = dict(
+            job_id=1,
+            resume=MinimalResume(**_minimal_resume()),
+            jd_text="产品经理 JD",
+            hard_rules={},
+        )
+        assert ScreenRequest(**base).llm_scoring is True
+        assert ScreenRequest(**base, llm_scoring=False).llm_scoring is False
+
 
 class TestScreeningResult:
     def test_json_roundtrip(self):

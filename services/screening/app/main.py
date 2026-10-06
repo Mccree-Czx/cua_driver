@@ -2,8 +2,10 @@
 
 判定顺序（controller 裁定，spec v1.6 §3 步骤 3-4）：
 1. hard_pass=False → rejected_hard（短路，不调 LLM）
-2. LLM 评分（客户端可注入）；provider 错误 / schema 非法 → degraded（HTTP 200）
-3. score >= threshold → screened_pass；否则 rejected_llm
+2. llm_scoring=False（2026-10-06 inbound 直索要策略）→ 硬规则通过即返回
+   screened_pass（score=None，评分后移至简历收到后）——不调 LLM
+3. LLM 评分（客户端可注入）；provider 错误 / schema 非法 → degraded（HTTP 200）
+4. score >= threshold → screened_pass；否则 rejected_llm
 degraded 时 status 无实际含义（pipeline 侧只存快照不推进，spec §5），
 固定写 screened_pass 以保持契约合法。
 """
@@ -64,6 +66,18 @@ def screen(
             score=None,
             judge_reason="硬规则不通过: " + "；".join(hard_reasons),
             status=CandidateStatus.REJECTED_HARD,
+            degraded=False,
+        )
+
+    if not request.llm_scoring:
+        # 2026-10-06 策略：inbound 直索要——仅硬规则通过即返回（LLM 评分后移至
+        # 简历收到后；score=None 表达"未评分"）。不依赖 LLM client。
+        return ScreeningResult(
+            hard_pass=True,
+            hard_reasons=[],
+            score=None,
+            judge_reason="硬规则通过（评分后移至简历收到后）",
+            status=CandidateStatus.SCREENED_PASS,
             degraded=False,
         )
 

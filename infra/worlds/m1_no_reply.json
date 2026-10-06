@@ -47,5 +47,15 @@
       "experience_summary": "四年产品经验，评分通过但永不回复"
     }
   },
-  "reply_timeline": "never"
+  "reply_timeline": [
+    {
+      "tick": 1,
+      "conversation_id": "LP002",
+      "text": null,
+      "attachment": {
+        "file_name": "简历.pdf",
+        "content_type": "application/pdf"
+      }
+    }
+  ]
 }

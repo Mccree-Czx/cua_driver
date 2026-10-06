@@ -520,7 +520,8 @@ def _job_payload() -> dict:
         "jd_text": "负责产品规划与迭代，3 年以上产品经验优先",
         "hard_rules": {"min_education": "本科", "min_years": 3},
         "template_msgs": {
-            "greet_request": "您好 {name}，看到您在看{title}岗位，方便发一份简历吗？"
+            "greet_request": "您好 {name}，看到您在看{title}岗位，方便发一份简历吗？",
+            "direct_request": "您好 {name}，感谢关注{title}岗位，方便发一份简历吗？",
         },
         "llm_threshold": 70,
     }
@@ -563,11 +564,11 @@ def scenario_a(log_dir: Path) -> ScenarioReport:
         )
         jc = _jc("LP001")
         # 中间态佐证（状态链 binding：终态以 DB 为准，中间态经字段/行佐证）
-        assert jc["match_score"] == 82, "screened_pass 佐证：match_score=82"
-        assert jc["judge_reason"], "screened_pass 佐证：judge_reason 已落"
+        assert jc["match_score"] is None, "前置评分已免：收到简历前 match_score 为空（2026-10-06 策略）"
+        assert "评分后移至简历收到后" in (jc["judge_reason"] or ""), "screened_pass 佐证：硬规则通过（未评分）"
         assert jc["resume_requested_at"] is not None, "awaiting_resume 佐证：72h 锚点已落"
         rows = _interactions(jc["id"])
-        assert [(r["direction"], r["msg_type"]) for r in rows] == [("out", "greet_request")]
+        assert [(r["direction"], r["msg_type"]) for r in rows] == [("out", "direct_request")]
         # 第 1 次巡检：附件尚未送达（tick 0 < 送达 tick 1）→ 无附件不动
         baseline = _task_log_count()
         sweep = awaiting_resume_sweep(_deps())
@@ -611,7 +612,7 @@ def scenario_a(log_dir: Path) -> ScenarioReport:
         assert jc["resume_downloaded_at"] is not None, "resume_received 佐证：下载时间已落"
         checks.append(
             "状态链 new→screened_pass→resume_requested→awaiting_resume→resume_received"
-            "（终态=resume_received；中间态经 match_score=82/72h 锚点/interactions 佐证）"
+            "（终态=resume_received；中间态经 硬规则未评分/72h 锚点/interactions 佐证）"
         )
         # 4) PDF 键 resumes/1/LP001/张伟_产品经理_\d{8}.pdf
         pdf = jc["minio_object_key"]
@@ -620,17 +621,18 @@ def scenario_a(log_dir: Path) -> ScenarioReport:
         ), f"PDF 键不匹配：{pdf}"
         assert _minio().stat_object(BUCKET, pdf), f"PDF 对象不存在：{pdf}"
         checks.append(f"PDF 键匹配 resumes/1/LP001/张伟_{JOB_TITLE}_\\d{{8}}.pdf：{pdf}")
-        # 5) interactions 恰 1 行 out/greet_request + 1 行 in/attachment
+        # 5) interactions 恰 1 行 out/direct_request + 1 行 in/attachment
         rows = _interactions(jc["id"])
         assert [(r["direction"], r["msg_type"]) for r in rows] == [
-            ("out", "greet_request"),
+            ("out", "direct_request"),
             ("in", "attachment"),
         ], f"interactions 偏差：{rows}"
-        checks.append("interactions 恰 1 行 out/greet_request + 1 行 in/attachment")
-        # 6) judge_reason 非空
+        checks.append("interactions 恰 1 行 out/direct_request + 1 行 in/attachment")
+        # 6) 收到后补评分：match_score=82 + judge_reason（2026-10-06 策略）
+        assert jc["match_score"] == 82, "收到后补评分：match_score=82"
         assert jc["judge_reason"], "judge_reason 为空"
-        checks.append(f"judge_reason 非空：{jc['judge_reason']}")
-        return ScenarioReport(name="剧本 A：张伟/LP001（评分 82 > 阈值 70）全链路", checks=checks)
+        checks.append(f"收到后补评分：match_score=82；judge_reason={jc['judge_reason']}")
+        return ScenarioReport(name="剧本 A：张伟/LP001（inbound 直索要 → 收到后评分 82）全链路", checks=checks)
     finally:
         stop_proc(worker)
         _write_world(HAPPY_WORLD, world)  # 剧本复原（tick 归 0，不污染仓库）
@@ -643,35 +645,62 @@ def scenario_b(log_dir: Path) -> ScenarioReport:
     checks: list[str] = []
     reset_state()
     assert seed_job() == 1
+    world_b = _read_world(NO_REPLY_WORLD)
+    _write_world(NO_REPLY_WORLD, {**world_b, "tick": 0})  # 剧本原状复位（可重跑）
     worker = start_worker(NO_REPLY_WORLD, log_dir)
     try:
         report = inbound_round(_deps())
         assert report.dispatched == 1
         poll_until(
-            lambda: _jc("LP002").get("status") == "rejected_llm"
+            lambda: _jc("LP002").get("status") == "awaiting_resume"
             and _jc("LP003").get("status") == "rejected_hard"
             and _jc("LP004").get("status") == "awaiting_resume",
             timeout=180,
-            what="剧本 B 三候选人判定完成（LP002 拒绝 / LP003 硬规则拒绝 / LP004 待回复）",
+            what="剧本 B 三候选人判定完成（LP002 直索要待回复 / LP003 硬规则拒绝 / LP004 待回复）",
         )
-        # 评分 55 → rejected_llm 且零触达
+        # —— LP002：直索要（未前置评分）→ 收到附件 → 收到后评分 55 落账（2026-10-06 策略）——
         jc2 = _jc("LP002")
-        assert jc2["status"] == "rejected_llm"
-        assert jc2["match_score"] == 55 and jc2["judge_reason"]
-        assert _interactions(jc2["id"]) == [], "rejected_llm 零触达：不应有 out 消息"
-        checks.append("LP002 评分 55 → rejected_llm，零触达（无 out 消息）")
+        assert jc2["status"] == "awaiting_resume"
+        assert jc2["match_score"] is None, "前置评分已免：收到简历前无分数"
+        rows2 = _interactions(jc2["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows2] == [("out", "direct_request")]
+        checks.append("LP002 直索要（direct_request）无前置评分 → awaiting_resume")
+        # 首次巡检（tick 0）：LP002+LP004 均 awaiting → 各一次 CHECK_ATTACHMENT，无附件不动
+        sweep = awaiting_resume_sweep(_deps())
+        assert sweep.dispatched == 2, f"LP002+LP004 均处 awaiting（首巡）：{sweep}"
+        # 推进 tick 1 → LP002 附件送达；清在途索引（时间推进的 mock 等价 物）后复巡
+        _write_world(NO_REPLY_WORLD, {**world_b, "tick": 1})
+        client = _redis()
+        client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc2["id"]))
+        client.close()
+        sweep = awaiting_resume_sweep(_deps())
+        assert sweep.dispatched == 1, f"复巡仅 LP002（LP004 在途去重）：{sweep}"
+        poll_until(
+            lambda: _jc("LP002").get("status") == "resume_received",
+            timeout=180,
+            what="LP002 到达 resume_received（附件下载归档 + 收到后评分）",
+        )
+        jc2 = _jc("LP002")
+        assert jc2["match_score"] == 55, "收到后补评分：match_score=55"
+        assert "评分 55" in (jc2["judge_reason"] or ""), f"judge_reason 偏差：{jc2['judge_reason']}"
+        rows2 = _interactions(jc2["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows2] == [
+            ("out", "direct_request"),
+            ("in", "attachment"),
+        ], f"LP002 interactions 偏差：{rows2}"
+        checks.append("LP002 收到简历后补评分 55 落账（resume_received + in/attachment）")
         # 硬规则不通过 → rejected_hard 且零触达
         jc3 = _jc("LP003")
         assert jc3["status"] == "rejected_hard"
         assert jc3["judge_reason"] and "硬规则" in jc3["judge_reason"]
         assert _interactions(jc3["id"]) == [], "rejected_hard 零触达：不应有 out 消息"
         checks.append("LP003 硬规则不通过 → rejected_hard，零触达")
-        # 永不回复 → awaiting_resume，out 恰 1
+        # 永不回复 → awaiting_resume，out 恰 1（直索要）
         jc4 = _jc("LP004")
         assert jc4["status"] == "awaiting_resume"
         rows4 = _interactions(jc4["id"])
-        assert [(r["direction"], r["msg_type"]) for r in rows4] == [("out", "greet_request")]
-        checks.append("LP004 永不回复 → awaiting_resume，out 消息恰 1")
+        assert [(r["direction"], r["msg_type"]) for r in rows4] == [("out", "direct_request")]
+        checks.append("LP004 永不回复 → awaiting_resume，out 消息恰 1（direct_request）")
         # 72h 边界内侧：回拨至 now-72h+5s（余量吸收脚本→pipeline 请求延迟）→ 仍 awaiting。
         # 恰好 72h（严格 < 边界）不关的精确语义由 pipeline 单测 test_72h 注入时钟覆盖；
         # E2E 真实时钟下用 5s 余量断言边界内侧不关。
@@ -686,11 +715,12 @@ def scenario_b(log_dir: Path) -> ScenarioReport:
         assert resp.get("closed") == 1, f"过期 awaiting 应关闭：{resp}"
         assert _jc("LP004").get("status") == "closed"
         rows4 = _interactions(jc4["id"])
-        assert [(r["direction"], r["msg_type"]) for r in rows4] == [("out", "greet_request")]
+        assert [(r["direction"], r["msg_type"]) for r in rows4] == [("out", "direct_request")]
         checks.append("72h 边界外侧（now-72h-1s）→ no_response→closed，out 消息仍恰 1（零追发）")
-        return ScenarioReport(name="剧本 B：拒绝 / 零触达 / 72h 关闭", checks=checks)
+        return ScenarioReport(name="剧本 B：硬拒零触达 / 收到后评分 55 / 72h 关闭", checks=checks)
     finally:
         stop_proc(worker)
+        _write_world(NO_REPLY_WORLD, world_b)  # 剧本复原（tick 归 0）
 
 
 # —— 总装：一条命令跑全部 ——
