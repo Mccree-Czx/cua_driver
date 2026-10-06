@@ -1,0 +1,29 @@
+[project]
+name = "hr-workbuddy"
+version = "0.1.0"
+description = "猎聘 HR 招聘自动化系统 (spec v1.6) — monorepo workspace root"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    "cryptography>=42", # PyMySQL 需要它完成 MySQL 8 默认的 caching_sha2_password 首次认证
+    "hr-workbuddy-contracts", # workspace 成员：根环境可运行全部共享契约测试
+    "httpx>=0.27",
+    "minio>=7.2",
+    "pymysql>=1.1",
+    "pytest>=8",
+    "redis>=5",
+    "sqlalchemy>=2.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "infra: requires running docker compose",
+    "e2e: M1 end-to-end acceptance (mock mode; starts real service subprocesses)",
+]
+
+[tool.uv.sources]
+hr-workbuddy-contracts = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*", "services/*"]

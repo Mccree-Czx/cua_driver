@@ -1,0 +1,26 @@
+[project]
+name = "hr-workbuddy-pipeline"
+version = "0.1.0"
+description = "pipeline 服务 — MySQL/MinIO 唯一写入口 + 状态机编排（spec v1.6）"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13",
+    "arq>=0.26",
+    "cryptography>=42", # PyMySQL 需要它完成 MySQL 8 默认的 caching_sha2_password 首次认证
+    "fastapi>=0.115",
+    "hr-workbuddy-contracts==0.1.0",
+    "httpx>=0.27",
+    "minio>=7.2",
+    "pydantic-settings>=2.2",
+    "pymysql>=1.1",
+    "python-multipart>=0.0.9",
+    "redis>=5.0",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+hr-workbuddy-contracts = { workspace = true }

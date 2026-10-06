@@ -1,0 +1,83 @@
+name: hr-workbuddy
+
+# 数据底座：MySQL 8.4 + MinIO + Redis（spec v1.6 §7.4，Docker Desktop / WSL2 后端）
+# 用法：
+#   cp infra/.env.example infra/.env   # 可选，覆盖默认值
+#   docker compose -f infra/docker-compose.yml up -d --wait
+# 冒烟验证：
+#   uv run pytest infra/tests -m infra
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-hr_root_dev_pw}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-hr_workbuddy}
+      MYSQL_USER: ${MYSQL_USER:-hr_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-hr_dev_pw}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # 用真实登录验证（mysqladmin ping 在认证失败时也返回 0，不可靠）
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD $$MYSQL_DATABASE -e 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  # 一次性容器：创建 hr-workbuddy bucket 后退出
+  minio-init:
+    image: quay.io/minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        echo 'waiting for minio...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/hr-workbuddy;
+      "
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  minio_data:
+  redis_data:

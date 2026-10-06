@@ -1,0 +1,507 @@
+"""worker + executor：动作前延时 / 令牌桶权威检查 / 动作后截图校验 /
+重试策略 / evidence 契约 / artifact 回调。
+
+全 mock：FakeLiepinDriver + MockBrain + 内存 fake 桶/重排/管线，无真实
+网络 / Redis / MinIO 依赖；延时与睡眠注入，不真 sleep。
+
+evidence 契约（对照 pipeline orchestrator docstring 逐字段）：
+- READ_RESUME 成功：resume（MinimalResume 7 字段）+ screenshot_keys
+  + brain_tokens + cost_est
+- SEND_MESSAGE 成功：sent_at（ISO str）+ brain_tokens + cost_est
+- CHECK_ATTACHMENT 成功：has_attachment + brain_tokens + cost_est
+"""
+
+import asyncio
+from datetime import datetime, timezone
+from uuid import uuid4
+
+import pytest
+from arq.worker import Retry
+
+from app.brain.mock import MockBrain
+from app.brain.openai_brain import BrainUnavailableError
+from app.drivers.fake import FakeLiepinDriver
+from app.worker import WorkerDeps, execute_task, run_task
+from app.executor import ExecutorDeps
+from app.world import AttachmentSpec, ConversationScript, ReplyEvent, World
+from hr_workbuddy import AtomicTask, AtomicTaskType, MinimalResume
+
+TASK_ID = uuid4()
+CANDIDATE = "uid_a"
+SNAPSHOT_KEY = "snapshots/uid_a/20261005_120000.png"
+
+
+def make_resume(uid: str) -> MinimalResume:
+    """恰 7 字段的最小简历 fixture。"""
+    return MinimalResume(
+        name=f"候选人{uid}",
+        liepin_user_id=uid,
+        education="本科",
+        years_of_experience="3年",
+        city="杭州",
+        salary="20-30K",
+        experience_summary="3 年后端开发经验",
+    )
+
+
+def make_world(**overrides) -> World:
+    """两会话剧本：uid_a 未读+简历、uid_b 已读无简历；默认登录态。"""
+    defaults = dict(
+        login_state=True,
+        conversations=[
+            ConversationScript(liepin_user_id="uid_a", unread=True, resume_fixture="fixture_a"),
+            ConversationScript(liepin_user_id="uid_b", unread=False, resume_fixture=None),
+        ],
+        resume_fixtures={"fixture_a": make_resume("uid_a")},
+        reply_timeline="never",
+    )
+    defaults.update(overrides)
+    return World(**defaults)
+
+
+def make_task(
+    task_type: AtomicTaskType,
+    *,
+    attempt: int = 0,
+    max_attempts: int = 3,
+    candidate_liepin_id: str | None = CANDIDATE,
+    context: dict | None = None,
+) -> AtomicTask:
+    return AtomicTask(
+        task_id=TASK_ID,
+        type=task_type,
+        job_id=1,
+        job_candidate_id=1,
+        candidate_liepin_id=candidate_liepin_id,
+        context=context or {},
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+
+
+# —— 内存替身：桶 / 重排 / 延时 / 管线 ——
+
+
+class FakeBucket:
+    """脚本化令牌桶：按序返回预设判定，记录 (key, rate, window) 调用。"""
+
+    def __init__(self, *verdicts: bool) -> None:
+        self.verdicts: list[bool] = list(verdicts)
+        self.calls: list[tuple[str, int, int]] = []
+
+    async def acquire_async(self, key: str, rate_per_window: int, window_seconds: int) -> bool:
+        self.calls.append((key, rate_per_window, window_seconds))
+        return self.verdicts.pop(0) if self.verdicts else True
+
+
+class FakeRequeue:
+    """重排记录器：记录 (task, defer_seconds)，不真入队。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[AtomicTask, int]] = []
+
+    async def __call__(self, task: AtomicTask, defer_seconds: int) -> None:
+        self.calls.append((task, defer_seconds))
+
+
+class FakePipeline:
+    """假 pipeline HTTP：记录 result / artifact 回调，artifact 返回预设对象键。"""
+
+    def __init__(self, object_key: str = SNAPSHOT_KEY) -> None:
+        self.object_key = object_key
+        self.results: list = []
+        self.artifacts: list = []
+
+    def post_result(self, task_id, result) -> None:
+        self.results.append((task_id, result))
+
+    def post_artifact(self, task_id, kind: str, filename: str, data: bytes) -> str:
+        self.artifacts.append((task_id, kind, filename, data))
+        return self.object_key
+
+
+class FakeSleep:
+    """睡眠记录器（不真睡）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+class FakeUniform:
+    """均匀随机源记录器：记录 (lo, hi) 并返回固定值 0。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, float]] = []
+
+    def __call__(self, lo: float, hi: float) -> float:
+        self.calls.append((lo, hi))
+        return 0.0
+
+
+def make_deps(*, bucket: FakeBucket | None = None, uniform: FakeUniform | None = None) -> dict:
+    """组装 WorkerDeps：driver 读世界剧本，brain 默认通过，全部副作用注入。"""
+    world = make_world()
+    driver = FakeLiepinDriver(world)
+    brain = MockBrain()
+    pipeline = FakePipeline()
+    sleep = FakeSleep()
+    uniform = uniform or FakeUniform()
+    requeue = FakeRequeue()
+    bucket = bucket or FakeBucket(True)
+    clock = lambda: 3600.0 * 10 + 30.0  # 任意固定时刻：距下一小时边界 3570s
+    now = lambda: datetime(2026, 10, 5, 10, 0, 30, tzinfo=timezone.utc)
+    executor = ExecutorDeps(
+        driver=driver,
+        brain=brain,
+        capture=lambda: b"\x89PNG\r\n\x1a\nfake-capture",
+        upload_artifact=pipeline.post_artifact,
+        price_per_1k_tokens=0.002,
+        now=now,
+    )
+    return dict(
+        driver=driver,
+        world=world,
+        brain=brain,
+        pipeline=pipeline,
+        sleep=sleep,
+        uniform=uniform,
+        now=now,
+        deps=WorkerDeps(
+            executor=executor,
+            pipeline=pipeline,
+            bucket=bucket,
+            requeue=requeue,
+            uniform=uniform,
+            sleep=sleep,
+            clock=clock,
+            now=now,
+        ),
+    )
+
+
+def run(task: AtomicTask, fixtures: dict, *, attempt: int = 0):
+    return asyncio.run(run_task(task, fixtures["deps"], attempt=attempt))
+
+
+# —— 成功路径与 evidence 契约 ——
+
+
+def test_read_resume_success_evidence_and_snapshot_artifact():
+    """READ_RESUME 成功：evidence 七字段 + screenshot_keys + 账目；
+    PNG 截图以 kind=snapshot 上传 fake pipeline 并取回对象键。"""
+    fixtures = make_deps()
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)
+
+    assert result.outcome == "success"
+    resume = result.evidence["resume"]
+    assert set(resume) == {
+        "name",
+        "liepin_user_id",
+        "education",
+        "years_of_experience",
+        "city",
+        "salary",
+        "experience_summary",
+    }  # 恰 7 字段（pipeline _minimal_from_evidence 逐字段消费）
+    assert result.evidence["screenshot_keys"] == [SNAPSHOT_KEY]
+    assert result.evidence["brain_tokens"] == 0
+    assert result.evidence["cost_est"] == 0.0
+    assert result.error is None
+
+    pipeline = fixtures["pipeline"]
+    (task_id, kind, filename, data), = pipeline.artifacts
+    assert task_id == TASK_ID
+    assert kind == "snapshot"
+    assert data == fixtures["driver"].read_online_resume(CANDIDATE)[0]  # 上传即截图原字节
+    assert filename.endswith(".png")
+    (posted_task_id, posted_result), = pipeline.results
+    assert posted_task_id == TASK_ID and posted_result is result
+
+
+def test_send_message_success_evidence_sent_at():
+    """SEND_MESSAGE 成功：sent_at ISO str + 账目；消息经驱动发出。"""
+    fixtures = make_deps()
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={"text": "您好，方便发一份简历吗？", "candidate_liepin_id": CANDIDATE},
+    )
+    result = run(task, fixtures)
+
+    assert result.outcome == "success"
+    assert result.evidence["sent_at"] == fixtures["now"]().isoformat()
+    assert fixtures["driver"].sent_messages == [(CANDIDATE, "您好，方便发一份简历吗？")]
+
+
+def test_check_attachment_negative_is_success():
+    """CHECK_ATTACHMENT 无附件：success + has_attachment=False（pipeline 等下一轮巡检）。"""
+    fixtures = make_deps()
+    result = run(make_task(AtomicTaskType.CHECK_ATTACHMENT), fixtures)
+    assert result.outcome == "success"
+    assert result.evidence["has_attachment"] is False
+
+
+def test_check_login_and_list_unread_evidence_shapes():
+    """CHECK_LOGIN / LIST_UNREAD 映射：evidence 形状（T10 编排对齐点）。"""
+    fixtures = make_deps()
+    login = run(make_task(AtomicTaskType.CHECK_LOGIN), fixtures)
+    assert login.outcome == "success"
+    assert login.evidence["logged_in"] is True
+    unread = run(make_task(AtomicTaskType.LIST_UNREAD), fixtures)
+    assert unread.outcome == "success"
+    assert unread.evidence["unread_ids"] == ["uid_a"]
+
+
+def test_download_attachment_uploads_resume_artifact_with_filename():
+    """DOWNLOAD_ATTACHMENT 成功：字节按不透明透传，kind=resume + 剧本文件名（R7）。"""
+    world = make_world(
+        reply_timeline=[
+            ReplyEvent(tick=0, conversation_id=CANDIDATE, attachment=AttachmentSpec(file_name="简历.pdf"))
+        ]
+    )
+    fixtures = make_deps()
+    fixtures["deps"].executor.driver = FakeLiepinDriver(world)
+    result = run(make_task(AtomicTaskType.DOWNLOAD_ATTACHMENT), fixtures)
+
+    assert result.outcome == "success"
+    assert result.evidence["filename"] == "简历.pdf"
+    (task_id, kind, filename, data), = fixtures["pipeline"].artifacts
+    assert task_id == TASK_ID and kind == "resume" and filename == "简历.pdf"
+    script_bytes, _ = FakeLiepinDriver(world).download_attachment(CANDIDATE)  # R7：(字节, 文件名)
+    assert data == script_bytes  # 原字节透传，不解析/不预览（T8 遗留：占位 PDF）
+
+
+# —— 失败重试：3 次重试后 → failed_needs_manual ——
+
+
+def _fail_driver(deps: WorkerDeps) -> None:
+    """让 driver 抛错（未知会话）。"""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("driver 动作失败")
+
+    deps.executor.driver.read_online_resume = boom
+
+
+def test_action_failure_below_max_attempts_raises_arq_retry():
+    """attempt < max_attempts：结果 failed_retryable 已回调，arq Retry 重试。"""
+    fixtures = make_deps()
+    _fail_driver(fixtures["deps"])
+    task = make_task(AtomicTaskType.READ_RESUME, attempt=2)
+
+    with pytest.raises(Retry):
+        run(task, fixtures, attempt=2)
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_retryable"
+    assert "驱动" in posted.error or "失败" in posted.error
+
+
+def test_action_failure_at_max_attempts_needs_manual():
+    """attempt 已达 max_attempts=3：failed_needs_manual，不再重试（不抛 Retry）。"""
+    fixtures = make_deps()
+    _fail_driver(fixtures["deps"])
+    task = make_task(AtomicTaskType.READ_RESUME, attempt=3)
+
+    result = run(task, fixtures, attempt=3)
+    assert result.outcome == "failed_needs_manual"
+    assert result.error is not None
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_needs_manual"
+
+
+# —— 真实模式门禁 ①：SEND_MESSAGE 发送后失败不重试（防同一任务重发）——
+
+
+def test_send_message_post_send_verify_failure_needs_manual_no_resend():
+    """SEND_MESSAGE 发送后 verify 失败：failed_needs_manual 且不 raise Retry。
+
+    消息已真实发出，arq 同 payload 重跑会重发同一消息（一人一消息只防第二条
+    任务的落库，防不住同一任务的重发）——evidence 带 post_send_failure 与
+    sent_at，fake 驱动记录 send 调用恰 1 次。
+    """
+    fixtures = make_deps()
+    fixtures["deps"].executor.brain = MockBrain(
+        script=lambda screenshot, criteria: False
+    )
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={"text": "您好", "candidate_liepin_id": CANDIDATE},
+    )
+
+    result = run(task, fixtures)  # 不抛 Retry
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["post_send_failure"] is True
+    assert result.evidence["sent_at"] == fixtures["now"]().isoformat()
+    assert result.evidence["attempt"] == 0
+    assert fixtures["driver"].sent_messages == [(CANDIDATE, "您好")]  # 恰发一次
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_needs_manual"
+    assert posted.evidence["post_send_failure"] is True
+
+
+def test_send_message_post_send_brain_unavailable_needs_manual_no_resend():
+    """SEND_MESSAGE 发送后大脑不可用：failed_needs_manual，不 defer 重判不重发。"""
+    fixtures = make_deps()
+    fixtures["deps"].executor.brain = MockBrain(
+        script=lambda screenshot, criteria: (_ for _ in ()).throw(
+            BrainUnavailableError("供应商 500")
+        )
+    )
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={"text": "您好", "candidate_liepin_id": CANDIDATE},
+    )
+
+    result = run(task, fixtures)
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["post_send_failure"] is True
+    assert fixtures["driver"].sent_messages == [(CANDIDATE, "您好")]
+    assert fixtures["deps"].requeue.calls == []  # 不 deferred 重判（重判会重发）
+
+
+def test_send_message_pre_send_driver_failure_still_retries():
+    """SEND_MESSAGE 发送前驱动抛错（send 未完成）：failed_retryable + Retry 语义不变。"""
+    fixtures = make_deps()
+
+    def boom(candidate_liepin_id, text):
+        raise RuntimeError("driver 动作失败")
+
+    fixtures["deps"].executor.driver.send_message = boom
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={"text": "您好", "candidate_liepin_id": CANDIDATE},
+    )
+
+    with pytest.raises(Retry):
+        run(task, fixtures, attempt=0)
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_retryable"
+    assert posted.evidence.get("post_send_failure") is None
+    assert fixtures["driver"].sent_messages == []  # 消息未发出
+
+
+def test_read_task_verify_failure_still_retryable():
+    """读类任务 verify 失败：仍 failed_retryable + Retry（重试语义不变）。"""
+    fixtures = make_deps()
+    fixtures["deps"].executor.brain = MockBrain(
+        script=lambda screenshot, criteria: False
+    )
+
+    with pytest.raises(Retry):
+        run(make_task(AtomicTaskType.READ_RESUME), fixtures, attempt=0)
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_retryable"
+    assert posted.evidence.get("post_send_failure") is None
+    assert posted.evidence["attempt"] == 0
+
+
+# —— evidence 账目：attempt 与 duration_s 传递（pipeline 按 (task_id, attempt) 落账）——
+
+
+class _AdvancingClock:
+    """每次调用推进 0.25s 的时钟：duration_s 可控可断言。"""
+
+    def __init__(self) -> None:
+        self.t = 10.0
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        self.t += 0.25
+        return self.t
+
+
+def test_success_evidence_carries_attempt_and_duration_s():
+    """evidence 带折算 attempt（task.attempt + job_try - 1）与 duration_s（耗时秒）。"""
+    fixtures = make_deps()
+    clock = _AdvancingClock()
+    fixtures["deps"].clock = clock
+
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures, attempt=2)
+
+    assert result.evidence["attempt"] == 2
+    assert result.evidence["duration_s"] == pytest.approx(0.25)
+    assert clock.calls == 2  # 起止各取一次
+
+
+# —— 空桶 → defer 重排（不发消息、不失败） ——
+
+
+def test_empty_bucket_defers_without_sending():
+    """触达前权威检查：桶耗尽 → _defer_by 重排自身 + 返回标记 deferred 的结果；
+    不失败、不发消息、不回调 pipeline。"""
+    fixtures = make_deps(bucket=FakeBucket(False))
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={"text": "您好", "candidate_liepin_id": CANDIDATE},
+    )
+    result = run(task, fixtures)
+
+    assert result.outcome == "failed_retryable"
+    assert result.evidence["deferred"] is True
+    assert fixtures["driver"].sent_messages == []  # 不得绕过桶直接发
+    assert fixtures["pipeline"].results == []  # deferred 不回调（无失败账）
+    (requeued, defer_seconds), = fixtures["deps"].requeue.calls
+    assert requeued == task
+    assert defer_seconds == 3570  # 距下一小时窗口（桶随 {date-hour} 键回填）
+    (key, rate, window), = fixtures["deps"].bucket.calls
+    assert key == "msg-touch:2026100510"
+    assert rate == 20 and window == 3600
+
+
+def test_brain_unavailable_defers_reevaluate():
+    """视觉大脑不可用（BrainUnavailableError）→ deferred 重判，不按动作失败重试。"""
+    fixtures = make_deps()
+    fixtures["deps"].executor.brain = MockBrain(
+        script=lambda screenshot, criteria: (_ for _ in ()).throw(BrainUnavailableError("供应商 500"))
+    )
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)
+
+    assert result.outcome == "failed_retryable"
+    assert result.evidence["deferred"] is True
+    (requeued, defer_seconds), = fixtures["deps"].requeue.calls
+    assert requeued.task_id == TASK_ID and defer_seconds == 60
+
+
+# —— 动作前延时：触达 10-60s / 读 5-15s 均匀随机，注入不真 sleep ——
+
+
+def test_delay_touch_range():
+    fixtures = make_deps()
+    task = make_task(AtomicTaskType.SEND_MESSAGE, context={"text": "您好"})
+    run(task, fixtures)
+    (lo, hi), = fixtures["uniform"].calls
+    assert (lo, hi) == (10.0, 60.0)
+    assert fixtures["sleep"].calls == [0.0]  # 注入随机源的返回值，不真 sleep
+
+
+def test_delay_read_range():
+    fixtures = make_deps()
+    run(make_task(AtomicTaskType.READ_RESUME), fixtures)
+    (lo, hi), = fixtures["uniform"].calls
+    assert (lo, hi) == (5.0, 15.0)
+    assert fixtures["sleep"].calls == [0.0]
+
+
+# —— arq 入口：payload 解析 + job_try 折算 attempt ——
+
+
+def test_execute_task_derives_attempt_from_job_try():
+    """execute_task 从 payload 解析 AtomicTask；effective attempt =
+    task.attempt + job_try - 1（arq 重试不重写 payload，attempt 靠 job_try 折算）。"""
+    fixtures = make_deps()
+    _fail_driver(fixtures["deps"])
+    payload = make_task(AtomicTaskType.READ_RESUME, attempt=0).model_dump(mode="json")
+
+    with pytest.raises(Retry):  # job_try=3 → attempt 2 → 未达上限，重试
+        asyncio.run(
+            execute_task({"worker_deps": fixtures["deps"], "job_try": 3}, payload)
+        )
+    result = asyncio.run(
+        execute_task({"worker_deps": fixtures["deps"], "job_try": 4}, payload)
+    )
+    assert result.outcome == "failed_needs_manual"  # job_try=4 → attempt 3 → 达上限

@@ -1,0 +1,19 @@
+[project]
+name = "hr-workbuddy-screening"
+version = "0.1.0"
+description = "screening 服务 — 硬规则过滤 + LLM 结构化评分 + 降级（spec v1.6 §3 步骤 3-4）"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "hr-workbuddy-contracts==0.1.0",
+    "openai>=1.40",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = ["httpx>=0.27", "pytest>=8"]
+
+[tool.uv.sources]
+hr-workbuddy-contracts = { workspace = true }

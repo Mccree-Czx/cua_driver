@@ -1,0 +1,19 @@
+[project]
+name = "hr-workbuddy-scheduler"
+version = "0.1.0"
+description = "scheduler 服务 — 巡检轮次 + 登录健康暂停 + 配额对账（spec v1.6 §调度机制）"
+requires-python = ">=3.12"
+dependencies = [
+    "apscheduler>=3.10",
+    "arq>=0.26",
+    "hr-workbuddy-contracts==0.1.0",
+    "httpx>=0.27",
+    "pydantic-settings>=2.2",
+    "redis>=5.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+hr-workbuddy-contracts = { workspace = true }

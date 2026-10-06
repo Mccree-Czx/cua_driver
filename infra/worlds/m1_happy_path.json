@@ -1,0 +1,33 @@
+{
+  "login_state": true,
+  "tick": 0,
+  "conversations": [
+    {
+      "liepin_user_id": "LP001",
+      "unread": true,
+      "resume_fixture": "lp001"
+    }
+  ],
+  "resume_fixtures": {
+    "lp001": {
+      "name": "张伟",
+      "liepin_user_id": "LP001",
+      "education": "本科",
+      "years_of_experience": "3年",
+      "city": "北京",
+      "salary": "20-30K",
+      "experience_summary": "三年互联网产品经验，负责过增长与留存专项"
+    }
+  },
+  "reply_timeline": [
+    {
+      "tick": 1,
+      "conversation_id": "LP001",
+      "text": null,
+      "attachment": {
+        "file_name": "简历.pdf",
+        "content_type": "application/pdf"
+      }
+    }
+  ]
+}

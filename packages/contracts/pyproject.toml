@@ -1,0 +1,13 @@
+[project]
+name = "hr-workbuddy-contracts"
+version = "0.1.0"
+description = "猎聘 HR 自动化 — 跨服务共享 pydantic 契约（spec v1.6 §任务契约）"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hr_workbuddy"]

@@ -1,0 +1,51 @@
+{
+  "login_state": true,
+  "tick": 0,
+  "conversations": [
+    {
+      "liepin_user_id": "LP002",
+      "unread": true,
+      "resume_fixture": "lp002"
+    },
+    {
+      "liepin_user_id": "LP003",
+      "unread": true,
+      "resume_fixture": "lp003"
+    },
+    {
+      "liepin_user_id": "LP004",
+      "unread": true,
+      "resume_fixture": "lp004"
+    }
+  ],
+  "resume_fixtures": {
+    "lp002": {
+      "name": "李四",
+      "liepin_user_id": "LP002",
+      "education": "本科",
+      "years_of_experience": "1年",
+      "city": "上海",
+      "salary": "10-15K",
+      "experience_summary": "一年产品助理经验，LLM 评分 55 未达阈值"
+    },
+    "lp003": {
+      "name": "王五",
+      "liepin_user_id": "LP003",
+      "education": "大专",
+      "years_of_experience": "5年",
+      "city": "深圳",
+      "salary": "25-35K",
+      "experience_summary": "五年运营经验，学历不满足岗位硬规则"
+    },
+    "lp004": {
+      "name": "赵六",
+      "liepin_user_id": "LP004",
+      "education": "本科",
+      "years_of_experience": "4年",
+      "city": "杭州",
+      "salary": "30-40K",
+      "experience_summary": "四年产品经验，评分通过但永不回复"
+    }
+  },
+  "reply_timeline": "never"
+}
