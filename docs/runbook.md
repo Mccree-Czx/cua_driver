@@ -209,7 +209,9 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | scheduler 日志 `[login] 请扫码登录…` 且派发暂停 | 登录态失效：桌面应用扫码重新登录，下一轮自动解除；状态键 `pipeline:state:login` |
 | screening 返回 `judge_reason="deferred: LLM unavailable"`（降级） | 检查 .env `SCREENING_LLM_*`（key/模型名）；候选人不推进，deferred_sweep 30min 自动重判 |
 | worker 日志大脑不可用 → 任务 deferred 重判（60s） | 检查 .env `CUA_BRAIN_*`；模型必须是 `deepseek-flash`（`deepseek-v4-pro` 不支持 image 输入）。**另一已知原因（已修）**：T12 前 `response_format` 用 json_schema，DeepSeek 现拒（400 `This response_format type is unavailable now`）——已改 `json_object` + 解析容忍代码围栏 |
-| 页面出现「账号行为异常」+ 图形验证码（安全验证页） | **立即停止全部自动化**（停 worker + 排空 arq 队列，防继续操作被控账号）；人工在桌面完成安全验证（绝不自动绕过）。2026-10-06 实测触发背景：连续高频真实校准（多任务连跑 + 失败任务快速重试 + 反复切页/重载，1 小时内数百次操作）。**已内置防线（2026-10-06；同日二次事件后加固）**：驱动检测风控页→立即 failed_needs_manual 不重试 + **写全局熔断标志 `cua:risk:paused`**（队列其余任务零操作直接跳过转人工，不再逐个试探）；重试默认延后 60s（`CUA_RETRY_DEFER_SECONDS`）；任务间隔默认 30s（`CUA_TASK_GAP_SECONDS`；E2E instant 自动置 0）。**恢复流程**：人工完成安全验证并确认页面恢复正常后清除熔断标志：`redis-cli -h 127.0.0.1 DEL cua:risk:paused`；观察期内（实测同日二次触发：阈值显著降低）建议静置 ≥24h 后以超低密度恢复（任务间隔 ≥120s、单批 ≤3 个操作） |
+| 页面出现「账号行为异常」+ 图形验证码（安全验证页） | **立即停止全部自动化**（停 worker + 排空 arq 队列，防继续操作被控账号）；人工在桌面完成安全验证（绝不自动绕过）。2026-10-06 实测触发背景：连续高频真实校准（多任务连跑 + 失败任务快速重试 + 反复切页/重载，1 小时内数百次操作）。**已内置防线（2026-10-06；同日二次事件后加固）**：驱动检测风控页→立即 failed_needs_manual  不重试 + **写全局熔断标志 `cua:risk:paused`**（队列其余任务零操作直接跳过转人工，不再逐个试探）；重试默认延后 60s（`CUA_RETRY_DEFER_SECONDS`）；任务间隔默认 30s（`CUA_TASK_GAP_SECONDS`；E2E instant 自动置 0）。**恢复流程**： 人工完成安全验证并确认页面恢复正常后清除熔断标志：`redis-cli -h 127.0.0.1 DEL cua:risk:paused`；观察期内（实测同日二次触发：阈值显著降低）建议静置 ≥24h 后以超低密度恢复（任务间隔 ≥120s、单批 ≤3 个操作） |
+| worker 疑似「吞队列」：队列只减、无无处理日志或处理即崩 | **环境错误 + 僵尸特性（2026-10-06 晚实测）**：任务级异常不会杀死 arq worker——配错的 worker 会循环吞掉整个队列（每个任务失败但不落 pipeline 账）。核查三项：① **cwd 必须是仓库根**（`env_file=".env"` 相对 cwd；从 `services/cua-agent` 子目录启动会缺 `CUA_BRAIN_API_KEY` 而任务级崩溃）；② `CUA_DRIVER_MODE=real`（缺省为 mock，会去找不存在的 `worlds/default.json`）；③ `PYTHONPATH=services/cua-agent`。处理：先 `pkill -9 -f "arq app.worker"` 清僵尸，修环境后把未完成任务重新入队 |
+| 跑完 E2E 后真实批次的 MinIO 归档消失 | E2E `reset_state` 会清空 bucket 内 `snapshots/` 与 `resumes/` 全部对象（含生产库模式下的真实归档）。**跑 E2E 前对 MinIO 一并做备份，或选无真实归档的时段**；DB 记录（object_key）不受影响，平台侧原件仍在，必要时重跑下载任务补归档（2026-10-06 晚实测：本批 PDF×10 + 截图×10 被清） |
 | worker 日志「窗口不可达（off_space_or_ax_unresolved）」 | 窗口 AX 面不可解析（风控/登录跳转或用户切屏的伴生状态）：任务已转 failed_needs_manual（保守化：不自动重试；不触发全局熔断）。确认桌面与浏览器窗口恢复后重跑该任务 |
 | 任务 evidence 出现 `llm_fallback` / `fallback_exhausted` | 读取链（check_login/list_unread/read_resume/check_attachment）定位失败触发 LLM 视觉兜底：`llm_fallback`=兜底诊断与动作（用量计入 brain_tokens 账目）；`fallback_exhausted`=兜底执行后仍失败已转人工（不重试）。发送类/下载类不兜底；兜底动作全程不绕过风控检测（撞风控页同样触发全局熔断） |
 | real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）已完成 7 个页面方法校准（check_login / list_unread / open_conversation / read_online_resume / send_message / check_attachment / download_attachment）；若再现说明代码回退 |
@@ -217,8 +219,11 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 
 ### 5.7 两路径流程差异（2026-10-06 策略）
 
-- **inbound（主动咨询者）**：硬规则 → 免前置 LLM 评分 → **直接索要简历**（话术变体 `direct_request`；job 未配置时用内置默认模板）→ 收到 PDF 入库 → **收到后补 LLM 评分**（写 match_score/judge_reason 供 HR；补评分失败仅记标记不重试，M3 人工关注）
+- **inbound（主动咨询者）**：读在线简历 → **先探附件**（读后分流）：
+  - **已有简历** → **回执 `resume_ack`**（零岗位名；派发前做候选人级一人一消息检查——已触达则跳过回执）+ **直接下载入库**（硬规则不拦收：PDF → MinIO + MySQL）→ 收到后补 LLM 评分
+  - **无简历** → 硬规则 → 通过者直索要（`direct_request`，零岗位名）→ 72h 等待 → 收到 PDF 入库 → 收到后补评分（写 match_score/judge_reason 供 HR；补评分失败仅记标记不重试，M3 人工关注）
 - **outbound（推荐人，M2）**：硬规则 + LLM 两层 → 通过者打招呼+索要（`greet_request`）；未通过判定者零触达（触达成本）
+- **话术零岗位名（2026-10-06 晚事故修订）**：会话「沟通职位」可能与库内岗位错位（实测：回执误写「产品经理」而候选人在聊「海外ToB渠道销售（出海品牌）」）→ inbound 双向话术（回执/直索要）不引用 {title}；outbound greet 仍带 {title}（主动触达须说明来意岗位）。
 
 ## 6. 已知限制（M2/T12 前置门禁）
 
@@ -248,4 +253,4 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | 2026-10-06 | Qoder(T12) | ⑤ 账目核对 | `--step verify` | **通过（配置面）**：real / 20条·小时 / `CUA_E2E_INSTANT` 未设 / 延时区间正确 / 工作窗口 08:00–20:00 | 本小时无 `msg-touch:*` 键（直连脚本不经 worker 延时/桶）；worker 级延时·桶·TaskLog 待全栈真实链路验证 |
 | 2026-10-06 | Qoder(T12) | 联调切片（附加） | 手工入队 CHECK_LOGIN（模拟 scheduler）→ pipeline + real worker | **通过（全链）**：worker `outcome=success`（19.7s=延时~12s+执行）；`/internal/state/login` → `is_login=true`；`task_logs` 落账 tokens=1176 / duration=7.78s | 期间发现并修复：DeepSeek 拒 json_schema（400）→ 大脑改 `json_object`（单测 57 绿）；附件链同步实测：check_attachment=True、download_attachment 得 322,966B PDF |
 | 2026-10-06 | Qoder(T12) | inbound 全链（附加） | 手工入队 LIST_UNREAD →  真实 worker 链（screening 用拒绝桩保零触达） | **部分完成后遇风控停机**：LIST_UNREAD 成功（建档 8 位真实候选人）；2 个 READ_RESUME 成功（其余遇风控） ；**触发猎聘风控（账号行为异常验证码）→ 立即停机** | 零触达保持（interactions 未增）；处置与恢复建议见 `.scratch/liepin_calib/risk_control_incident.md`；恢复前需人工完成安全验证 + 控制操作密度 |
-| 2026-10-06 | Qoder(T12) | inbound 低密度恢复（M1 收尾） | 只读探针（check_login=True）→ 分批入队 READ_RESUME ×10（4+3+3，任务间隔 120s、批间冷静 ≥10min）→ 真实 screening 自动判定 → 全部读完停 worker | **通过（10/10 闭环）**：9 位硬规则拒 + 1 位 LLM 拒（得分 50，附完整判定理由）；**零触达保持**（interactions=0）；10 张候选人真实截图落 MinIO（snapshots/ 各 ~1MB）；全程无风控触发；队列/熔断键终态清零 | 处置记录：窗口前台态缺失修复 ×2（切回猎聘标签 / 前置三连）；闲置后首触选项卡定位失败 ×3 由 60s 冷却重试自愈；驱动加固：experience_summary 改可选（邵女士类页面无 file-search 栏目）→ jc10 重跑通过；残余：PDF 落 MinIO 待通过者回复自然闭环、冒烟②待人工配合 |
+| 2026-10-06 | Qoder(T12) | 策略回溯批次（check-first 分流） | 重开 10 人（终态→new）→ 逐个入队 CHECK_ATTACHMENT → 真实 worker（120s 间隔）级联：有简历→回执+下载入库 / 无→硬规则→直索要 | **通过（10/10）**：全部 resume_received（补评分 15-55 落账）；共 9 条回执真实发出；梁女士仅入库不回执（候选人级一人一消息拦截生效）；零风控、队列/熔断键终态清零 | 硬规则已剔除年限（保留 min_education=本科）。事故与修复：①僵尸 worker（mock 缺 world + 任务级崩溃不退出，循环吞 10 个任务）→ pkill 后带正确环境重入队；②**话术错位事故**：已发 5 条回执含「产品经理」岗位名（会话实际「海外ToB渠道销售（出海品牌）」，库内岗位为 M1 演示岗）→ 修订为**话术零岗位名**并撤销未发 4 条重入队；已发 5 条按一人一消息不可撤回；③E2E 验证后 MinIO 真实归档被清（PDF×10+截图×10，DB 记录完整，需要时补下载） |
