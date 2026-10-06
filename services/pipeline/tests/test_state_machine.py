@@ -34,12 +34,14 @@ def _make_jc(source: str = INBOUND, status: S = S.NEW) -> models.JobCandidate:
     return jc
 
 
-# §4 逐字边集：inbound 8 边 + outbound 9 边 + 共享后段 2 边 = 19 条合法边
+# §4 逐字边集（inbound/outbound）+ 2026-10-06 分流新增：new→resume_received（inbound 直收）
 LEGAL_EDGES = [
     # —— inbound：new → screened_pass | rejected_hard | rejected_llm ——
     (INBOUND, S.NEW, StateEvent.SCREEN_PASS, S.SCREENED_PASS),
     (INBOUND, S.NEW, StateEvent.REJECT_HARD, S.REJECTED_HARD),
     (INBOUND, S.NEW, StateEvent.REJECT_LLM, S.REJECTED_LLM),
+    # —— inbound 直收入库（已带简历，硬规则不拦收）：new → resume_received ——
+    (INBOUND, S.NEW, StateEvent.RECEIVE_RESUME, S.RESUME_RECEIVED),
     # —— inbound：screened_pass → resume_requested → awaiting_resume ——
     (INBOUND, S.SCREENED_PASS, StateEvent.REQUEST_RESUME, S.RESUME_REQUESTED),
     (INBOUND, S.RESUME_REQUESTED, StateEvent.AWAIT_RESUME, S.AWAITING_RESUME),
@@ -90,6 +92,7 @@ INVALID_EDGES = [
     (OUTBOUND, S.NEW, StateEvent.GREET, "非法迁移"),  # 同上
     (INBOUND, S.NEW, StateEvent.CLOSE, "非法迁移"),
     (INBOUND, S.NEW, StateEvent.AWAIT_RESUME, "非法迁移"),
+    (OUTBOUND, S.NEW, StateEvent.RECEIVE_RESUME, "无法判定合法路径"),  # 直收仅 inbound（2026-10-06 分流）
     (INBOUND, S.AWAITING_RESUME, StateEvent.REQUEST_RESUME, "非法迁移"),
     (INBOUND, S.RESUME_REQUESTED, StateEvent.RECEIVE_RESUME, "非法迁移"),
     (INBOUND, S.NO_RESPONSE, StateEvent.RECEIVE_RESUME, "非法迁移"),  # no_response 只到 closed

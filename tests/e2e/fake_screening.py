@@ -6,6 +6,7 @@ controller 裁定：不真调 LLM、不做真实硬规则判定、不改 T5 生�
 - LP002 → 55 分（剧本 B：收到后评分 55 落账）
 - LP003 → 硬规则不通过（剧本 B：rejected_hard 零触达）
 - LP004 → 82 分（剧本 B：永不回复 → 72h 关闭）
+- LP005 → 64 分（剧本 C：直收入库——收到前零 scoring，仅收到后补评分）
 
 2026-10-06 策略镜像：llm_scoring=False（inbound 直索要）→ 非硬拒一律返回
 「硬规则通过（未评分）」（与 screening 服务语义逐字一致）；收到简历后的
@@ -65,6 +66,13 @@ SCRIPTS: dict[str, ScreeningResult] = {
         hard_pass=True,
         score=82,
         judge_reason="LLM 评分 82 通过（剧本 B 永不回复）",
+        status=CandidateStatus.SCREENED_PASS,
+    ),
+    # 剧本 C：直收入库——收到前零 scoring（分流跳过），仅收到后补评分
+    "LP005": _result(
+        hard_pass=True,
+        score=64,
+        judge_reason="LLM 评分 64（剧本 C：直收入库后补评分）",
         status=CandidateStatus.SCREENED_PASS,
     ),
 }

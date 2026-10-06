@@ -16,10 +16,11 @@ from app.models import Candidate, Interaction, Job, JobCandidate
 TEMPLATE_VARIABLES = ("name", "title")
 
 # 内置默认模板：job.template_msgs 未配置该变体时的兜底。
-# 仅 direct_request（2026-10-06 inbound 直索要策略新增变体，兼容存量岗位配置）；
-# greet_request（outbound 打招呼+索要）仍要求显式配置。
+# 仅 direct_request / resume_ack（2026-10-06 inbound 策略新增变体，兼容存量岗位
+# 配置）；greet_request（outbound 打招呼+索要）仍要求显式配置。
 DEFAULT_TEMPLATES = {
     "direct_request": "您好 {name}，感谢关注{title}岗位，方便发一份简历吗？",
+    "resume_ack": "您好 {name}，已收到您的简历，感谢关注{title}岗位！",
 }
 
 

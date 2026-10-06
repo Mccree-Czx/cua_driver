@@ -53,6 +53,7 @@ from hr_workbuddy import (
 RESUME_TIMEOUT = timedelta(hours=72)  # spec §3：发送后 72h 无附件 → no_response→closed
 GREET_VARIANT = "greet_request"  # 打招呼+索要简历合并模板变体（决策 3；outbound）
 DIRECT_REQUEST_VARIANT = "direct_request"  # inbound 直索要变体（2026-10-06 策略：主动咨询者免前置评分）
+RESUME_ACK_VARIANT = "resume_ack"  # 已带简历候选人的回执变体（2026-10-06 分流：有简历→回执+直接入库）
 DEFERRED_REASON = "deferred: LLM unavailable"  # 降级判定理由（与 screening 服务一致）
 DEFERRED_MARKER = "deferred"  # 延期重判扫描判据：judge_reason 含此子串
 
@@ -117,7 +118,7 @@ def next_tasks(
                 job_id=job.id,
                 job_candidate_id=jc.id,
                 candidate_liepin_id=candidate.liepin_user_id,
-                context={"text": text, "candidate_liepin_id": candidate.liepin_user_id},
+                context={"text": text, "candidate_liepin_id": candidate.liepin_user_id, "variant": variant},
             )
         ]
     if status is CandidateStatus.AWAITING_RESUME and has_attachment:
@@ -253,6 +254,21 @@ def _handle_read_resume_result(
     candidate.name = minimal.name
     candidate.online_resume_minimal = minimal.model_dump()
 
+    if candidate.source == "inbound":
+        # 2026-10-06 分流：先探附件——有简历→回执+直接入库 / 无→硬规则→直索要；
+        # 两个分支都在 CHECK_ATTACHMENT 结果回调里产生后继任务。此处不调 screening。
+        return [
+            AtomicTask(
+                task_id=uuid4(),
+                type=AtomicTaskType.CHECK_ATTACHMENT,
+                job_id=job.id,
+                job_candidate_id=jc.id,
+                candidate_liepin_id=candidate.liepin_user_id,
+                context={},
+            )
+        ]
+
+    # outbound（推荐人，M2）：保持两层判定（前置 LLM 评分）→ 打招呼索要
     sres = screening.screen(
         ScreenRequest(
             job_id=job.id,
@@ -260,8 +276,7 @@ def _handle_read_resume_result(
             jd_text=job.jd_text,
             hard_rules=job.hard_rules,
             threshold=job.llm_threshold,
-            # 2026-10-06 策略：inbound 直索要（仅硬规则；LLM 评分后移至简历收到后）
-            llm_scoring=(candidate.source != "inbound"),
+            llm_scoring=True,
         )
     )
     return _apply_screening_result(jc, job, candidate, sres)
@@ -283,6 +298,33 @@ def _handle_send_message_result(
     jc = session.get(JobCandidate, dispatched.job_candidate_id)
     if jc is None:
         raise MissingEntityError(f"job_candidate {dispatched.job_candidate_id} 不存在")
+    variant = str(dispatched.context.get("variant") or "")
+    if variant == RESUME_ACK_VARIANT:
+        # 2026-10-06 分流：回执消息——仅记触达与互动（msg_type=reply），不推进生命周期
+        try:
+            ensure_no_out_message(session, jc)
+        except OneMessagePerCandidateError:
+            session.add(
+                TaskLog(
+                    task_id=str(result.task_id),
+                    outcome="failed_needs_manual",
+                    attempt=int(result.evidence.get("attempt") or 0),
+                    tokens=int(result.evidence.get("brain_tokens") or 0),
+                    cost=float(result.evidence.get("cost_est") or 0),
+                )
+            )
+            return []
+        jc.last_touch_at = now
+        session.add(
+            Interaction(
+                job_candidate_id=jc.id,
+                direction="out",
+                msg_type="reply",
+                content=dispatched.context.get("text"),
+                sent_at=now,
+            )
+        )
+        return []
     if jc.status == CandidateStatus.AWAITING_RESUME.value:
         return []  # 重复回调重放：已推进过，幂等忽略
     if jc.status != CandidateStatus.RESUME_REQUESTED.value:
@@ -314,15 +356,96 @@ def _handle_send_message_result(
         Interaction(
             job_candidate_id=jc.id,
             direction="out",
-            # 2026-10-06 策略：inbound 直索要（direct_request）/ outbound 打招呼索要
+            # 2026-10-06 策略：按任务 context.variant 落 msg_type（缺省回退 source 推断）
             msg_type=(
-                DIRECT_REQUEST_VARIANT if candidate.source == "inbound" else GREET_VARIANT
+                variant
+                or (DIRECT_REQUEST_VARIANT if candidate.source == "inbound" else GREET_VARIANT)
             ),
             content=dispatched.context.get("text"),
             sent_at=now,
         )
     )
     return []
+
+
+def _candidate_has_out_message(session: Session, candidate_id: int) -> bool:
+    """候选人级一人一消息检查（跨岗位，2026-10-06 分流）：任意 jc 已有 out 即 True。"""
+    return (
+        session.execute(
+            select(Interaction.id)
+            .join(JobCandidate, JobCandidate.id == Interaction.job_candidate_id)
+            .where(
+                JobCandidate.candidate_id == candidate_id,
+                Interaction.direction == "out",
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
+def _direct_intake_tasks(
+    session: Session,
+    jc: JobCandidate,
+    candidate: Candidate,
+    *,
+    has_attachment: bool,
+    screening: Screener,
+) -> list[AtomicTask]:
+    """inbound 读后分流（2026-10-06）：
+
+    - 有简历：回执（候选人级一人一消息检查通过才发；已触达则跳过）+ DOWNLOAD（直接入库；
+      硬规则不拦收）
+    - 无简历：此刻才走硬规则（llm_scoring=False）→ 直索要分支
+    """
+    job = session.get(Job, jc.job_id)
+    if job is None:
+        raise MissingEntityError(f"岗位 {jc.job_id} 不存在")
+    if not has_attachment:
+        if not candidate.online_resume_minimal:
+            raise InvalidEvidenceError(
+                f"candidate {candidate.id} 缺在线简历快照，无法硬规则判定"
+            )
+        minimal = MinimalResume.model_validate(candidate.online_resume_minimal)
+        sres = screening.screen(
+            ScreenRequest(
+                job_id=job.id,
+                resume=minimal,
+                jd_text=job.jd_text,
+                hard_rules=job.hard_rules,
+                threshold=job.llm_threshold,
+                llm_scoring=False,  # inbound：仅硬规则（评分后移至收到简历后）
+            )
+        )
+        return _apply_screening_result(jc, job, candidate, sres)
+    tasks: list[AtomicTask] = []
+    if not _candidate_has_out_message(session, candidate.id):
+        text = render_message(job, candidate, RESUME_ACK_VARIANT)
+        tasks.append(
+            AtomicTask(
+                task_id=uuid4(),
+                type=AtomicTaskType.SEND_MESSAGE,
+                job_id=job.id,
+                job_candidate_id=jc.id,
+                candidate_liepin_id=candidate.liepin_user_id,
+                context={
+                    "text": text,
+                    "candidate_liepin_id": candidate.liepin_user_id,
+                    "variant": RESUME_ACK_VARIANT,
+                },
+            )
+        )
+    tasks.append(
+        AtomicTask(
+            task_id=uuid4(),
+            type=AtomicTaskType.DOWNLOAD_ATTACHMENT,
+            job_id=job.id,
+            job_candidate_id=jc.id,
+            candidate_liepin_id=candidate.liepin_user_id,
+            context={},
+        )
+    )
+    return tasks
 
 
 def _handle_check_attachment_result(
@@ -344,9 +467,16 @@ def _handle_check_attachment_result(
     has_attachment = result.evidence.get("has_attachment")
     if not isinstance(has_attachment, bool):
         raise InvalidEvidenceError("CHECK_ATTACHMENT 成功结果 evidence 需 has_attachment: bool")
-    if not has_attachment:
-        return []  # 无附件 → 不动（等下一轮巡检）
     candidate = session.get(Candidate, jc.candidate_id)
+    if candidate is None:
+        raise MissingEntityError(f"job_candidate {jc.id} 关联的 candidate 行不存在")
+    if jc.status == CandidateStatus.NEW.value:
+        # 2026-10-06 分流：读后探测（直收路径）——有简历→回执+入库 / 无→硬规则→直索要
+        return _direct_intake_tasks(
+            session, jc, candidate, has_attachment=has_attachment, screening=screening
+        )
+    if not has_attachment:
+        return []  # awaiting_resume 巡检路径：无附件 → 不动（等下一轮巡检）
     return next_tasks(jc, candidate=candidate, has_attachment=True)
 
 
@@ -551,7 +681,10 @@ def _handle_resume_artifact(
     if jc.minio_object_key is None:
         jc.minio_object_key = key  # 空则填上；已有（先前收到的简历）保留先到者
 
-    if jc.status != CandidateStatus.AWAITING_RESUME.value:
+    if jc.status not in (
+        CandidateStatus.AWAITING_RESUME.value,
+        CandidateStatus.NEW.value,  # 2026-10-06 分流：直收路径（已带简历，硬规则不拦收）
+    ):
         # 迟到附件（jc 已 closed/no_response/resume_received 等）：只存不推进。
         # 状态推进交由人工/复核流程（M4）；落 TaskLog 注记留痕。
         session.add(
@@ -564,7 +697,11 @@ def _handle_resume_artifact(
         )
         return key
 
-    _advance(jc, StateEvent.RECEIVE_RESUME)
+    if jc.status == CandidateStatus.NEW.value:
+        # 2026-10-06 分流：直收入库——new→resume_received（inbound 路径）
+        _advance(jc, StateEvent.RECEIVE_RESUME, TransitionContext(source="inbound"))
+    else:
+        _advance(jc, StateEvent.RECEIVE_RESUME)
     jc.resume_downloaded_at = now
     session.add(
         Interaction(

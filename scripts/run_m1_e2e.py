@@ -58,6 +58,7 @@ E2E_DIR = REPO_ROOT / "tests" / "e2e"
 WORLDS_DIR = REPO_ROOT / "infra" / "worlds"
 HAPPY_WORLD = WORLDS_DIR / "m1_happy_path.json"
 NO_REPLY_WORLD = WORLDS_DIR / "m1_no_reply.json"
+DIRECT_INTAKE_WORLD = WORLDS_DIR / "m1_direct_intake.json"
 
 # 本机若存在代理环境变量（HTTP_PROXY/HTTPS_PROXY），httpx 默认会走代理，
 # 把 127.0.0.1 的内网回调拦成 404（实测：首请求 200、复用连接后续全 404）。
@@ -113,22 +114,24 @@ class ScenarioReport:
 
 @dataclass
 class E2EReport:
-    """两剧本总报告。passed = 剧本 A + 剧本 B 全部跑完。"""
+    """三剧本总报告。passed = 剧本 A + 剧本 B + 剧本 C 全部跑完。"""
 
     scenarios: list[ScenarioReport]
     log_dir: Path
 
     @property
     def passed(self) -> bool:
-        return len(self.scenarios) == 2
+        return len(self.scenarios) == 3
 
 
 def format_report(report: E2EReport) -> str:
     lines = [f"=== M1 E2E 验收（mock 模式）===", f"子进程日志目录：{report.log_dir}"]
+    total = len(report.scenarios)
     for i, scenario in enumerate(report.scenarios, 1):
-        lines.append(f"[{i}/2] {scenario.name}")
+        lines.append(f"[{i}/{total}] {scenario.name}")
         lines.extend(f"  - {check}" for check in scenario.checks)
-    lines.append("总体：剧本 A + 剧本 B 全部通过")
+    names = " + ".join(chr(ord("A") + i) for i in range(total))
+    lines.append(f"总体：剧本 {names} 全部通过")
     return "\n".join(lines)
 
 
@@ -570,6 +573,10 @@ def scenario_a(log_dir: Path) -> ScenarioReport:
         rows = _interactions(jc["id"])
         assert [(r["direction"], r["msg_type"]) for r in rows] == [("out", "direct_request")]
         # 第 1 次巡检：附件尚未送达（tick 0 < 送达 tick 1）→ 无附件不动
+        # 读时探测（2026-10-06 分流）的在途键 TTL 1h——清掉让巡检可再派发（mock 时间等价物）
+        client = _redis()
+        client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc["id"]))
+        client.close()
         baseline = _task_log_count()
         sweep = awaiting_resume_sweep(_deps())
         assert sweep.dispatched == 1
@@ -666,6 +673,11 @@ def scenario_b(log_dir: Path) -> ScenarioReport:
         assert [(r["direction"], r["msg_type"]) for r in rows2] == [("out", "direct_request")]
         checks.append("LP002 直索要（direct_request）无前置评分 → awaiting_resume")
         # 首次巡检（tick 0）：LP002+LP004 均 awaiting → 各一次 CHECK_ATTACHMENT，无附件不动
+        # 读时探测（2026-10-06 分流）的在途键清理（否则首巡被去重跳过）
+        client = _redis()
+        for jc_id in (jc2["id"], _jc("LP004")["id"]):
+            client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc_id))
+        client.close()
         sweep = awaiting_resume_sweep(_deps())
         assert sweep.dispatched == 2, f"LP002+LP004 均处 awaiting（首巡）：{sweep}"
         # 推进 tick 1 → LP002 附件送达；清在途索引（时间推进的 mock 等价 物）后复巡
@@ -723,12 +735,63 @@ def scenario_b(log_dir: Path) -> ScenarioReport:
         _write_world(NO_REPLY_WORLD, world_b)  # 剧本复原（tick 归 0）
 
 
+# —— 剧本 C：已有简历 → 回执 + 直接入库（硬规则不拦收）——
+
+
+def scenario_c(log_dir: Path) -> ScenarioReport:
+    """LP005（大专/2 年，硬规则本应拒）：主动咨询时已附简历（tick 0 送达）→
+
+    读→CHECK 有附件→回执（out/reply）+ 下载直接入库（不调 screening）→
+    收到后补评分 64。对比剧本 B LP003（无附件 + 硬规则不符 → 拒）验证分流。
+    """
+    checks: list[str] = []
+    reset_state()
+    assert seed_job() == 1
+    world_c = _read_world(DIRECT_INTAKE_WORLD)
+    _write_world(DIRECT_INTAKE_WORLD, {**world_c, "tick": 0})  # 剧本原状复位（可重跑）
+    worker = start_worker(DIRECT_INTAKE_WORLD, log_dir)
+    try:
+        report = inbound_round(_deps())
+        assert report.dispatched == 1
+        poll_until(
+            lambda: _jc("LP005").get("status") == "resume_received",
+            timeout=180,
+            what="LP005 直收入库：new→resume_received（回执 + 附件下载归档）",
+        )
+        jc = _jc("LP005")
+        # 回执（resume_ack 默认模板）+ 附件入库；零索要（无 direct_request）
+        rows = _interactions(jc["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows] == [
+            ("out", "reply"),
+            ("in", "attachment"),
+        ], f"LP005 interactions 偏差：{rows}"
+        assert rows[0]["content"] == f"您好 钱七，已收到您的简历，感谢关注{JOB_TITLE}岗位！"
+        checks.append("LP005 回执 out/reply（resume_ack）+ in/attachment；零索要")
+        # 硬规则不拦收：大专/2 年仍入库（对比剧本 B LP003 硬拒零触达）
+        pdf = jc["minio_object_key"]
+        assert pdf and re.fullmatch(
+            rf"resumes/1/LP005/钱七_{JOB_TITLE}_\d{{8}}\.pdf", pdf
+        ), f"PDF 键不匹配：{pdf}"
+        assert _minio().stat_object(BUCKET, pdf), f"PDF 对象不存在：{pdf}"
+        checks.append(f"硬规则不符（大专/2年）仍直收入库：PDF={pdf}")
+        # 收到后补评分 64
+        assert jc["match_score"] == 64, f"补评分偏差：{jc['match_score']}"
+        assert jc["resume_downloaded_at"] is not None
+        checks.append(f"收到后补评分：match_score=64；judge_reason={jc['judge_reason']}")
+        return ScenarioReport(
+            name="剧本 C：已有简历 → 回执 + 直接入库（硬规则不拦收）", checks=checks
+        )
+    finally:
+        stop_proc(worker)
+        _write_world(DIRECT_INTAKE_WORLD, world_c)  # 剧本复原（tick 归 0）
+
+
 # —— 总装：一条命令跑全部 ——
 
 
 def run_e2e() -> E2EReport:
     """一条命令跑全部：compose 复用 → 起 pipeline / 假 screening 子进程 →
-    剧本 A → 剧本 B → finally 杀干净全部子进程。失败即抛（断言原样上抛）。"""
+    剧本 A → 剧本 B → 剧本 C → finally 杀干净全部子进程。失败即抛（断言原样上抛）。"""
     global _LOG_DIR, _PROCS
     _LOG_DIR = Path(tempfile.mkdtemp(prefix="m1_e2e_"))
     _PROCS = []
@@ -744,6 +807,7 @@ def run_e2e() -> E2EReport:
         wait_http(f"{SCREENING_URL}/health", name="假 screening")
         scenarios.append(scenario_a(_LOG_DIR))
         scenarios.append(scenario_b(_LOG_DIR))
+        scenarios.append(scenario_c(_LOG_DIR))
     finally:
         for proc in reversed(_PROCS):
             stop_proc(proc)

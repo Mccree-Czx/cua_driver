@@ -1,0 +1,33 @@
+{
+  "login_state": true,
+  "tick": 0,
+  "conversations": [
+    {
+      "liepin_user_id": "LP005",
+      "unread": true,
+      "resume_fixture": "lp005"
+    }
+  ],
+  "resume_fixtures": {
+    "lp005": {
+      "name": "钱七",
+      "liepin_user_id": "LP005",
+      "education": "大专",
+      "years_of_experience": "2年",
+      "city": "北京",
+      "salary": "18-25K",
+      "experience_summary": "两年新媒体运营；主动咨询时已附简历（硬规则不满足——大专/2年——但已给简历→直接收下入库）"
+    }
+  },
+  "reply_timeline": [
+    {
+      "tick": 0,
+      "conversation_id": "LP005",
+      "text": null,
+      "attachment": {
+        "file_name": "钱七-简历.pdf",
+        "content_type": "application/pdf"
+      }
+    }
+  ]
+}

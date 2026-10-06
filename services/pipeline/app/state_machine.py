@@ -85,6 +85,8 @@ _PATH_EDGES: dict[
     (S.SCREENED_PASS, StateEvent.GREET): {OUTBOUND: S.GREETED},
     (S.SCREENED_PASS, StateEvent.REQUEST_RESUME): {INBOUND: S.RESUME_REQUESTED},
     (S.GREETED, StateEvent.REQUEST_RESUME): {OUTBOUND: S.RESUME_REQUESTED},
+    # 2026-10-06 分流：inbound 直收入库（已带简历，硬规则不拦收）——new→resume_received
+    (S.NEW, StateEvent.RECEIVE_RESUME): {INBOUND: S.RESUME_RECEIVED},
 }
 
 
@@ -166,6 +168,17 @@ def _path_error(event: StateEvent, path: str | None, current: CandidateStatus) -
         if path == INBOUND:
             return "greet 仅存在于 outbound 路径（当前 source=inbound，inbound 是对方先开口）"
         return f"greet 仅存在于 outbound 路径（source={path!r}）"
+    if event is StateEvent.RECEIVE_RESUME:
+        # 2026-10-06 分流：直收入库（new→resume_received）仅存在于 inbound 路径
+        if path is None:
+            return (
+                "无法判定路径（candidate.source 与 ctx.source 均不可得）；"
+                "receive_resume 直收入库仅存在于 inbound 路径"
+            )
+        return (
+            f"无法判定合法路径（source={path!r}）："
+            "receive_resume 直收入库仅存在于 inbound 路径"
+        )
     # REQUEST_RESUME
     if path == OUTBOUND:
         return (

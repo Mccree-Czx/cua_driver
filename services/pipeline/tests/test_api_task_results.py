@@ -106,6 +106,19 @@ def _post_send_result(client, task: AtomicTask):
     )
 
 
+def _post_check_attachment_result(client, task: AtomicTask, *, has_attachment: bool):
+    """CHECK_ATTACHMENT 成功结果：evidence 仅 has_attachment（契 约）。"""
+    return client.post(
+        f"/internal/tasks/{task.task_id}/result",
+        json={
+            "task_id": str(task.task_id),
+            "outcome": "success",
+            "evidence": {"has_attachment": has_attachment, "attempt": 0, "duration_s": 0.5},
+            "error": None,
+        },
+    )
+
+
 def _reload(session):
     """API 调用后：提交本会话挂起变更 + 清空身份映射，使后续读取见到
     API 已提交数据（MySQL RR 快照 + expire_on_commit=False 双重要求）。"""
@@ -195,24 +208,52 @@ def store():
 
 
 def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session, store):
-    """score 82 > threshold 70：new→screened_pass→resume_requested→awaiting_resume。
-
-    READ_RESUME 结果 → 建候选人 + 最小字段 + 推进 + 入队 SEND_MESSAGE（渲染话术）；
-    SEND_MESSAGE 成功 → awaiting_resume + interactions 恰 1 行 out/greet_request；
+    """inbound 分流（2026-10-06）：读→CHECK（无附件）→硬规则→直索要→触达→等待。
+    
+    READ_RESUME 结果 → 建候选人 + 最小字段 + 派发 CHECK_ATTACHMENT（不调 screening）；
+    CHECK 无附件 → 此刻才走硬规则（llm_scoring=False）→ resume_requested + SEND（direct_request）；
+    SEND_MESSAGE 成功 → awaiting_resume + interactions 恰 1 行 out/direct_request；
     snapshot artifact → MinIO snapshots/ 键 + candidates.snapshot_object_key。
     """
     job_id, title = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
     fake_screening.set(liepin, _pass_result(82))
-
+    
     read_task = _make_read_task(job_id, liepin)
     fake_queue.record(read_task)
-
+    
     resp = _post_read_result(client, read_task, liepin)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"ok": True}
-
-    # —— 判定请求逐字段正确（job_id/jd_text/hard_rules/threshold 来自 jobs）——
+    assert fake_screening.requests == []  # 读后不调 screening（先探附件，2026-10-06 分流）
+    
+    session.commit()  # 新事务读 API 已提交数据（MySQL RR 快照）
+    candidate = session.execute(
+        select(models.Candidate).where(models.Candidate.liepin_user_id == liepin)
+    ).scalar_one()
+    assert candidate.source == "inbound"
+    assert candidate.name == "张伟"
+    assert candidate.online_resume_minimal == _resume(liepin)  # 恰 7 字段
+    
+    jc = session.execute(
+        select(models.JobCandidate).where(
+            models.JobCandidate.job_id == job_id,
+            models.JobCandidate.candidate_id == candidate.id,
+        )
+    ).scalar_one()
+    assert jc.status == CandidateStatus.NEW.value  # 读后未判定（等 CHECK 结果）
+    
+    # —— CHECK_ATTACHMENT 已派发（分流第一步）——
+    assert len(fake_queue.enqueued) == 1
+    check_task = fake_queue.enqueued[0]
+    assert check_task.type is AtomicTaskType.CHECK_ATTACHMENT
+    assert check_task.job_candidate_id == jc.id
+    assert check_task.candidate_liepin_id == liepin
+    
+    # —— CHECK 结果：无附件 → 此刻才走硬规则 → 直索要 ——
+    resp = _post_check_attachment_result(client, check_task, has_attachment=False)
+    assert resp.status_code == 200, resp.text
+    _reload(session)
     assert len(fake_screening.requests) == 1
     req = fake_screening.requests[0]
     assert req.job_id == job_id
@@ -221,44 +262,31 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert req.hard_rules == {"min_education": "本科", "min_years": 3}
     assert req.resume.liepin_user_id == liepin
     assert req.llm_scoring is False  # inbound 直索要：仅硬规则（2026-10-06 策略）
-
-    session.commit()  # 新事务读 API 已提交数据（MySQL RR 快照）
-    candidate = session.execute(
-        select(models.Candidate).where(models.Candidate.liepin_user_id == liepin)
-    ).scalar_one()
-    assert candidate.source == "inbound"
-    assert candidate.name == "张伟"
-    assert candidate.online_resume_minimal == _resume(liepin)  # 恰 7 字段
-
-    jc = session.execute(
-        select(models.JobCandidate).where(
-            models.JobCandidate.job_id == job_id,
-            models.JobCandidate.candidate_id == candidate.id,
-        )
-    ).scalar_one()
+    
+    jc = session.get(models.JobCandidate, jc.id)
     assert jc.status == CandidateStatus.RESUME_REQUESTED.value  # new→screened_pass→resume_requested
     assert jc.match_score is None  # 前置评分已免（收到简历后补评）
     assert jc.judge_reason == "硬规则通过（评分后移至简历收到后）"
-
-    # —— SEND_MESSAGE 入队：context 带渲染文本 + candidate_liepin_id ——
-    assert len(fake_queue.enqueued) == 1
-    send_task = fake_queue.enqueued[0]
-    assert send_task.type is AtomicTaskType.SEND_MESSAGE
+    
+    # —— SEND_MESSAGE 入队：direct_request 变体 + 渲染文本 ——
+    send_tasks = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.SEND_MESSAGE]
+    assert len(send_tasks) == 1
+    (send_task,) = send_tasks
     assert send_task.job_candidate_id == jc.id
     assert send_task.candidate_liepin_id == liepin
-    assert send_task.context["candidate_liepin_id"] == liepin
+    assert send_task.context["variant"] == "direct_request"
     assert send_task.context["text"] == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"  # direct_request 默认模板
-
+    
     # —— SEND_MESSAGE 成功 → awaiting_resume + 72h 锚点 + out/direct_request ——
     resp2 = _post_send_result(client, send_task)
     assert resp2.status_code == 200, resp2.text
-
+    
     _reload(session)
     jc2 = session.get(models.JobCandidate, jc.id)
     assert jc2.status == CandidateStatus.AWAITING_RESUME.value
     assert jc2.resume_requested_at is not None
     assert jc2.last_touch_at is not None
-
+    
     interactions = session.execute(
         select(models.Interaction).where(
             models.Interaction.job_candidate_id == jc.id
@@ -268,7 +296,6 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert interactions[0].direction == "out"
     assert interactions[0].msg_type == "direct_request"  # inbound 直索要（2026-10-06 策略）
     assert interactions[0].content == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"
-    assert len(fake_queue.enqueued) == 1  # SEND_MESSAGE 成功后无后继任务（等巡检）
 
     # —— snapshot artifact → snapshots/{liepin}/YYYYMMDD_HHMMSS.png + 落库 + 真实 MinIO ——
     png = b"\x89PNG\r\n\x1a\n" + uuid4().bytes
@@ -406,9 +433,15 @@ def test_rejected_zero_contact(
 
 
 def test_duplicate_read_result_idempotent(client, fake_queue, fake_screening, session):
-    """Review Focus 5：同 liepin_user_id 重复 read_resume 结果不重复建档/不重复推进。"""
+    """Review Focus 5：同 liepin_user_id 重复 read_resume 结果不重复建档/不重复推进。
+
+    inbound 已改为 读→CHECK→硬规则 序列（2026-10-06），幂等语义以 outbound
+    （recommended，读后即判定）验证，保持原断言形状。
+    """
     job_id, _ = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
+    session.add(models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended"))
+    session.commit()
     fake_screening.set(liepin, _pass_result(82))
 
     read_task = _make_read_task(job_id, liepin)
@@ -1064,6 +1097,158 @@ def test_inbound_post_receive_scoring_on_artifact(
     assert jc2.match_score == 82  # 收到后补评分落账
     assert jc2.judge_reason == "LLM 评分 82 通过"
     assert fake_screening.requests[-1].llm_scoring is True  # 补评分调用带评分开关
+    try:
+        store.client.remove_object(BUCKET, jc2.minio_object_key)
+    finally:
+        pass
+
+
+# —— 2026-10-06 分流：读→CHECK→（有简历：回执+入库 / 无：硬规则→直索要）——
+
+
+def _drive_inbound_read_to_check(client, fake_queue, session, *, job_id, liepin):
+    """读结果 → 返回 (read_task, candidate, jc, check_task)；断言分流第一步（不调 screening）。"""
+    read_task = _make_read_task(job_id, liepin)
+    fake_queue.record(read_task)
+    assert _post_read_result(client, read_task, liepin).status_code == 200
+    _reload(session)
+    candidate = session.execute(
+        select(models.Candidate).where(models.Candidate.liepin_user_id == liepin)
+    ).scalar_one()
+    jc = session.execute(
+        select(models.JobCandidate).where(
+            models.JobCandidate.job_id == job_id,
+            models.JobCandidate.candidate_id == candidate.id,
+        )
+    ).scalar_one()
+    checks = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.CHECK_ATTACHMENT]
+    assert len(checks) == 1
+    return read_task, candidate, jc, checks[0]
+
+
+def test_direct_intake_has_attachment_dispatches_ack_and_download(
+    client, fake_queue, fake_screening, session
+):
+    """有简历分支：回执（resume_ack）+ DOWNLOAD 直入；零 screening；状态仍 new。"""
+    job_id, title = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    _, _, jc, check_task = _drive_inbound_read_to_check(
+        client, fake_queue, session, job_id=job_id, liepin=liepin
+    )
+
+    resp = _post_check_attachment_result(client, check_task, has_attachment=True)
+    assert resp.status_code == 200, resp.text
+    _reload(session)
+
+    rollout = [
+        t
+        for t in fake_queue.enqueued
+        if t.type in (AtomicTaskType.SEND_MESSAGE, AtomicTaskType.DOWNLOAD_ATTACHMENT)
+    ]
+    assert [t.type for t in rollout] == [
+        AtomicTaskType.SEND_MESSAGE,
+        AtomicTaskType.DOWNLOAD_ATTACHMENT,
+    ]
+    ack, download = rollout
+    assert ack.context["variant"] == "resume_ack"
+    assert ack.context["text"] == f"您好 张伟，已收到您的简历，感谢关注{title}岗位！"
+    assert download.job_candidate_id == jc.id
+    assert fake_screening.requests == []  # 硬规则不拦收：直收路径零 screening
+    assert session.get(models.JobCandidate, jc.id).status == CandidateStatus.NEW.value
+
+
+def test_direct_intake_skips_ack_when_candidate_already_touched(
+    client, fake_queue, fake_screening, session
+):
+    """候选人级一人一消息：该候选人已触达（跨岗位）→ 跳过回执，仍下载入库。"""
+    job_id, _ = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    _, _, jc, check_task = _drive_inbound_read_to_check(
+        client, fake_queue, session, job_id=job_id, liepin=liepin
+    )
+    session.add(
+        models.Interaction(
+            job_candidate_id=jc.id,
+            direction="out",
+            msg_type="reply",
+            content="历史触达（另一岗位）",
+            sent_at=datetime.now(),
+        )
+    )
+    session.commit()
+
+    resp = _post_check_attachment_result(client, check_task, has_attachment=True)
+    assert resp.status_code == 200, resp.text
+    rollout = [
+        t
+        for t in fake_queue.enqueued
+        if t.type in (AtomicTaskType.SEND_MESSAGE, AtomicTaskType.DOWNLOAD_ATTACHMENT)
+    ]
+    assert [t.type for t in rollout] == [AtomicTaskType.DOWNLOAD_ATTACHMENT]
+
+
+def test_ack_result_records_reply_without_status_change(
+    client, fake_queue, fake_screening, session
+):
+    """回执结果：interactions 落 out/reply + last_touch_at；生命周期状态不推进。"""
+    job_id, _ = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    _, _, jc, check_task = _drive_inbound_read_to_check(
+        client, fake_queue, session, job_id=job_id, liepin=liepin
+    )
+    assert _post_check_attachment_result(client, check_task, has_attachment=True).status_code == 200
+    (ack,) = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.SEND_MESSAGE]
+
+    assert _post_send_result(client, ack).status_code == 200
+    _reload(session)
+    jc2 = session.get(models.JobCandidate, jc.id)
+    assert jc2.status == CandidateStatus.NEW.value  # 回执不推进状态
+    assert jc2.last_touch_at is not None
+    interactions = (
+        session.execute(
+            select(models.Interaction).where(models.Interaction.job_candidate_id == jc.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert [(r.direction, r.msg_type) for r in interactions] == [("out", "reply")]
+
+
+def test_direct_intake_artifact_from_new_reaches_resume_received(
+    client, fake_queue, fake_screening, session, store
+):
+    """直收入库：artifact 从 new → resume_received + 收到后补评分落账。"""
+    job_id, _ = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    fake_screening.set(liepin, _pass_result(82))
+    _, _, jc, check_task = _drive_inbound_read_to_check(
+        client, fake_queue, session, job_id=job_id, liepin=liepin
+    )
+    assert _post_check_attachment_result(client, check_task, has_attachment=True).status_code == 200
+    (download,) = [
+        t for t in fake_queue.enqueued if t.type is AtomicTaskType.DOWNLOAD_ATTACHMENT
+    ]
+
+    resp = client.post(
+        f"/internal/tasks/{download.task_id}/artifact",
+        files={"file": ("简历.pdf", b"%PDF-1.4 resume", "application/pdf")},
+        data={"task_id": str(download.task_id), "kind": "resume", "filename": "简历.pdf"},
+    )
+    assert resp.status_code == 200, resp.text
+    _reload(session)
+    jc2 = session.get(models.JobCandidate, jc.id)
+    assert jc2.status == CandidateStatus.RESUME_RECEIVED.value
+    assert jc2.resume_downloaded_at is not None
+    assert jc2.match_score == 82  # 收到后补评分
+    assert fake_screening.requests[-1].llm_scoring is True
+    interaction = (
+        session.execute(
+            select(models.Interaction).where(models.Interaction.job_candidate_id == jc.id)
+        )
+        .scalars()
+        .one()
+    )  # 回执未执行（未投递 send 结果）→ 仅 in/attachment
+    assert (interaction.direction, interaction.msg_type) == ("in", "attachment")
     try:
         store.client.remove_object(BUCKET, jc2.minio_object_key)
     finally:
