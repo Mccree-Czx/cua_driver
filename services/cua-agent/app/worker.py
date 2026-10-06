@@ -62,7 +62,7 @@ from app.brain.mock import MockBrain
 from app.brain.openai_brain import BrainUnavailableError, OpenAIBrain
 from app.config import get_settings
 from app.cost import usage_evidence
-from app.drivers.cua_sdk import CuaLiepinDriver
+from app.drivers.cua_sdk import CuaLiepinDriver, RiskControlDetectedError
 from app.drivers.fake import FakeLiepinDriver, png_bytes
 from app.executor import ExecutorDeps, TaskExecutionError, execute
 from app.world import load_world
@@ -90,6 +90,8 @@ class WorkerDeps:
     uniform: Callable[[float, float], float] = random.uniform
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     rate_per_hour: int = 20
+    task_gap_seconds: float = 0.0  # 任务间隔冷却（真实默认 30s；风控密度闸）
+    retry_defer_seconds: int = 0  # 失败重试延后（真实默认 60s；禁 0 秒连重试）
     now: Callable[[], datetime] = datetime.now
     clock: Callable[[], float] = time.time
 
@@ -127,7 +129,20 @@ class _PassthroughBucket:
 
 
 async def run_task(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskResult:
-    """执行单任务（attempt 为折算后的尝试计数；测试直调入口）。"""
+    """执行单任务（attempt 为折算后的尝试计数；测试直调入口）。
+
+    末尾统一应用任务间隔冷却（deps.task_gap_seconds；真实模式默认 30s，E2E
+    自动置 0）——风控教训：连续高频操作会触发平台安全验证。
+    """
+    try:
+        return await _run_task_inner(task, deps, attempt=attempt)
+    finally:
+        if deps.task_gap_seconds > 0:
+            await deps.sleep(deps.task_gap_seconds)
+
+
+async def _run_task_inner(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskResult:
+    """run_task 主体（不含末尾间隔冷却）。"""
     # 1. 动作前延时
     lo, hi = TOUCH_DELAY_RANGE if task.type is AtomicTaskType.SEND_MESSAGE else READ_DELAY_RANGE
     await deps.sleep(deps.uniform(lo, hi))
@@ -144,6 +159,19 @@ async def run_task(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskR
     start = deps.clock()
     try:
         result = execute(task, deps.executor)
+    except RiskControlDetectedError as e:
+        # 平台风控/安全验证页：立即转人工，绝不自动重试（重试=继续冲击风控画像）
+        evidence = {
+            "risk_control": True,
+            "attempt": attempt,
+            "duration_s": round(deps.clock() - start, 3),
+        }
+        result = TaskResult(
+            task_id=task.task_id,
+            outcome="failed_needs_manual",
+            evidence=evidence,
+            error=f"检测到风控/安全验证页：{e}",
+        )
     except BrainUnavailableError as e:
         await deps.requeue(task, BRAIN_DEFER_SECONDS)
         return _deferred_result(task, f"视觉大脑不可用，deferred 重判：{e}")
@@ -181,11 +209,12 @@ async def run_task(task: AtomicTask, deps: WorkerDeps, *, attempt: int) -> TaskR
     try:
         deps.pipeline.post_result(task.task_id, result)
     except Exception as e:  # 回调失败按重试处理：pipeline 幂等兜底，arq max_tries 为最终兜底
-        raise Retry() from e
+        raise Retry(defer=deps.retry_defer_seconds or None) from e
 
-    # 5. 重试策略：未达上限 → arq 按 max_tries=4 配置重跑（1 初跑 + 3 重试）
+    # 5. 重试策略：未达上限 → arq 按 max_tries=4 配置重跑（1 初跑 + 3 重试）；
+    #    重试统一延后 deps.retry_defer_seconds（真实默认 60s——禁止 0 秒快速连重试）
     if result.outcome == "failed_retryable":
-        raise Retry()
+        raise Retry(defer=deps.retry_defer_seconds or None)
     return result
 
 
@@ -235,6 +264,8 @@ def build_worker_deps(ctx: dict) -> WorkerDeps:
         bucket=TokenBucket(redis_pool),
         requeue=requeue,
         rate_per_hour=settings.msg_rate_per_hour,
+        task_gap_seconds=0.0 if settings.e2e_instant else settings.task_gap_seconds,
+        retry_defer_seconds=0 if settings.e2e_instant else settings.retry_defer_seconds,
     )
     if settings.e2e_instant:
         return _apply_e2e_instant(deps)
@@ -250,6 +281,8 @@ def _apply_e2e_instant(deps: WorkerDeps) -> WorkerDeps:
     deps.uniform = lambda lo, hi: 0.0
     deps.sleep = _noop_sleep
     deps.bucket = _PassthroughBucket()
+    deps.task_gap_seconds = 0.0
+    deps.retry_defer_seconds = 0
     return deps
 
 

@@ -20,6 +20,7 @@ from arq.worker import Retry
 
 from app.brain.mock import MockBrain
 from app.brain.openai_brain import BrainUnavailableError
+from app.drivers.cua_sdk import RiskControlDetectedError, has_risk_control
 from app.drivers.fake import FakeLiepinDriver
 from app.worker import WorkerDeps, execute_task, run_task
 from app.executor import ExecutorDeps
@@ -505,3 +506,49 @@ def test_execute_task_derives_attempt_from_job_try():
         execute_task({"worker_deps": fixtures["deps"], "job_try": 4}, payload)
     )
     assert result.outcome == "failed_needs_manual"  # job_try=4 → attempt 3 → 达上限
+
+
+# —— 风控防线（2026-10-06 实测教训：连续高频操作触发平台安全验证）——
+
+
+def test_has_risk_control_detects_security_page_markers():
+    """风控页判据纯函数：命中「账号行为异常/猎聘安全中心/图形验证码」任一即 True。"""
+    assert has_risk_control("猎聘安全中心发现您的帐号存在异常行为……请点击下方图形验证码") is True
+    assert has_risk_control("账号行为异常") is True
+    assert has_risk_control("消息列表页正常展示") is False
+
+
+def test_risk_control_error_fails_manual_without_retry():
+    """风控检测：failed_needs_manual + 不 raise Retry + 回调落账（人工接管，绝不自动重试）。"""
+    fixtures = make_deps()
+
+    def boom(*args, **kwargs):
+        raise RiskControlDetectedError("检测到账号行为异常验证页")
+
+    fixtures["deps"].executor.driver.read_online_resume = boom
+    result = run(make_task(AtomicTaskType.READ_RESUME), fixtures)  # 不抛 Retry
+
+    assert result.outcome == "failed_needs_manual"
+    assert result.evidence["risk_control"] is True
+    assert result.evidence["attempt"] == 0
+    (_, posted), = fixtures["pipeline"].results
+    assert posted.outcome == "failed_needs_manual"
+    assert fixtures["deps"].requeue.calls == []  # 不 deferred 重排
+
+
+def test_task_gap_applied_at_end_of_run():
+    """任务间隔闸：run_task 结束时按 deps.task_gap_seconds 冷却（真实默认 30s）。"""
+    fixtures = make_deps()
+    fixtures["deps"].task_gap_seconds = 7.5
+    run(make_task(AtomicTaskType.CHECK_LOGIN), fixtures)
+    assert 7.5 in fixtures["sleep"].calls
+
+
+def test_retry_uses_configured_defer_not_immediate():
+    """失败重试按 retry_defer_seconds 延后（禁止 0 秒快速连重试）。"""
+    fixtures = make_deps()
+    fixtures["deps"].retry_defer_seconds = 90
+    _fail_driver(fixtures["deps"])
+    with pytest.raises(Retry) as excinfo:
+        run(make_task(AtomicTaskType.READ_RESUME), fixtures)
+    assert excinfo.value.defer_score == 90_000

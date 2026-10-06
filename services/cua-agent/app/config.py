@@ -38,6 +38,13 @@ class Settings(BaseSettings):
         default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL"
     )
     msg_rate_per_hour: int = Field(default=20, validation_alias="MSG_RATE_PER_HOUR")
+    # 风控防线（2026-10-06 实测教训：连续高频操作触发平台安全验证）
+    task_gap_seconds: float = Field(
+        default=30.0, validation_alias="CUA_TASK_GAP_SECONDS"
+    )  # 任务间隔：每个任务结束后的冷却（E2E instant 自动置 0）
+    retry_defer_seconds: int = Field(
+        default=60, validation_alias="CUA_RETRY_DEFER_SECONDS"
+    )  # 失败重试延后：禁止 0 秒快速连重试（E2E instant 自动置 0）
     world_path: str = Field(default="worlds/default.json", validation_alias="CUA_WORLD_PATH")
     e2e_instant: bool = Field(
         default=False, validation_alias="CUA_E2E_INSTANT"

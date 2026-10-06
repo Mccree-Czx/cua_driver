@@ -6,7 +6,8 @@ execute(task, deps) -> TaskResult：
   （模块 docstring 的 evidence 契约段逐字段对齐）；
 - 动作/校验失败抛 TaskExecutionError（携带已烧 token 用量，worker 据此
   组装 failed 结果）；BrainUnavailableError 原样上抛（worker 降级为
-  deferred 重判，不按动作失败计）。
+  deferred 重判，不按动作失败计）；RiskControlDetectedError（平台风控/
+  安全验证页）原样上抛（worker 立即转人工，绝不重试）。
 
 每类型的"动作后截图 → verify"：
 - 判定型动作（check_login / check_attachment）返回 bool 即页面判定结果，
@@ -36,6 +37,7 @@ from hr_workbuddy import AtomicTask, AtomicTaskType, BrainClient, LiepinDriver, 
 from app.brain.openai_brain import BrainUnavailableError
 from app.brain.usage import BrainUsage
 from app.cost import accumulate
+from app.drivers.cua_sdk import RiskControlDetectedError
 from app.verify import verify_success
 
 
@@ -226,6 +228,8 @@ def execute(task: AtomicTask, deps: ExecutorDeps) -> TaskResult:
         )
     except TaskExecutionError:
         raise
+    except RiskControlDetectedError:
+        raise  # 风控/安全验证页：原样上抛（worker 立即转人工，绝不重试）
     except BrainUnavailableError as e:
         if post_send:
             raise TaskExecutionError(

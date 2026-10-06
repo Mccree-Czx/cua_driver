@@ -60,6 +60,19 @@ class CuaNotInstalledError(RuntimeError):
     """cua-driver SDK 未安装（应经 `uv sync --all-packages` 安装）。"""
 
 
+# 风控页判据（2026-10-06 实测：连续高频操作触发「账号行为异常」安全验证页）
+RISK_CONTROL_MARKERS = ("账号行为异常", "猎聘安全中心", "图形验证码")
+
+
+class RiskControlDetectedError(RuntimeError):
+    """检测到平台风控/安全验证页：立即失败即停（worker 转人工，绝不自动重试/绕过）。"""
+
+
+def has_risk_control(tree_text: str) -> bool:
+    """风控页判据（模块级纯函数，供驱动与单测复用）。"""
+    return any(m in tree_text for m in RISK_CONTROL_MARKERS)
+
+
 class _RuntimeBridge:
     """专用事件循环线程：所有 SDK 调用经此串行执行（同步函数 call / 协程 run）。"""
 
@@ -401,8 +414,18 @@ class CuaLiepinDriver:
     # —— 聊天页 / 批量简历页导航与读取（T12 步骤③ 实测路径）——
 
     def _live_state(self, pid: int, wid: int) -> Any:
-        """取最新窗口 state（元素索引逐快照漂移：后续一律即时定位）。"""
-        return self.window_state(pid, wid)
+        """取最新窗口 state（元素索引逐快照漂移：后续一律即时定位）。
+
+        风控页闸口：检测到「账号行为异常」安全验证页立即抛
+        RiskControlDetectedError（worker 转人工，不重试；绝不自动绕过验证）。
+        """
+        state = self.window_state(pid, wid)
+        text = str(getattr(state, "tree_markdown", "") or "")
+        if has_risk_control(text):
+            raise RiskControlDetectedError(
+                "检测到猎聘风控/安全验证页（账号行为异常）——停止操作，人工在桌面完成验证"
+            )
+        return state
 
     def _current_url(self, state: Any) -> str:
         for e in (getattr(state, "elements", []) or []):
@@ -680,6 +703,8 @@ class CuaLiepinDriver:
         except Exception:
             pass  # 可见性失败不阻断判定（树读取在遮挡下也常可用）
         tree = self._tree_text(found[2])
+        if has_risk_control(tree):
+            return False  # 风控页≈不可用：按未登录处理（scheduler 暂停派发，人工接管）
         if any(m in tree for m in self.LOGIN_PAGE_MARKERS):
             return False
         return any(m in tree for m in self.BACKEND_MARKERS)
