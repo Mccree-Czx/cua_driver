@@ -989,15 +989,18 @@ class CuaLiepinDriver:
         实测路径：聊天页 →「浏览简历」→ 批量预览简历页 → 逐选项卡 AXPress → 读
         「简历编号」比对目标 → 图标锚点提取字段（environment/work/education/
         file-search + 求职意向薪资）；截图用桌面捕获（窗口捕获在 capture 绑定期
-        不稳定）。字段缺失/查找失败即抛错（失败即停）；错误信息携带状态供人工/
-        视觉复核（视觉兜底为后续接线点，驱动当前无大脑实例）。
+        不稳定）。必填字段（city/years/education）缺失或查找失败即抛错（失败即
+        停）；experience_summary 为可选——部分候选人页面无 file-search 栏目
+        （2026-10-06 实测），缺失落空串；错误信息携带状态供人工/视觉复核。
         """
         pid, wid = self._ensure_visible_and_resolved()
         state, name = self._candidate_detail(pid, wid, candidate_liepin_id)
         city = self._value_after_icon(state, "environment")
         years = self._value_after_icon(state, "work")
         edu_full = self._value_after_icon(state, "education")
-        summary = self._value_after_icon(state, "file-search")
+        # 自我评价/个人优势栏目并非所有候选人都有（2026-10-06 实测：邵女士类
+        # 页面无 file-search 栏目）——缺失落空串，不作为失败；其余字段失败即停。
+        summary = self._value_after_icon(state, "file-search") or ""
         education = edu_full.split("·")[-1].strip() if edu_full else None
         missing = [
             key
@@ -1005,7 +1008,6 @@ class CuaLiepinDriver:
                 ("city", city),
                 ("years_of_experience", years),
                 ("education", education),
-                ("experience_summary", summary),
             )
             if not value
         ]
