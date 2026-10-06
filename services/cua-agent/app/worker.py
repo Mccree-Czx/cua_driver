@@ -212,9 +212,7 @@ def build_worker_deps(ctx: dict) -> WorkerDeps:
         brain = OpenAIBrain(
             settings.brain_base_url, settings.brain_api_key, settings.brain_model
         )
-
-        def capture() -> bytes:  # 真实桌面截图注入：待 T12 真实账号冒烟校准
-            raise NotImplementedError("真实模式动作后截图：待 T12 冒烟校准（SDK get_desktop_state）")
+        capture = driver.capture_desktop_png  # T12：真实桌面截图（PNG 字节，capture_binding 注记以文件为准）
 
     pipeline = PipelineClient(settings.pipeline_url)
     redis_pool = ctx["redis"]

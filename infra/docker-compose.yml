@@ -8,7 +8,11 @@ name: hr-workbuddy
 #   uv run pytest infra/tests -m infra
 
 services:
+  # Docker MySQL 默认以 profile 隔离不启动（本机 3306 由宿主机 MySQL 占用）；
+  # 需要 Docker 版 MySQL 时显式启用：
+  #   docker compose -f infra/docker-compose.yml --profile docker-mysql up -d
   mysql:
+    profiles: ["docker-mysql"]
     image: mysql:8.4
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-hr_root_dev_pw}

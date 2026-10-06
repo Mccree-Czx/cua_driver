@@ -2,8 +2,10 @@
 
 env：CUA_BRAIN_BASE_URL / CUA_BRAIN_API_KEY / CUA_BRAIN_MODEL（默认
 deepseek-flash——用户账号实测支持 image 输入；deepseek-v4-pro 为纯文本
-模型，不可用于本用途）。截图以 base64 data URL 附给模型，输出经
-response_format json_schema 约束为 {ok: bool, reason: str}。
+模型，不可用于本用途）。截图以 base64 data URL 附给模型，输出约束为
+{ok: bool, reason: str}：response_format 用 json_object（T12 实测：当前
+DeepSeek API 对 json_schema 返回 400「response_format type is unavailable」），
+输出契约由 prompt 声明 + 解析层严格校验兜底；解析容忍 ```json 代码围栏包裹。
 
 T9 扩展：verify_with_usage(screenshot, criteria) -> VerifyVerdict——
 返回判定 + 本次调用 token 用量（resp.usage），供 worker 写
@@ -27,6 +29,8 @@ VERIFY_PROMPT = (
     '输出 JSON 对象 {{"ok": bool, "reason": str}}。\n标准：{criteria}'
 )
 
+# 输出契约（以 prompt 声明 + 解析层校验兑现；T12 后不再作为 response_format 发出
+# ——当前 DeepSeek API 不支持 json_schema）
 VERDICT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -99,23 +103,29 @@ class OpenAIBrain:
                         ],
                     }
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "verification_verdict",
-                        "strict": True,
-                        "schema": VERDICT_SCHEMA,
-                    },
-                },
+                # T12 实测：DeepSeek 当前 API 拒绝 json_schema（400
+                # response_format type is unavailable）——json_object 保结构化约束
+                response_format={"type": "json_object"},
             )
             content = resp.choices[0].message.content
-            verdict = BrainVerdict.model_validate_json(content)
+            verdict = _parse_verdict(content)
         except APIError as e:
             raise BrainUnavailableError(f"供应商错误：{e}") from e
         except (ValidationError, ValueError, TypeError, IndexError, AttributeError) as e:
             raise BrainUnavailableError(f"非法输出：{e}") from e
         self._last_usage = _extract_usage(resp)
         return VerifyVerdict(ok=verdict.ok, usage=self._last_usage)
+
+
+def _parse_verdict(content: Any) -> BrainVerdict:
+    """解析校验输出：容忍 ```json 代码围栏包裹，其余按契约严格校验（extra=forbid）。"""
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    return BrainVerdict.model_validate_json(text)
 
 
 def _extract_usage(resp: Any) -> BrainUsage:

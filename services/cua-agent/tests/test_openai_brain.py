@@ -65,9 +65,9 @@ def test_ok_false():
     assert make_brain(chat).verify(PNG, "页面处于已登录状态") is False
 
 
-def test_request_shape_model_prompt_image_and_schema():
+def test_request_shape_model_prompt_image_and_response_format():
     """请求形状：模型名、criteria 入 prompt、截图以 base64 data URL 附给模型、
-    response_format 施加 {ok, reason} JSON Schema。"""
+    response_format 为 json_object（T12 实测：DeepSeek 不支持 json_schema，400 拒绝）。"""
     chat = FakeChat(content='{"ok": true, "reason": "yes"}')
     brain = make_brain(chat)
     brain.verify(PNG, "附件为 PDF 简历")
@@ -79,10 +79,13 @@ def test_request_shape_model_prompt_image_and_schema():
     url = content[1]["image_url"]["url"]
     assert url.startswith("data:image/png;base64,")
     assert base64.b64decode(url.split(",", 1)[1]) == PNG  # 原字节往返一致
-    schema = kwargs["response_format"]["json_schema"]["schema"]
-    assert schema["required"] == ["ok", "reason"]
-    assert schema["properties"]["ok"] == {"type": "boolean"}
-    assert schema["properties"]["reason"] == {"type": "string"}
+    assert kwargs["response_format"] == {"type": "json_object"}
+
+
+def test_code_fenced_json_output_tolerated():
+    """解析容忍 ```json 代码围栏包裹（真实模型偶发输出形态）。"""
+    chat = FakeChat(content='```json\n{"ok": true, "reason": "fenced"}\n```')
+    assert make_brain(chat).verify(PNG, "criteria") is True
 
 
 # —— 非法输出 → BrainUnavailableError ——

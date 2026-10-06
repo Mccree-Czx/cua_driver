@@ -17,7 +17,7 @@
   POST /internal/sweeps/stale-awaiting → 断言 no_response→closed 与边界两向
 - 状态清理：每剧本前 TRUNCATE pipeline 各表（FK_CHECKS=0，AUTO_INCREMENT 归 1）、
   Redis FLUSHDB、删 MinIO snapshots/ 与 resumes/ 前缀对象——保证可重复运行
-- 子进程在 finally 里杀干净（taskkill 进程树）；World 剧本文件改动在 finally 复原
+- 子进程在 finally 里杀干净（Windows taskkill / POSIX 进程组信号）；World 剧本文件改动在 finally 复原
 
 断言直查 DB / MinIO / Redis（不经日志）。
 """
@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -197,7 +198,8 @@ def _port_of(url: str) -> int:
 
 @dataclass
 class Proc:
-    """服务子进程：日志写文件（UTF-8），stop 用 taskkill 杀整棵进程树。"""
+    """服务子进程：日志写文件（UTF-8）；stop 杀整棵进程树
+    （Windows taskkill / POSIX 进程组 SIGTERM→SIGKILL）。"""
 
     name: str
     args: list[str]
@@ -216,24 +218,40 @@ class Proc:
             env=self.env,
             stdout=self._log_fh,
             stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            **(
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if os.name == "nt"
+                else {"start_new_session": True}  # POSIX：独立进程组，stop 按组杀树
+            ),
         )
 
     def stop(self) -> None:
         if self.popen is None:
             return
         if self.popen.poll() is None:
-            subprocess.run(
-                ["taskkill", "/PID", str(self.popen.pid), "/T", "/F"],
-                capture_output=True,
-                check=False,
-            )
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.popen.pid), "/T", "/F"],
+                    capture_output=True,
+                    check=False,
+                )
+            else:
+                self._kill_group(signal.SIGTERM)
         try:
             self.popen.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            pass
+            if os.name != "nt":
+                self._kill_group(signal.SIGKILL)  # 超时升级：硬杀整组
+                self.popen.wait(timeout=10)
         if self._log_fh is not None:
             self._log_fh.close()  # type: ignore[union-attr]
+
+    def _kill_group(self, sig: int) -> None:
+        """POSIX：向子进程组发信号（start_new_session 保证子孙同在组内）。"""
+        try:
+            os.killpg(os.getpgid(self.popen.pid), sig)  # type: ignore[union-attr]
+        except ProcessLookupError:
+            pass
 
 
 def _env() -> dict[str, str]:

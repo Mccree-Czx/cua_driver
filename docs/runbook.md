@@ -208,8 +208,8 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | worker 起不来 / arq 队列无人消费 | 检查 `PYTHONPATH`（arq CLI 导入 app.worker 需要，见 §3）；Redis 可达；`CUA_DRIVER_MODE` 取值合法（mock\|real，勿写 local） |
 | scheduler 日志 `[login] 请扫码登录…` 且派发暂停 | 登录态失效：桌面应用扫码重新登录，下一轮自动解除；状态键 `pipeline:state:login` |
 | screening 返回 `judge_reason="deferred: LLM unavailable"`（降级） | 检查 .env `SCREENING_LLM_*`（key/模型名）；候选人不推进，deferred_sweep 30min 自动重判 |
-| worker 日志大脑不可用 → 任务 deferred 重判（60s） | 检查 .env `CUA_BRAIN_*`；模型必须是 `deepseek-flash`（`deepseek-v4-pro` 不支持 image 输入） |
-| real 模式驱动方法抛 NotImplementedError | **预期**（T8 骨架未校准，待 T12）：冒烟脚本会清晰提示「待 T12 校准」，不是故障 |
+| worker 日志大脑不可用 → 任务 deferred 重判（60s） | 检查 .env `CUA_BRAIN_*`；模型必须是 `deepseek-flash`（`deepseek-v4-pro` 不支持 image 输入）。**另一已知原因（已修）**：T12 前 `response_format` 用 json_schema，DeepSeek 现拒（400 `This response_format type is unavailable now`）——已改 `json_object` + 解析容忍代码围栏 |
+| real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）已完成 7 个页面方法校准（check_login / list_unread / open_conversation / read_online_resume / send_message / check_attachment / download_attachment）；若再现说明代码回退 |
 | 回调 `404 {"detail":"Not Found"}`；E2E 卡在 read_resume「max retries 4 exceeded」 | **本机代理环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向本地代理时，httpx（默认 `trust_env=True`）会把 `127.0.0.1` 的内网回调也发给代理，被拦成 404（实测特征：同一连接首请求 200、其后全 404；`http.client` 与新建连接均正常）。服务侧已用 `trust_env=False` 绕过硬编码内网调用；自建脚本请设 `NO_PROXY=127.0.0.1,localhost,::1`（或 `set HTTP_PROXY=` 清空）。排查命令：`echo $env:HTTP_PROXY` |
 
 ## 6. 已知限制（M2/T12 前置门禁）
@@ -233,8 +233,9 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 
 | 日期 | 执行人 | 步骤 | 命令/操作 | 结果 | 备注 |
 |---|---|---|---|---|---|
-| | | ① 登录态 | | | |
-| | | ② 登出/恢复 | | | |
-| | | ③ 读简历 | | | |
-| | | ④ 发消息 | | | |
-| | | ⑤ 账目核对 | | | |
+| 2026-10-06 | Qoder(T12) | ① 登录态 | `smoke_real.py --step login` | **通过**：`check_login() → True`（首次扫描 2.1s / 缓存 0.2s） | macOS 迁移后重校：窗口判据=地址栏含 liepin.com；登录锚点=后台导航 |
+| 2026-10-06 | Qoder(T12) | ② 登出/恢复 | （未执行） | 待办 | 需全栈运行 + 人工扫码配合（本地登出→告警→扫码恢复） |
+| 2026-10-06 | Qoder(T12) | ③ 读简历 | `--step read --candidate-liepin-id e37fdde092f5Yc6f103cf422b` | **通过**：截图 1,062,579B + 7 字段全对（梁女士/硕士/工作2年/佛山/11-22k×12薪/摘要全文） | 零触达；liepin_user_id 真实来源=批量预览页「简历编号」 |
+| 2026-10-06 | Qoder(T12) | ④ 发消息 | `--step send --candidate-liepin-id e37fdde092f5Yc6f103cf422b --yes --text "您好 梁女士，⋯发一份简历吗？"` | **通过**：消息上屏（16:02，截图目视确认）；输入读回校验+发送后上屏校验全过 | 唯一真实触达；梁女士的一人一消息额度已消耗，不可对其重发 |
+| 2026-10-06 | Qoder(T12) | ⑤ 账目核对 | `--step verify` | **通过（配置面）**：real / 20条·小时 / `CUA_E2E_INSTANT` 未设 / 延时区间正确 / 工作窗口 08:00–20:00 | 本小时无 `msg-touch:*` 键（直连脚本不经 worker 延时/桶）；worker 级延时·桶·TaskLog 待全栈真实链路验证 |
+| 2026-10-06 | Qoder(T12) | 联调切片（附加） | 手工入队 CHECK_LOGIN（模拟 scheduler）→ pipeline + real worker | **通过（全链）**：worker `outcome=success`（19.7s=延时~12s+执行）；`/internal/state/login` → `is_login=true`；`task_logs` 落账 tokens=1176 / duration=7.78s | 期间发现并修复：DeepSeek 拒 json_schema（400）→ 大脑改 `json_object`（单测 57 绿）；附件链同步实测：check_attachment=True、download_attachment 得 322,966B PDF |
