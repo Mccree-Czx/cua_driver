@@ -72,7 +72,7 @@ def test_render_empty_template_raises():
 def test_render_direct_request_default_fallback():
     """direct_request 未配置 → 内置默认模板兜底（存量岗位兼容，2026-10-06 策略）。"""
     text = render_message(_job(template_msgs={}), _candidate(), "direct_request")
-    assert text == "您好 张伟，感谢关注高级产品经理岗位，方便发一份简历吗？"
+    assert text == "您好 张伟，方便发一份简历吗？"  # 零岗位名（错位事故修订）
 
 
 def test_render_direct_request_explicit_config_wins():

@@ -765,7 +765,7 @@ def scenario_c(log_dir: Path) -> ScenarioReport:
             ("out", "reply"),
             ("in", "attachment"),
         ], f"LP005 interactions 偏差：{rows}"
-        assert rows[0]["content"] == f"您好 钱七，已收到您的简历，感谢关注{JOB_TITLE}岗位！"
+        assert rows[0]["content"] == "您好 钱七，已收到您的简历，感谢关注！"
         checks.append("LP005 回执 out/reply（resume_ack）+ in/attachment；零索要")
         # 硬规则不拦收：大专/2 年仍入库（对比剧本 B LP003 硬拒零触达）
         pdf = jc["minio_object_key"]

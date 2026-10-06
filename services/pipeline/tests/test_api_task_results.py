@@ -275,7 +275,7 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert send_task.job_candidate_id == jc.id
     assert send_task.candidate_liepin_id == liepin
     assert send_task.context["variant"] == "direct_request"
-    assert send_task.context["text"] == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"  # direct_request 默认模板
+    assert send_task.context["text"] == f"您好 张伟，方便发一份简历吗？"  # direct_request 默认模板（零岗位名）
     
     # —— SEND_MESSAGE 成功 → awaiting_resume + 72h 锚点 + out/direct_request ——
     resp2 = _post_send_result(client, send_task)
@@ -295,7 +295,7 @@ def test_read_resume_pass_full_chain(client, fake_queue, fake_screening, session
     assert len(interactions) == 1  # 恰 1 行
     assert interactions[0].direction == "out"
     assert interactions[0].msg_type == "direct_request"  # inbound 直索要（2026-10-06 策略）
-    assert interactions[0].content == f"您好 张伟，感谢关注{title}岗位，方便发一份简历吗？"
+    assert interactions[0].content == f"您好 张伟，方便发一份简历吗？"
 
     # —— snapshot artifact → snapshots/{liepin}/YYYYMMDD_HHMMSS.png + 落库 + 真实 MinIO ——
     png = b"\x89PNG\r\n\x1a\n" + uuid4().bytes
@@ -1151,7 +1151,7 @@ def test_direct_intake_has_attachment_dispatches_ack_and_download(
     ]
     ack, download = rollout
     assert ack.context["variant"] == "resume_ack"
-    assert ack.context["text"] == f"您好 张伟，已收到您的简历，感谢关注{title}岗位！"
+    assert ack.context["text"] == f"您好 张伟，已收到您的简历，感谢关注！"
     assert download.job_candidate_id == jc.id
     assert fake_screening.requests == []  # 硬规则不拦收：直收路径零 screening
     assert session.get(models.JobCandidate, jc.id).status == CandidateStatus.NEW.value
