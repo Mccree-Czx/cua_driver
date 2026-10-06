@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     minio_endpoint: str = "127.0.0.1:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
+    minio_bucket: str = "hr-workbuddy"  # E2E 用独立 bucket（hr-workbuddy-e2e）隔离生产归档
     screening_url: str = "http://127.0.0.1:8001"
 
 

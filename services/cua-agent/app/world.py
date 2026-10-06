@@ -42,7 +42,8 @@ class ConversationScript(BaseModel):
 
     liepin_user_id: str
     unread: bool = False
-    resume_fixture: str | None = None  # 引用 World.resume_fixtures 的 key；None = 无在线简历
+    resume_fixture: str | None = None  # 引用 World.resume_fixtures 的 key ；None = 无在线简历
+    recommended: bool = False  # M2：推荐人列表可见（list_recommended 取数源）
 
 
 class World(BaseModel):

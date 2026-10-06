@@ -6,6 +6,7 @@ MySQL 与 MinIO 保持真实（任务测试要求：真实 MySQL + 真实 MinIO�
 
 from functools import lru_cache
 
+from app.config import get_settings
 from app.db import SessionLocal
 from app.login_state import RedisLoginState
 from app.screening_client import ScreeningClient
@@ -30,7 +31,7 @@ def get_screening() -> ScreeningClient:
 
 @lru_cache
 def get_store() -> ObjectStore:
-    return ObjectStore()
+    return ObjectStore(bucket=get_settings().minio_bucket)
 
 
 @lru_cache

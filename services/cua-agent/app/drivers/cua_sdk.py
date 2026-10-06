@@ -867,6 +867,16 @@ class CuaLiepinDriver:
         self._back_to_chat_page(pid, wid)
         return ids
 
+    def list_recommended(self) -> list[str]:
+        """推荐人列表读取（M2 路径二）——待 W7 真实页面校准后实装。
+
+        页面结构（入口/列表项 liepin_user_id 取数/职位切换）均未校准；mock/E2E
+        走 FakeLiepinDriver.list_recommended（剧本 recommended 标记）。校准清单见
+        docs/superpowers/plans/2026-10-06-liepin-m2.md §7。"""
+        raise NotImplementedError(
+            "list_recommended 待 W7 真实页面校准（先只读探针，低密度）"
+        )
+
     def open_conversation(self, candidate_liepin_id: str) -> None:
         """打开候选人会话：批量页按「简历编号」定位选项卡 →「继续沟通」进入聊天浮层。
 

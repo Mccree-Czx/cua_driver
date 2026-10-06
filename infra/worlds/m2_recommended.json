@@ -1,0 +1,64 @@
+{
+  "login_state": true,
+  "tick": 0,
+  "conversations": [
+    {
+      "liepin_user_id": "LP101",
+      "unread": false,
+      "resume_fixture": "lp101",
+      "recommended": true
+    },
+    {
+      "liepin_user_id": "LP102",
+      "unread": false,
+      "resume_fixture": "lp102",
+      "recommended": true
+    },
+    {
+      "liepin_user_id": "LP103",
+      "unread": false,
+      "resume_fixture": "lp103",
+      "recommended": true
+    }
+  ],
+  "resume_fixtures": {
+    "lp101": {
+      "name": "周九",
+      "liepin_user_id": "LP101",
+      "education": "本科",
+      "years_of_experience": "4年",
+      "city": "北京",
+      "salary": "25-35K",
+      "experience_summary": "四年产品经验，LLM 评分 82 通过（剧本 D 推荐人）"
+    },
+    "lp102": {
+      "name": "吴十",
+      "liepin_user_id": "LP102",
+      "education": "大专",
+      "years_of_experience": "5年",
+      "city": "上海",
+      "salary": "20-30K",
+      "experience_summary": "五年运营经验，学历不满足岗位硬规则（剧本 D 推荐人）"
+    },
+    "lp103": {
+      "name": "郑十一",
+      "liepin_user_id": "LP103",
+      "education": "本科",
+      "years_of_experience": "3年",
+      "city": "深圳",
+      "salary": "20-28K",
+      "experience_summary": "三年产品经验，LLM 评分 55 未达阈值（剧本 D 推荐人）"
+    }
+  },
+  "reply_timeline": [
+    {
+      "tick": 1,
+      "conversation_id": "LP101",
+      "text": null,
+      "attachment": {
+        "file_name": "周九-简历.pdf",
+        "content_type": "application/pdf"
+      }
+    }
+  ]
+}

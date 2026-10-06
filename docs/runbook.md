@@ -222,16 +222,16 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 - **inbound（主动咨询者）**：读在线简历 → **先探附件**（读后分流）：
   - **已有简历** → **回执 `resume_ack`**（零岗位名；派发前做候选人级一人一消息检查——已触达则跳过回执）+ **直接下载入库**（硬规则不拦收：PDF → MinIO + MySQL）→ 收到后补 LLM 评分
   - **无简历** → 硬规则 → 通过者直索要（`direct_request`，零岗位名）→ 72h 等待 → 收到 PDF 入库 → 收到后补评分（写 match_score/judge_reason 供 HR；补评分失败仅记标记不重试，M3 人工关注）
-- **outbound（推荐人，M2）**：硬规则 + LLM 两层 → 通过者打招呼+索要（`greet_request`）；未通过判定者零触达（触达成本）
+- **outbound（推荐人，M2）**：分层判定通过者打招呼+索要（`greet_request`，含岗位名），未通过判定者零触达（触达成本）。**2026-10-06 已实现**：`outbound_round`（间隔/每轮上限/爬坡参数）→ `LIST_RECOMMENDED`（推荐人页读取）→ 建档（source=recommended）→ 两层判定 → 打招呼 → 72h 等回传；**默认关闭**（`OUTBOUND_ENABLED=false`）——待 W7 真实页面校准后开启（校准清单：`docs/superpowers/plans/2026-10-06-liepin-m2.md` §7）。
 - **话术零岗位名（2026-10-06 晚事故修订）**：会话「沟通职位」可能与库内岗位错位（实测：回执误写「产品经理」而候选人在聊「海外ToB渠道销售（出海品牌）」）→ inbound 双向话术（回执/直索要）不引用 {title}；outbound greet 仍带 {title}（主动触达须说明来意岗位）。
 
-## 6. 已知限制（M2/T12 前置门禁）
+## 6. 已知限制（上线前门禁）
 
-以下三项为 M1 范围内的已知缺陷，**真实模式操作前（T12 真实模式校准、M2 真实发送）必须先修**：
+以下三项为历史已知缺陷，**当前状态**如下（2026-10-06 更新）：
 
-1. **同一任务可能被重试重发**：worker 在真实模式下 verify 失败 / 大脑不可用会把任务重排重试并重发同一条消息——pipeline 的一人一消息闸只防第二条**任务**的落库，防不住同一任务的重复发送。建议发送类任务失败一律置 `failed_needs_manual`（人工介入），T12 真实模式校准与 M2 真实发送前必须落实。
-2. **非 awaiting_resume 状态到达的简历附件被静默丢弃**：72h 关闭与在途下载链之间存在竞态窗口（候选人已被 72h 巡检关闭、附件才到达）——真实模式操作前必须改为「只存不推进」（附件照常落库，状态推进交由人工/复核流程）。
-3. **「终身一条消息」按 job_candidate 粒度**：同一候选人对多个岗位会被各发一条（决策 3 的约束半径是单个 job_candidate）——M2 计划需补跨岗位合并或全局 out 去重。
+1. **同一任务可能被重试重发**：【已修，Eb4f934】发送类任务失败后一律 `failed_needs_manual`（`post_send_failure` 证据），arq 不再同 payload 重跑；真实发送的重复窗口关闭。
+2. **非 awaiting_resume 状态到达的简历附件被静默丢弃**：【已修，2026-10-06】迟到附件“只存不推进”（新状态直收入库路径 `new→resume_received` 也纳入受理范围）。
+3. **「终身一条消息」按 job_candidate 粒度**：【已全域化，2026-10-06】候选人级一人一消息预检已覆盖全部 SEND 派发点（推荐人建档、screening pass、回执派发三处）+ 结果侧 jc 级兜底；跨岗位去重生效。
 
 ## 7. 安全红线
 
@@ -239,6 +239,18 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 - **零触达原则**：一切验证优先 mock（M1 E2E 全 mock）；真实触达前脚本打印全文与风险提示；`CUA_E2E_INSTANT=1`（延时 0 + 桶直通）**严禁**出现在真实冒烟/生产——延时、20/hr、工作窗口是风控约束不是摆设。
 - **数据本地不外传**：简历 PDF 与快照仅存本地 MinIO；在线简历仅存 7 最小字段快照（姓名/liepin_user_id/学历/年限/城市/薪资/经历摘要）；真实密钥仅 `.env`（git-ignored），任何提交文件不得含 key。
 - **封号风险（决策 10）**：使用者知晓并接受猎聘协议封号风险，使用专门招聘子账号承担；任何绕过限频/延时/窗口的操作都会显著提高风控画像。
+
+## 8. 常驻部署与备份（上线硬化，2026-10-06）
+
+- **常驻守护（launchd）**：`scripts/deploy/install.sh` 安装四服务（pipeline/screening/scheduler/worker），
+  `KeepAlive` 崩溃自动拉起、`RunAtLoad` 登录即起；环境由 `run_service.sh` 固化
+  （cwd=仓库根、NO_PROXY、CUA_DRIVER_MODE=real、PYTHONPATH——僵尸 worker 教训的对策）；
+  日志在 `.run/logs/`；卸载：`scripts/deploy/uninstall.sh`。
+  前置：Docker（redis/minio）+ MySQL 已运行。worker 依赖交互式桌面会话——锁屏期间任务转人工，恢复后自动继续。
+- **备份**：`scripts/backup.py`（mysqldump → `backups/db/*.sql.gz` + MinIO 全量 → `backups/minio/<ts>/`，
+  各保留最近 14 份）。建议上线后每日 21:30（工作窗外）跑：launchd 或 crontab 均可。
+- **E2E 数据面隔离**：E2E 跑在测试库 `hr_workbuddy_test` + bucket `hr-workbuddy-e2e` + Redis `/1`；
+  指向生产库会直接拒跑（`E2E_ALLOW_PROD=1` 可强行绕过，勿在生产批次期间使用）。
 
 ## 附录：冒烟结果记录
 

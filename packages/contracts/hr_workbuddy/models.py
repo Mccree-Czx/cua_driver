@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 class AtomicTaskType(str, Enum):
-    """原子任务类型。M2 预留 list_recommended，本迭代不实现。"""
+    """原子任务类型（恰 7 值）。list_recommended = M2 推荐人列表读取（2026-10-06 实装）。"""
 
     CHECK_LOGIN = "check_login"
     LIST_UNREAD = "list_unread"
@@ -16,6 +16,7 @@ class AtomicTaskType(str, Enum):
     SEND_MESSAGE = "send_message"
     CHECK_ATTACHMENT = "check_attachment"
     DOWNLOAD_ATTACHMENT = "download_attachment"
+    LIST_RECOMMENDED = "list_recommended"
 
 
 class CandidateStatus(str, Enum):

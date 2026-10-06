@@ -28,6 +28,7 @@ from .rounds import (
     deferred_sweep,
     inbound_round,
     login_health_round,
+    outbound_round,
     parse_work_window,
     window_checker,
 )
@@ -44,6 +45,8 @@ def build_deps(settings: Settings) -> RoundDeps:
         gate=Gate(),
         within_window=window_checker(start, end),
         daily_msg_cap=settings.daily_msg_cap,
+        outbound_enabled=settings.outbound_enabled,
+        outbound_limit_per_round=settings.outbound_limit_per_round,
     )
 
 
@@ -56,6 +59,11 @@ def build_scheduler(settings: Settings) -> BlockingScheduler:
             "inbound_round",
             inbound_round,
             settings.inbound_interval_seconds,
+        ),
+        (
+            "outbound_round",
+            outbound_round,
+            settings.outbound_interval_seconds,
         ),
         (
             "awaiting_resume_sweep",

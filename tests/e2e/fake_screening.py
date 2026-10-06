@@ -7,6 +7,9 @@ controller 裁定：不真调 LLM、不做真实硬规则判定、不改 T5 生�
 - LP003 → 硬规则不通过（剧本 B：rejected_hard 零触达）
 - LP004 → 82 分（剧本 B：永不回复 → 72h 关闭）
 - LP005 → 64 分（剧本 C：直收入库——收到前零 scoring，仅收到后补评分）
+- LP101 → 82 分通过（剧本 D：推荐人两层判定通过 → 打招呼）
+- LP102 → 硬规则不通过（剧本 D：推荐人零触达）
+- LP103 → 55 分（剧本 D：推荐人 LLM 拒 → 零触达）
 
 2026-10-06 策略镜像：llm_scoring=False（inbound 直索要）→ 非硬拒一律返回
 「硬规则通过（未评分）」（与 screening 服务语义逐字一致）；收到简历后的
@@ -74,6 +77,26 @@ SCRIPTS: dict[str, ScreeningResult] = {
         score=64,
         judge_reason="LLM 评分 64（剧本 C：直收入库后补评分）",
         status=CandidateStatus.SCREENED_PASS,
+    ),
+    # 剧本 D：推荐人 outbound（两层判定 llm_scoring=True）
+    "LP101": _result(
+        hard_pass=True,
+        score=82,
+        judge_reason="LLM 评分 82 通过（剧本 D 推荐人）",
+        status=CandidateStatus.SCREENED_PASS,
+    ),
+    "LP102": _result(
+        hard_pass=False,
+        score=None,
+        judge_reason="硬规则不通过: 学历不满足岗位要求（剧本 D 推荐人）",
+        status=CandidateStatus.REJECTED_HARD,
+        hard_reasons=["学历不满足岗位要求"],
+    ),
+    "LP103": _result(
+        hard_pass=True,
+        score=55,
+        judge_reason="LLM 评分 55 未达阈值（剧本 D 推荐人）",
+        status=CandidateStatus.REJECTED_LLM,
     ),
 }
 

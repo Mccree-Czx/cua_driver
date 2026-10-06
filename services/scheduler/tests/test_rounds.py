@@ -19,6 +19,7 @@ from scheduler_app.rounds import (
     deferred_sweep,
     inbound_round,
     login_health_round,
+    outbound_round,
     within_work_window,
 )
 
@@ -82,7 +83,7 @@ class RecordingEnqueuer:
         return [t for t in self.tasks if t.type is task_type]
 
 
-def make_deps(pipeline=None, enqueuer=None, notifier=None, gate=None, in_flight=None, within_window=None, daily_msg_cap=240):
+def make_deps(pipeline=None, enqueuer=None, notifier=None, gate=None, in_flight=None, within_window=None, daily_msg_cap=240, outbound_enabled=True, outbound_limit_per_round=10):
     return RoundDeps(
         pipeline=pipeline or FakePipelineApi(),
         enqueue=enqueuer or RecordingEnqueuer(),
@@ -91,6 +92,8 @@ def make_deps(pipeline=None, enqueuer=None, notifier=None, gate=None, in_flight=
         in_flight=in_flight,
         within_window=within_window,
         daily_msg_cap=daily_msg_cap,
+        outbound_enabled=outbound_enabled,
+        outbound_limit_per_round=outbound_limit_per_round,
         now=lambda: NOW,
     )
 
@@ -150,6 +153,52 @@ def test_inbound_round_enqueues_list_unread_per_active_job():
     assert len(tasks) == 2
     assert {t.job_id for t in tasks} == {1, 3}
     assert all(t.job_candidate_id is None and t.candidate_liepin_id is None for t in tasks)
+
+
+# —— outbound_round（M2 路径二，2026-10-06）——
+
+
+def test_outbound_round_disabled_skips():
+    """默认关闭（outbound_enabled=False）：零派发、零 pipeline 调用（W7 校准前）。"""
+    pipeline = FakePipelineApi()
+    pipeline.jobs = [{"id": 1, "status": "active"}]
+    enqueuer = RecordingEnqueuer()
+    report = outbound_round(
+        make_deps(pipeline=pipeline, enqueuer=enqueuer, outbound_enabled=False)
+    )
+    assert report.skipped == "outbound_disabled"
+    assert report.dispatched == 0
+    assert enqueuer.tasks == []
+
+
+def test_outbound_round_enqueues_with_limit_per_active_job():
+    """对每个 active 岗位入队 LIST_RECOMMENDED；context.limit = 参数（爬坡节流）。"""
+    pipeline = FakePipelineApi()
+    pipeline.jobs = [
+        {"id": 1, "status": "active"},
+        {"id": 2, "status": "paused"},
+        {"id": 3, "status": "active"},
+    ]
+    enqueuer = RecordingEnqueuer()
+    report = outbound_round(
+        make_deps(pipeline=pipeline, enqueuer=enqueuer, outbound_limit_per_round=5)
+    )
+    assert report.dispatched == 2
+    tasks = enqueuer.of_type(AtomicTaskType.LIST_RECOMMENDED)
+    assert {t.job_id for t in tasks} == {1, 3}
+    assert all(t.context == {"limit": 5} for t in tasks)
+
+
+def test_outbound_round_quota_exhausted_skips():
+    """配额触顶：推荐人链最终产生触达 → 同停（零派发）。"""
+    pipeline = FakePipelineApi()
+    pipeline.jobs = [{"id": 1, "status": "active"}]
+    enqueuer = RecordingEnqueuer()
+    report = outbound_round(
+        make_deps(pipeline=pipeline, enqueuer=enqueuer, gate=Gate(quota_exhausted=True))
+    )
+    assert report.skipped == "quota_exhausted"
+    assert enqueuer.tasks == []
 
 
 # —— awaiting_resume_sweep ——

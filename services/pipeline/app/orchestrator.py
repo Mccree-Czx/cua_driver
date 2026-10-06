@@ -161,7 +161,11 @@ def _advance(jc: JobCandidate, event: StateEvent, ctx: TransitionContext | None 
 
 
 def _get_or_create_candidate(
-    session: Session, liepin_user_id: str, *, name: str | None = None
+    session: Session,
+    liepin_user_id: str,
+    *,
+    name: str | None = None,
+    source: str = "inbound",
 ) -> Candidate:
     candidate = session.execute(
         select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
@@ -171,7 +175,7 @@ def _get_or_create_candidate(
             liepin_user_id=liepin_user_id,
             name=name or liepin_user_id,
             online_resume_minimal={},
-            source="inbound",
+            source=source,
         )
         session.add(candidate)
         session.flush()
@@ -201,12 +205,16 @@ def _apply_screening_result(
     job: Job,
     candidate: Candidate,
     sres: ScreeningResult,
+    *,
+    session: Session | None = None,
 ) -> list[AtomicTask]:
     """spec §3 步骤 3-5 判定分支，返回待入队的后继任务（由 HTTP 层在 commit 后入队）：
 
     - degraded → 只存证据不推进：status 保持 new、judge_reason=deferred、不发消息
     - rejected_hard / rejected_llm → 对应状态 + judge_reason 落库，零触达
-    - screened_pass → new→screened_pass→resume_requested，渲染话术产出 SEND_MESSAGE
+    - screened_pass → 按 source 走各自路径边（inbound：直接请求；outbound：greet→greeted
+      →请求，greet_request 合并单条）→ 渲染话术产出 SEND_MESSAGE；
+      一人一消息全域化（2026-10-06 M2）：候选人任意岗位已触达 → 不派发消息
     """
     if sres.degraded:
         jc.judge_reason = sres.judge_reason or DEFERRED_REASON
@@ -220,8 +228,20 @@ def _apply_screening_result(
         jc.match_score = sres.score
     elif sres.status is CandidateStatus.SCREENED_PASS:
         _advance(jc, StateEvent.SCREEN_PASS)
-        _advance(jc, StateEvent.REQUEST_RESUME, TransitionContext(source="inbound"))
         jc.match_score = sres.score
+        if session is not None and _candidate_has_out_message(session, candidate.id):
+            # 一人一消息全域化（2026-10-06 M2）：跨岗位已触达 → 不推进、不发消息
+            jc.judge_reason = (
+                f"{sres.judge_reason}（一人一消息：候选人已触达，跳过打招呼）"
+            )
+            return []
+        if candidate.source == "inbound":
+            _advance(jc, StateEvent.REQUEST_RESUME, TransitionContext(source="inbound"))
+        else:
+            # outbound（推荐人）：打招呼（greet）→ greeted → 请求（greet_request 合并单条）；
+            # 状态机路径键取 source 值（OUTBOUND="recommended"）——显式传候选 人 source
+            _advance(jc, StateEvent.GREET, TransitionContext(source=candidate.source))
+            _advance(jc, StateEvent.REQUEST_RESUME, TransitionContext(source=candidate.source))
         jc.judge_reason = sres.judge_reason
         return next_tasks(jc, job=job, candidate=candidate)
     return []
@@ -279,7 +299,7 @@ def _handle_read_resume_result(
             llm_scoring=True,
         )
     )
-    return _apply_screening_result(jc, job, candidate, sres)
+    return _apply_screening_result(jc, job, candidate, sres, session=session)
 
 
 def _handle_send_message_result(
@@ -417,7 +437,7 @@ def _direct_intake_tasks(
                 llm_scoring=False,  # inbound：仅硬规则（评分后移至收到简历后）
             )
         )
-        return _apply_screening_result(jc, job, candidate, sres)
+        return _apply_screening_result(jc, job, candidate, sres, session=session)
     tasks: list[AtomicTask] = []
     if not _candidate_has_out_message(session, candidate.id):
         text = render_message(job, candidate, RESUME_ACK_VARIANT)
@@ -518,6 +538,61 @@ def _handle_list_unread_result(
     return pending
 
 
+def _handle_list_recommended_result(
+    session: Session,
+    dispatched: AtomicTask,
+    result: TaskResult,
+    *,
+    screening: Screener,
+    now: datetime,
+    login_state: LoginStateStore | None = None,
+) -> list[AtomicTask]:
+    """M2 路径二：推荐人列表读取结果 → 幂等建档（source=recommended）→ READ_RESUME。
+
+    去重三层：候选人级一人一消息预检（已触达 → 不读不触达）；jc 存在性幂等
+    （READ_RESUME 在途或已读 → 不重复入队）；context.limit 截断本轮新分发数
+    （爬坡节流点——仅新建数计入，已存在的 id 不占额度）。
+    """
+    if result.outcome != "success":
+        return []  # 失败由 worker 重试 ≤3；pipeline 不动状态
+    if dispatched.job_id is None:
+        raise InvalidEvidenceError("LIST_RECOMMENDED 任务缺 job_id")
+    recommended = result.evidence.get("recommended_ids")
+    if not isinstance(recommended, list) or not all(
+        isinstance(i, str) for i in recommended
+    ):
+        raise InvalidEvidenceError(
+            "LIST_RECOMMENDED 成功结果 evidence 需 recommended_ids: list[str]"
+        )
+    limit = dispatched.context.get("limit")
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise InvalidEvidenceError("LIST_RECOMMENDED context.limit 须为整数") from None
+    pending: list[AtomicTask] = []
+    for liepin_id in recommended:
+        if limit is not None and len(pending) >= limit:
+            break
+        candidate = _get_or_create_candidate(session, liepin_id, source="recommended")
+        if _candidate_has_out_message(session, candidate.id):
+            continue  # 一人一消息全域化：任意岗位已触达 → 跳过（不读不触达）
+        jc, created = _get_or_create_job_candidate(session, dispatched.job_id, candidate)
+        if not created:
+            continue  # 已有 jc：READ_RESUME 在途或已读 → 不重复入队
+        pending.append(
+            AtomicTask(
+                task_id=uuid4(),
+                type=AtomicTaskType.READ_RESUME,
+                job_id=dispatched.job_id,
+                job_candidate_id=jc.id,
+                candidate_liepin_id=liepin_id,
+                context={},
+            )
+        )
+    return pending
+
+
 def _handle_check_login_result(
     session: Session,
     dispatched: AtomicTask,
@@ -544,6 +619,7 @@ _RESULT_HANDLERS: dict[AtomicTaskType, Callable[..., list[AtomicTask]]] = {
     AtomicTaskType.SEND_MESSAGE: _handle_send_message_result,
     AtomicTaskType.CHECK_ATTACHMENT: _handle_check_attachment_result,
     AtomicTaskType.LIST_UNREAD: _handle_list_unread_result,
+    AtomicTaskType.LIST_RECOMMENDED: _handle_list_recommended_result,
     AtomicTaskType.CHECK_LOGIN: _handle_check_login_result,
 }
 

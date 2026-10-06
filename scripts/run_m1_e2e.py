@@ -1,10 +1,12 @@
 """M1 E2E 验收（mock 模式，一条命令）：scripts/run_m1_e2e.py
 
 用法：
-    uv run python scripts/run_m1_e2e.py        # 一条命令跑全部（剧本 A + 剧本 B）
+    uv run python scripts/run_m1_e2e.py        # 一条命令跑全部（剧本 A + B + C + D）
     uv run pytest tests/e2e -m e2e -v          # pytest 包装（同一套逻辑）
 
 装配方式（controller 裁定）：
+- 数据面隔离（2026-10-06 教训后改造）：专用测试库 hr_workbuddy_test + 独立 bucket
+  hr-workbuddy-e2e + 独立 Redis 库号 /1；指向生产库时拒跑（除非 E2E_ALLOW_PROD=1）
 - 数据底座复用 compose 栈（MySQL/MinIO/Redis；未起则 docker compose up -d --wait）
 - pipeline：真实 uvicorn 子进程（127.0.0.1:8000，启动即 alembic upgrade head）
 - screening：tests/e2e/fake_screening.py 假服务（127.0.0.1:8001，按
@@ -16,7 +18,8 @@
 - 72h 剧本：DB 时间回拨 job_candidate.resume_requested_at → 调 pipeline
   POST /internal/sweeps/stale-awaiting → 断言 no_response→closed 与边界两向
 - 状态清理：每剧本前 TRUNCATE pipeline 各表（FK_CHECKS=0，AUTO_INCREMENT 归 1）、
-  Redis FLUSHDB、删 MinIO snapshots/ 与 resumes/ 前缀对象——保证可重复运行
+  E2E 专用 Redis 库 FLUSHDB、删 E2E bucket 的 snapshots/ 与 resumes/ 前缀对象
+  ——生产数据面零接触；保证可重复运行
 - 子进程在 finally 里杀干净（Windows taskkill / POSIX 进程组信号）；World 剧本文件改动在 finally 复原
 
 断言直查 DB / MinIO / Redis（不经日志）。
@@ -59,6 +62,7 @@ WORLDS_DIR = REPO_ROOT / "infra" / "worlds"
 HAPPY_WORLD = WORLDS_DIR / "m1_happy_path.json"
 NO_REPLY_WORLD = WORLDS_DIR / "m1_no_reply.json"
 DIRECT_INTAKE_WORLD = WORLDS_DIR / "m1_direct_intake.json"
+M2_RECOMMENDED_WORLD = WORLDS_DIR / "m2_recommended.json"
 
 # 本机若存在代理环境变量（HTTP_PROXY/HTTPS_PROXY），httpx 默认会走代理，
 # 把 127.0.0.1 的内网回调拦成 404（实测：首请求 200、复用连接后续全 404）。
@@ -69,18 +73,25 @@ _loopback = "127.0.0.1,localhost,::1"
 os.environ["NO_PROXY"] = ",".join(p for p in (_no_proxy, _loopback) if p)
 os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
-# 连接配置（默认 = infra 契约；可 env 覆盖，与 infra/tests 同模式）
+# 连接配置（2026-10-06 隔离改造：E2E 专用库/bucket/Redis 库号，不再碰生产数据面）
 DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "mysql+pymysql://hr_user:hr_dev_pw@127.0.0.1:3306/hr_workbuddy",
+    "E2E_DATABASE_URL",
+    # 与单测共用测试库（均已授权、每轮自重置）；勿与单测并行跑
+    "mysql+pymysql://hr_user:hr_dev_pw@127.0.0.1:3306/hr_workbuddy_test",
 )
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+_DB_NAME = DATABASE_URL.rstrip("/").split("/")[-1].split("?")[0]
+if _DB_NAME == "hr_workbuddy" and os.environ.get("E2E_ALLOW_PROD") != "1":
+    raise SystemExit(
+        "拒绝运行：E2E 指向生产库 hr_workbuddy（E2E reset 会清数据）。"
+        "确需对生产库跑请显式 E2E_ALLOW_PROD=1（并先做 MySQL/MinIO 快照）。"
+    )
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/1")  # E2E 独立 Redis 库号
 PIPELINE_URL = os.environ.get("PIPELINE_URL", "http://127.0.0.1:8000")
 SCREENING_URL = os.environ.get("SCREENING_URL", "http://127.0.0.1:8001")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "127.0.0.1:9000")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-BUCKET = "hr-workbuddy"  # infra 契约（minio-init 创建）
+BUCKET = os.environ.get("E2E_MINIO_BUCKET", "hr-workbuddy-e2e")  # E2E 独立 bucket
 
 UV = shutil.which("uv") or "uv"
 
@@ -114,14 +125,14 @@ class ScenarioReport:
 
 @dataclass
 class E2EReport:
-    """三剧本总报告。passed = 剧本 A + 剧本 B + 剧本 C 全部跑完。"""
+    """四剧本总报告。passed = 剧本 A + 剧本 B + 剧本 C + 剧本 D 全部跑完。"""
 
     scenarios: list[ScenarioReport]
     log_dir: Path
 
     @property
     def passed(self) -> bool:
-        return len(self.scenarios) == 3
+        return len(self.scenarios) == 4
 
 
 def format_report(report: E2EReport) -> str:
@@ -263,12 +274,57 @@ def _env() -> dict[str, str]:
     return env
 
 
+def ensure_test_database() -> None:
+    """确保 E2E 专用库存在（幂等）：已存在则跳过（无需 CREATE 权限）；
+
+    缺失时尝试创建，失败则提示手工赋权（CREATE DATABASE `{db}` + GRANT）。"""
+    from urllib.parse import urlparse
+
+    import pymysql
+
+    parsed = urlparse(DATABASE_URL)
+    db_name = parsed.path.lstrip("/")
+    if not db_name:
+        raise SystemExit(f"无法从 DATABASE_URL 解析库名：{DATABASE_URL}")
+    conn = pymysql.connect(
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 3306,
+        user=parsed.username or "root",
+        password=parsed.password or "",
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SHOW DATABASES LIKE %s", (db_name,))
+            if cursor.fetchone() is None:
+                try:
+                    cursor.execute(
+                        f"CREATE DATABASE `{db_name}` CHARACTER SET utf8mb4"
+                    )
+                except pymysql.err.OperationalError as exc:
+                    raise SystemExit(
+                        f"E2E 库 {db_name} 不存在且无权限创建（{exc}）；"
+                        f"请以 root 执行：CREATE DATABASE `{db_name}`；"
+                        f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO 'hr_user'@'%';"
+                    ) from exc
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ensure_test_bucket() -> None:
+    """建 E2E 专用 bucket（幂等）。"""
+    client = _minio()
+    if not client.bucket_exists(BUCKET):
+        client.make_bucket(BUCKET)
+
+
 def start_pipeline(log_dir: Path) -> Proc:
     env = _env()
     env.update(
         {
-            "DATABASE_URL": DATABASE_URL,  # E2E 用生产库 hr_workbuddy（显式，防外部泄漏）
+            "DATABASE_URL": DATABASE_URL,  # E2E 专用库 hr_workbuddy_e2e（生产隔离，2026-10-06）
             "REDIS_URL": REDIS_URL,
+            "MINIO_BUCKET": BUCKET,  # E2E 专用 bucket（生产隔离）
             "SCREENING_URL": SCREENING_URL,  # 指向假 screening（不触真实 LLM）
         }
     )
@@ -365,6 +421,7 @@ from scheduler_app.rounds import (  # noqa: E402
     build_enqueuer,
     build_in_flight,
     inbound_round,
+    outbound_round,
 )
 
 
@@ -383,6 +440,8 @@ def _deps() -> RoundDeps:
         gate=Gate(),
         within_window=lambda now: True,
         daily_msg_cap=240,
+        outbound_enabled=True,
+        outbound_limit_per_round=10,
         now=datetime.now,
     )
 
@@ -786,18 +845,104 @@ def scenario_c(log_dir: Path) -> ScenarioReport:
         _write_world(DIRECT_INTAKE_WORLD, world_c)  # 剧本复原（tick 归 0）
 
 
+# —— 剧本 D：推荐人 outbound（LIST_RECOMMENDED → 两层判定 → 打招呼索要）——
+
+
+def scenario_d(log_dir: Path) -> ScenarioReport:
+    """LP101（推荐人，两层通过 82）→ 打招呼 greet_request（含岗位名）→ awaited；
+
+    tick1 回传附件 → 复巡下载入库（前置评分 82 保留，无收到后补评）；
+    LP102（硬拒）/ LP103（LLM 拒 55）零触达。同时验证 outbound_round（M2 轮次）。
+    """
+    checks: list[str] = []
+    reset_state()
+    assert seed_job() == 1
+    world_d = _read_world(M2_RECOMMENDED_WORLD)
+    _write_world(M2_RECOMMENDED_WORLD, {**world_d, "tick": 0})  # 剧本原状复位（可重跑）
+    worker = start_worker(M2_RECOMMENDED_WORLD, log_dir)
+    try:
+        report = outbound_round(_deps())
+        assert report.dispatched == 1, f"outbound_round 应派发 1 个岗位：{report}"
+        checks.append("outbound_round 入队 LIST_RECOMMENDED × 1（M2 轮次）")
+        poll_until(
+            lambda: _jc("LP101").get("status") == "awaiting_resume"
+            and _jc("LP102").get("status") == "rejected_hard"
+            and _jc("LP103").get("status") == "rejected_llm",
+            timeout=180,
+            what="剧本 D 三推荐人判定完成（LP101 打招呼待回复 / LP102 硬拒 / LP103 LLM 拒）",
+        )
+        jc1 = _jc("LP101")
+        assert jc1["match_score"] == 82, "outbound 前置评分保留（两层判定）"
+        rows1 = _interactions(jc1["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows1] == [
+            ("out", "greet_request")
+        ], f"LP101 interactions 偏差：{rows1}"
+        assert (
+            rows1[0]["content"]
+            == f"您好 周九，看到您在看{JOB_TITLE}岗位，方便发一份简历吗？"
+        )
+        checks.append("LP101 打招呼（greet_request，含岗位名）→ awaiting_resume；前置评分 82")
+        for lid, st in (("LP102", "rejected_hard"), ("LP103", "rejected_llm")):
+            jcx = _jc(lid)
+            assert jcx["status"] == st, f"{lid} 应为 {st}，实际 {jcx['status']}"
+            assert _interactions(jcx["id"]) == [], f"{lid} 零触达"
+        checks.append("LP102 硬拒 / LP103 LLM 拒 → 零触达")
+        # 附件链：首巡（tick 0）无附件 → tick1 送达 → 复巡（清在途键）下载入库
+        baseline = _task_log_count()
+        sweep = awaiting_resume_sweep(_deps())
+        assert sweep.dispatched == 1, f"LP101 awaiting 首巡：{sweep}"
+        poll_until(
+            lambda: _task_log_count() > baseline,
+            timeout=60,
+            what="LP101 首巡 CHECK（无附件）结果落 TaskLog",
+        )
+        _write_world(M2_RECOMMENDED_WORLD, {**world_d, "tick": 1})  # 附件送达
+        client = _redis()
+        client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc1["id"]))
+        client.close()
+        sweep = awaiting_resume_sweep(_deps())
+        assert sweep.dispatched == 1
+        poll_until(
+            lambda: _jc("LP101").get("status") == "resume_received",
+            timeout=180,
+            what="LP101 到达 resume_received（打招呼回传附件下载归档）",
+        )
+        jc1 = _jc("LP101")
+        rows1 = _interactions(jc1["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows1] == [
+            ("out", "greet_request"),
+            ("in", "attachment"),
+        ], f"LP101 interactions 偏差：{rows1}"
+        pdf = jc1["minio_object_key"]
+        assert pdf and re.fullmatch(
+            rf"resumes/1/LP101/周九_{JOB_TITLE}_\d{{8}}\.pdf", pdf
+        ), f"PDF 键不匹配：{pdf}"
+        assert _minio().stat_object(BUCKET, pdf), f"PDF 对象不存在：{pdf}"
+        assert jc1["match_score"] == 82, "outbound 前置评分不回退（无收到后补评）"
+        checks.append(f"LP101 回传入库：PDF={pdf}（前置评分 82 保留）")
+        return ScenarioReport(
+            name="剧本 D：推荐人 outbound（两层判定 → 打招呼 → 回传入库）", checks=checks
+        )
+    finally:
+        stop_proc(worker)
+        _write_world(M2_RECOMMENDED_WORLD, world_d)  # 剧本复原（tick 归 0）
+
+
 # —— 总装：一条命令跑全部 ——
 
 
 def run_e2e() -> E2EReport:
-    """一条命令跑全部：compose 复用 → 起 pipeline / 假 screening 子进程 →
-    剧本 A → 剧本 B → 剧本 C → finally 杀干净全部子进程。失败即抛（断言原样上抛）。"""
+    """一条命令跑全部：compose 复用 → 建 E2E 专用库/bucket（生产隔离）→ 起 pipeline / 假
+    screening 子进程 → 剧本 A → 剧本 B → 剧本 C → 剧本 D → finally 杀干净全部子进程。
+    失败即抛（断言原样上抛）。"""
     global _LOG_DIR, _PROCS
     _LOG_DIR = Path(tempfile.mkdtemp(prefix="m1_e2e_"))
     _PROCS = []
     scenarios: list[ScenarioReport] = []
     try:
         ensure_compose()
+        ensure_test_database()  # E2E 专用库（生产隔离）
+        ensure_test_bucket()  # E2E 专用 bucket（生产隔离）
         for port in (_port_of(PIPELINE_URL), _port_of(SCREENING_URL)):
             ensure_port_free(port)
         # 子进程逐个登记：任一 start 失败，已起的也走 finally 杀干净
@@ -808,6 +953,7 @@ def run_e2e() -> E2EReport:
         scenarios.append(scenario_a(_LOG_DIR))
         scenarios.append(scenario_b(_LOG_DIR))
         scenarios.append(scenario_c(_LOG_DIR))
+        scenarios.append(scenario_d(_LOG_DIR))
     finally:
         for proc in reversed(_PROCS):
             stop_proc(proc)

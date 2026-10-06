@@ -1,7 +1,7 @@
 """契约块逐名覆盖（spec v1.6 §任务契约）。
 
 - AtomicTask JSON 往返（model_dump_json → model_validate_json 全等）
-- AtomicTaskType 恰 6 值（M2 的 list_recommended 不得提前出现）
+- AtomicTaskType 恰 7 值（含 M2 list_recommended，2026-10-06 实装）
 - TaskResult JSON 往返 + outcome 域（3 值，其他拒绝）
 - CandidateStatus 恰 11 态（成员集合逐字一致）
 - MinimalResume 恰 7 字段（缺任一字段报 ValidationError）
@@ -98,6 +98,7 @@ def test_atomic_task_type_values_verbatim():
         "send_message",
         "check_attachment",
         "download_attachment",
+        "list_recommended",
     }
 
 
@@ -227,6 +228,9 @@ class _StubLiepinDriver:
         return True
 
     def list_unread_conversations(self) -> list[str]:
+        return []
+
+    def list_recommended(self) -> list[str]:
         return []
 
     def open_conversation(self, candidate_liepin_id: str) -> None:

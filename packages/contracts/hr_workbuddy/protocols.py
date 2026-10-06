@@ -17,6 +17,9 @@ class LiepinDriver(Protocol):
 
     def list_unread_conversations(self) -> list[str]: ...
 
+    def list_recommended(self) -> list[str]:
+        """推荐人列表页可见的 liepin_user_id 列表（M2 路径二；翻页不在 v1）。"""
+
     def open_conversation(self, candidate_liepin_id: str) -> None: ...
 
     def read_online_resume(

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     login_health_interval_seconds: int = 3600
     reconcile_interval_seconds: int = 3600
     deferred_interval_seconds: int = 1800
+    # M2 路径二（推荐人 outbound）：默认关闭——W7 真实页面校准完成后再开；
+    # 爬坡表（观察期 2/2h → 第1周 5/2h → 第2周 10/1.5h → 常态 12/1h）见
+    # docs/superpowers/plans/2026-10-06-liepin-m2.md §5
+    outbound_enabled: bool = False
+    outbound_interval_seconds: int = 3600
+    outbound_limit_per_round: int = 10
 
 
 @lru_cache

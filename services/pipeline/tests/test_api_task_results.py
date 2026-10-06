@@ -1253,3 +1253,128 @@ def test_direct_intake_artifact_from_new_reaches_resume_received(
         store.client.remove_object(BUCKET, jc2.minio_object_key)
     finally:
         pass
+
+
+# —— 2026-10-06 M2：推荐人路径（LIST_RECOMMENDED 建档 / 去重 / 一人一消息全域化）——
+
+
+def _post_list_recommended_result(client, task: AtomicTask, recommended_ids: list[str]):
+    return client.post(
+        f"/internal/tasks/{task.task_id}/result",
+        json={
+            "task_id": str(task.task_id),
+            "outcome": "success",
+            "evidence": {
+                "recommended_ids": recommended_ids,
+                "attempt": 0,
+                "duration_s": 0.5,
+            },
+            "error": None,
+        },
+    )
+
+
+def _make_list_recommended_task(job_id: int, *, limit: int | None = None) -> AtomicTask:
+    return AtomicTask(
+        task_id=uuid4(),
+        type=AtomicTaskType.LIST_RECOMMENDED,
+        job_id=job_id,
+        job_candidate_id=None,
+        candidate_liepin_id=None,
+        context={} if limit is None else {"limit": limit},
+    )
+
+
+def test_list_recommended_creates_and_dispatches_reads(client, fake_queue, session):
+    """推荐人列表 → 幂等建档（source=recommended）+ jc(new) → READ_RESUME ×N。"""
+    job_id, _ = _create_job(client)
+    lid_a, lid_b = f"LP{uuid4().hex[:12]}", f"LP{uuid4().hex[:12]}"
+    task = _make_list_recommended_task(job_id)
+    fake_queue.record(task)
+
+    resp = _post_list_recommended_result(client, task, [lid_a, lid_b])
+    assert resp.status_code == 200, resp.text
+    _reload(session)
+    candidates = (
+        session.execute(
+            select(models.Candidate).where(
+                models.Candidate.liepin_user_id.in_([lid_a, lid_b])
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {c.source for c in candidates} == {"recommended"}
+    reads = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.READ_RESUME]
+    assert {t.candidate_liepin_id for t in reads} == {lid_a, lid_b}
+    assert all(t.job_id == job_id for t in reads)
+
+
+def test_list_recommended_skip_touched_dedup_and_limit(client, fake_queue, session):
+    """三层去重：已触达（跨岗位）不读；已有 jc 不重复；limit 只计新建数。"""
+    job_id, _ = _create_job(client)
+    job2_id, _ = _create_job(client)
+    existing, touched, fresh_a, fresh_b = (f"LP{uuid4().hex[:12]}" for _ in range(4))
+    # 已有 jc（本岗位已建档）
+    c1 = models.Candidate(liepin_user_id=existing, name="陈一", source="recommended")
+    session.add(c1)
+    session.flush()
+    session.add(models.JobCandidate(job_id=job_id, candidate_id=c1.id))
+    # 其他岗位已触达（一人一消息全域化 → 不读不触达）
+    c2 = models.Candidate(liepin_user_id=touched, name="杜二", source="recommended")
+    session.add(c2)
+    session.flush()
+    jc2 = models.JobCandidate(job_id=job2_id, candidate_id=c2.id)
+    session.add(jc2)
+    session.flush()
+    session.add(
+        models.Interaction(
+            job_candidate_id=jc2.id,
+            direction="out",
+            msg_type="greet_request",
+            content="历史打招呼（另一岗位）",
+            sent_at=datetime.now(),
+        )
+    )
+    session.commit()
+
+    task = _make_list_recommended_task(job_id, limit=1)
+    fake_queue.record(task)
+    resp = _post_list_recommended_result(client, task, [existing, touched, fresh_a, fresh_b])
+    assert resp.status_code == 200, resp.text
+    reads = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.READ_RESUME]
+    assert [t.candidate_liepin_id for t in reads] == [fresh_a]  # limit=1：仅首个新建
+
+
+def test_outbound_skip_when_candidate_already_touched(
+    client, fake_queue, fake_screening, session
+):
+    """screened_pass 前一人一消息预检：已触达 → 不推进到打招呼、零派发。"""
+    job_id, _ = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    candidate = models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended")
+    session.add(candidate)
+    session.flush()
+    jc = models.JobCandidate(job_id=job_id, candidate_id=candidate.id)
+    session.add(jc)
+    session.flush()
+    session.add(
+        models.Interaction(
+            job_candidate_id=jc.id,
+            direction="out",
+            msg_type="greet_request",
+            content="别处已触达",
+            sent_at=datetime.now(),
+        )
+    )
+    session.commit()
+    fake_screening.set(liepin, _pass_result(82))
+
+    read_task = _make_read_task(job_id, liepin)
+    fake_queue.record(read_task)
+    assert _post_read_result(client, read_task, liepin).status_code == 200
+    _reload(session)
+    jc2 = session.get(models.JobCandidate, jc.id)
+    assert jc2.status == CandidateStatus.SCREENED_PASS.value  # 已判定但不推进
+    assert "一人一消息" in (jc2.judge_reason or "")
+    assert fake_queue.enqueued == []  # 零派发（不打招呼）

@@ -24,3 +24,7 @@ node_modules/
 
 # 本地开发记忆目录（不入公开仓库）
 .workbuddy/
+
+# 上线硬化：本地备份与运行日志
+backups/
+.run/

@@ -82,6 +82,10 @@ class RoundDeps:
     in_flight: Callable[[AtomicTaskType, int], bool] | None = None
     within_window: Callable[[datetime], bool] | None = None
     daily_msg_cap: int = DEFAULT_DAILY_MSG_CAP
+    # M2 outbound（爬坡节流）：enabled 默认在 settings 侧为 False（W7 校准前不派发）；
+    # limit = 每轮 LIST_RECOMMENDED 新分发上限（仅新建候选人计数，见 orchestrator）
+    outbound_enabled: bool = True
+    outbound_limit_per_round: int = 10
     # 注意：default_factory 会被调用一次产出默认值——须返回"可调用对象"本身，
     # 不能写 default_factory=datetime.now（那会产出 datetime 实例，轮次调用 deps.now() 时 TypeError）
     now: Callable[[], datetime] = field(default_factory=lambda: datetime.now)
@@ -145,6 +149,35 @@ def inbound_round(deps: RoundDeps) -> RoundReport:
             )
         )
     return RoundReport(name="inbound_round", dispatched=len(jobs))
+
+
+def outbound_round(deps: RoundDeps) -> RoundReport:
+    """M2 路径二：对每个 active 岗位入队 LIST_RECOMMENDED（context.limit = 每轮上限）。
+
+    未启用（W7 真实页面校准前）→ 跳过；窗口外/登录暂停 → 跳过；配额触顶 →
+    跳过（触达类派发全停——推荐人链最终产生触达）；pipeline 侧对新建数截断
+    （已建档 id 不占额度，见 orchestrator._handle_list_recommended_result）。
+    """
+    if not deps.outbound_enabled:
+        return RoundReport(name="outbound_round", skipped="outbound_disabled")
+    report = _dispatch_gate(deps, "outbound_round")
+    if report is not None:
+        return report
+    if deps.gate.quota_exhausted:
+        return RoundReport(name="outbound_round", skipped="quota_exhausted")
+    jobs = [j for j in deps.pipeline.list_jobs() if j.get("status") == "active"]
+    for job in jobs:
+        deps.enqueue(
+            AtomicTask(
+                task_id=uuid4(),
+                type=AtomicTaskType.LIST_RECOMMENDED,
+                job_id=job["id"],
+                job_candidate_id=None,
+                candidate_liepin_id=None,
+                context={"limit": deps.outbound_limit_per_round},
+            )
+        )
+    return RoundReport(name="outbound_round", dispatched=len(jobs))
 
 
 def awaiting_resume_sweep(deps: RoundDeps) -> RoundReport:

@@ -166,6 +166,14 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
         evidence=lambda d, r: {"unread_ids": r},
         artifact=_none_artifact,
     ),
+    AtomicTaskType.LIST_RECOMMENDED: ActionSpec(
+        # M2 路径二：推荐人列表读取（mock 剧本 recommended 标记；real 待 W7 校准）
+        perform=lambda d, t: d.list_recommended(),
+        screenshot=_page_capture,
+        criteria=lambda r: "推荐人列表已打开，可见候选人推荐列表",
+        evidence=lambda d, r: {"recommended_ids": r},
+        artifact=_none_artifact,
+    ),
     AtomicTaskType.READ_RESUME: ActionSpec(
         perform=lambda d, t: d.read_online_resume(_candidate_id(t)),
         screenshot=_resume_png,
@@ -203,10 +211,11 @@ _FALLBACK_TASK_TYPES = frozenset(
     {
         AtomicTaskType.CHECK_LOGIN,
         AtomicTaskType.LIST_UNREAD,
+        AtomicTaskType.LIST_RECOMMENDED,  # M2 推荐人读取（读链兜底同享）
         AtomicTaskType.READ_RESUME,
         AtomicTaskType.CHECK_ATTACHMENT,
     }
-)  # 读取链白名单：仅此四类可走 LLM 兜底（发送/下载类不兜底）
+)  # 读取链白名单：仅此五类可走 LLM 兜底（发送/下载类不兜底）
 
 
 def _recover_or_raise(
