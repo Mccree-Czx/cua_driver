@@ -209,6 +209,7 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | scheduler 日志 `[login] 请扫码登录…` 且派发暂停 | 登录态失效：桌面应用扫码重新登录，下一轮自动解除；状态键 `pipeline:state:login` |
 | screening 返回 `judge_reason="deferred: LLM unavailable"`（降级） | 检查 .env `SCREENING_LLM_*`（key/模型名）；候选人不推进，deferred_sweep 30min 自动重判 |
 | worker 日志大脑不可用 → 任务 deferred 重判（60s） | 检查 .env `CUA_BRAIN_*`；模型必须是 `deepseek-flash`（`deepseek-v4-pro` 不支持 image 输入）。**另一已知原因（已修）**：T12 前 `response_format` 用 json_schema，DeepSeek 现拒（400 `This response_format type is unavailable now`）——已改 `json_object` + 解析容忍代码围栏 |
+| 页面出现「账号行为异常」+ 图形验证码（安全验证页） | **立即停止全部自动化**（停 worker + 排空 arq 队列，防继续操作被控账号）；人工在桌面完成安全验证（绝不自动绕过）。2026-10-06 实测触发背景：连续高频真实校准（多任务连跑 + 失败任务快速重试 + 反复切页/重载，1 小时内数百次操作）。恢复前需降批量、降频、加重试冷却 |
 | real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）已完成 7 个页面方法校准（check_login / list_unread / open_conversation / read_online_resume / send_message / check_attachment / download_attachment）；若再现说明代码回退 |
 | 回调 `404 {"detail":"Not Found"}`；E2E 卡在 read_resume「max retries 4 exceeded」 | **本机代理环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向本地代理时，httpx（默认 `trust_env=True`）会把 `127.0.0.1` 的内网回调也发给代理，被拦成 404（实测特征：同一连接首请求 200、其后全 404；`http.client` 与新建连接均正常）。服务侧已用 `trust_env=False` 绕过硬编码内网调用；自建脚本请设 `NO_PROXY=127.0.0.1,localhost,::1`（或 `set HTTP_PROXY=` 清空）。排查命令：`echo $env:HTTP_PROXY` |
 
@@ -239,3 +240,4 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | 2026-10-06 | Qoder(T12) | ④ 发消息 | `--step send --candidate-liepin-id e37fdde092f5Yc6f103cf422b --yes --text "您好 梁女士，⋯发一份简历吗？"` | **通过**：消息上屏（16:02，截图目视确认）；输入读回校验+发送后上屏校验全过 | 唯一真实触达；梁女士的一人一消息额度已消耗，不可对其重发 |
 | 2026-10-06 | Qoder(T12) | ⑤ 账目核对 | `--step verify` | **通过（配置面）**：real / 20条·小时 / `CUA_E2E_INSTANT` 未设 / 延时区间正确 / 工作窗口 08:00–20:00 | 本小时无 `msg-touch:*` 键（直连脚本不经 worker 延时/桶）；worker 级延时·桶·TaskLog 待全栈真实链路验证 |
 | 2026-10-06 | Qoder(T12) | 联调切片（附加） | 手工入队 CHECK_LOGIN（模拟 scheduler）→ pipeline + real worker | **通过（全链）**：worker `outcome=success`（19.7s=延时~12s+执行）；`/internal/state/login` → `is_login=true`；`task_logs` 落账 tokens=1176 / duration=7.78s | 期间发现并修复：DeepSeek 拒 json_schema（400）→ 大脑改 `json_object`（单测 57 绿）；附件链同步实测：check_attachment=True、download_attachment 得 322,966B PDF |
+| 2026-10-06 | Qoder(T12) | inbound 全链（附加） | 手工入队 LIST_UNREAD → 真实 worker 链（screening 用拒绝桩保零触达） | **部分完成后遇风控停机**：LIST_UNREAD 成功（建档 8 位真实候选人）；2 个 READ_RESUME 成功（其余遇风控）；**触发猎聘风控（账号行为异常验证码）→ 立即停机** | 零触达保持（interactions 未增）；处置与恢复建议见 `.scratch/liepin_calib/risk_control_incident.md`；恢复前需人工完成安全验证 + 控制操作密度 |

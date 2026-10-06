@@ -158,7 +158,9 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
     AtomicTaskType.READ_RESUME: ActionSpec(
         perform=lambda d, t: d.read_online_resume(_candidate_id(t)),
         screenshot=_resume_png,
-        criteria=lambda r: "会话页已打开，在线简历内容已完整显示",
+        # T12 校准：（2026-10-06 真实页面）读简历收尾在批量预览简历页（候选人
+        # 完整简历展示），非 T8 骨架设想的会话页——判据按实测页面语义描述。
+        criteria=lambda r: "批量预览简历页已打开，候选人在线简历内容已完整显示",
         evidence=_resume_evidence,
         artifact=_resume_artifact,
     ),

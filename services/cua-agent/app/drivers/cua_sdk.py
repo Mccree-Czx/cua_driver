@@ -589,6 +589,19 @@ class CuaLiepinDriver:
             self._press(pid, wid, btn)
         time.sleep(1.0)
 
+    def _back_to_chat_page(self, pid: int, wid: int) -> None:
+        """切回「在线沟通」标签页（消息列表页）——list_unread 收尾语义：
+        worker 后置校验判据=「消息列表页已打开，可见未读会话列表」（实测）。"""
+        state = self._live_state(pid, wid)
+        tab = self._find(state, role="AXRadioButton", label="在线沟通")
+        if tab is None:
+            raise RuntimeError("未找到「在线沟通」标签页（无法回到消息列表页）")
+        self._press(pid, wid, tab)
+        time.sleep(self.SETTLE_SECONDS)
+        state = self._live_state(pid, wid)
+        if self.CHAT_PATH not in self._current_url(state):
+            raise RuntimeError(f"切换后未回到消息列表页（URL={self._current_url(state)[:120]}）")
+
     def _attachment_filename(self, state: Any) -> str | None:
         """详情附件文件名（取带附件扩展名的最靠后静态文本=详情区条目）。"""
         name = None
@@ -605,15 +618,23 @@ class CuaLiepinDriver:
         return self._find(state, role="AXButton", label="下载")
 
     def _reach_batch_page(self, pid: int, wid: int) -> Any:
-        """确保位于批量预览简历页：不在则经「沟通」导航 →「浏览简历」进入。
+        """确保位于批量预览简历页：已有批量标签页优先切回；否则经聊天页→「浏览简历」。
 
-        聊天页默认选中首个列表项（收简历通知），右栏带「浏览简历」按钮（实测）。
-        任一锚点缺失即抛错（失败即停）。
+        实测：批量页以新标签页打开（标签名「批量预览简历」）——逐任务复用标签页
+        切换（快）优于重复点击「浏览简历」（会新开页）。任一锚点缺失即抛错（失败即停）。
         """
         state = self._live_state(pid, wid)
         url = self._current_url(state)
         if self.BATCH_PATH in url:
             return state
+        batch_tab = self._find(state, role="AXRadioButton", label="批量预览简历")
+        if batch_tab is not None:
+            self._press(pid, wid, batch_tab)
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
+            if self.BATCH_PATH in self._current_url(state):
+                return state
+            url = self._current_url(state)
         if self.CHAT_PATH not in url:
             nav = self._find(state, role="AXLink", label_contains="沟通")
             if nav is None:
@@ -668,7 +689,8 @@ class CuaLiepinDriver:
 
         M1 语义映射（披露）：真实批量页对应聊天页「收到简历」未读通知批次——当前
         返回批次内全部候选人 ID，去重交由 pipeline（jc 存在性幂等）；未读精细筛选
-        待 M2。任一环节失败抛错（失败即停，不猜）。
+        待 M2。收集完成后切回「在线沟通」消息列表页（worker 后置校验判据语义）；
+        任一环节失败抛错（失败即停，不猜）。
         """
         pid, wid = self._ensure_visible_and_resolved()
         state = self._reach_batch_page(pid, wid)
@@ -683,6 +705,7 @@ class CuaLiepinDriver:
                 ids.append(lid)
         if not ids:
             raise RuntimeError("批量页未读到任何简历编号（页面结构变化？）")
+        self._back_to_chat_page(pid, wid)
         return ids
 
     def open_conversation(self, candidate_liepin_id: str) -> None:
