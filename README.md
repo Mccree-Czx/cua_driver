@@ -30,3 +30,4 @@ uv run pytest infra/tests -m infra    # 冒烟验证 MySQL / MinIO / Redis
 - 前端（M3）：Next.js + TypeScript
 - 数据底座：Docker Desktop（WSL2 后端）跑 MySQL 8.4 + MinIO + Redis 7
 - 包管理：uv workspace + pnpm（apps/*）
+# cua_driver
