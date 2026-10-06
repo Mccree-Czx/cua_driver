@@ -28,3 +28,4 @@ node_modules/
 # 上线硬化：本地备份与运行日志
 backups/
 .run/
+exports/

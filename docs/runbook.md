@@ -251,6 +251,8 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
   各保留最近 14 份）。建议上线后每日 21:30（工作窗外）跑：launchd 或 crontab 均可。
 - **E2E 数据面隔离**：E2E 跑在测试库 `hr_workbuddy_test` + bucket `hr-workbuddy-e2e` + Redis `/1`；
   指向生产库会直接拒跑（`E2E_ALLOW_PROD=1` 可强行绕过，勿在生产批次期间使用）。
+- **HR 查看通道（M3 前凑合）**：`scripts/hr_report.py`——候选人清单（默认）/ `--stats` 每日漏斗与
+  索要→回传转化率 / `--fetch all|<jc>` 拉取快照+PDF 到 `exports/`（只读脚本）。
 
 ## 附录：冒烟结果记录
 
