@@ -58,6 +58,15 @@ WORLDS_DIR = REPO_ROOT / "infra" / "worlds"
 HAPPY_WORLD = WORLDS_DIR / "m1_happy_path.json"
 NO_REPLY_WORLD = WORLDS_DIR / "m1_no_reply.json"
 
+# 本机若存在代理环境变量（HTTP_PROXY/HTTPS_PROXY），httpx 默认会走代理，
+# 把 127.0.0.1 的内网回调拦成 404（实测：首请求 200、复用连接后续全 404）。
+# 兜底把 loopback 加入 NO_PROXY —— 同时被子进程（pipeline/worker/screening）
+# 继承；服务侧另有 trust_env=False 的代码级防护。
+_no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+_loopback = "127.0.0.1,localhost,::1"
+os.environ["NO_PROXY"] = ",".join(p for p in (_no_proxy, _loopback) if p)
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
 # 连接配置（默认 = infra 契约；可 env 覆盖，与 infra/tests 同模式）
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",

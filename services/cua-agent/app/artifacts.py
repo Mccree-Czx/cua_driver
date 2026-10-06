@@ -52,7 +52,13 @@ class PipelineClient:
             else:
                 import httpx  # 延迟导入：注入替身的测试不触发
 
-                self._client_instance = httpx.Client(timeout=RESULT_TIMEOUT_SECONDS)
+                # trust_env=False：内网回拨（worker → pipeline）必须绕过
+                # HTTP(S)_PROXY。本机若存在代理环境变量（如 HTTP_PROXY=
+                # http://127.0.0.1:xxxx），httpx 默认会走代理，导致回调被
+                # 代理拦成 404（E2E 实测：首请求 200、复用连接后续全 404）。
+                self._client_instance = httpx.Client(
+                    timeout=RESULT_TIMEOUT_SECONDS, trust_env=False
+                )
         return self._client_instance
 
     def post_result(self, task_id: UUID, result: TaskResult) -> None:

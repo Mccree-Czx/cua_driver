@@ -16,10 +16,14 @@ class ScreeningClient:
         self.timeout = timeout
 
     def screen(self, request: ScreenRequest) -> ScreeningResult:
+        # trust_env=False：pipeline → screening 是内网调用，必须绕过
+        # HTTP(S)_PROXY 环境变量（代理会把内网路径拦成 404，见 cua-agent
+        # artifacts.py 同类修复的实测记录）。
         response = httpx.post(
             f"{self.base_url}/screen",
             json=request.model_dump(mode="json"),
             timeout=self.timeout,
+            trust_env=False,
         )
         response.raise_for_status()
         return ScreeningResult.model_validate(response.json())
