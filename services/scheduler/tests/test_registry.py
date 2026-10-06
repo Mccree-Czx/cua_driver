@@ -4,6 +4,7 @@ TTL 72h；在途索引（(type, jc_id) → SET）TTL 1h、in_flight 查询语义
 """
 
 import os
+import random
 from uuid import uuid4
 
 import pytest
@@ -22,6 +23,11 @@ from hr_workbuddy.task_registry import (
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+# 在途索引键含 jc_id（固定值）——用随机大数隔离：2026-10-06 实测踩中，固定 id 11
+# 与开发库真实运行的残留索引（TTL 1h）撞车导致测试误报；uuid 后缀约定不适用于
+# (type, jc_id) 键，随机大数等价隔离且自愈。
+JC_ID = random.randint(10**9, 10**10)
+
 
 @pytest.fixture()
 def redis_client():
@@ -35,7 +41,7 @@ def _task(**overrides) -> AtomicTask:
         task_id=uuid4(),
         type=AtomicTaskType.CHECK_ATTACHMENT,
         job_id=1,
-        job_candidate_id=11,
+        job_candidate_id=JC_ID,
         candidate_liepin_id="LP-A",
         context={},
     )
@@ -74,10 +80,10 @@ def test_in_flight_index_and_semantics(redis_client):
     task = _task()
     try:
         write_task(redis_client, task)
-        assert in_flight(redis_client, task.type, 11) is True
-        assert in_flight(redis_client, task.type, 12) is False  # 其他 jc
-        assert in_flight(redis_client, AtomicTaskType.READ_RESUME, 11) is False  # 其他类型
-        ttl = redis_client.pttl(in_flight_key(task.type, 11))
+        assert in_flight(redis_client, task.type, JC_ID) is True
+        assert in_flight(redis_client, task.type, JC_ID + 1) is False  # 其他 jc
+        assert in_flight(redis_client, AtomicTaskType.READ_RESUME, JC_ID) is False  # 其他类型
+        ttl = redis_client.pttl(in_flight_key(task.type, JC_ID))
         assert 0 < ttl <= IN_FLIGHT_TTL_SECONDS * 1000
     finally:
         _cleanup(redis_client, task)
