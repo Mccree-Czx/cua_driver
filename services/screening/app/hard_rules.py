@@ -19,6 +19,25 @@ from hr_workbuddy import MinimalResume
 # 学历级别（低 → 高）；不在表内的学历视为低于一切（保守判不通过）
 EDUCATION_LEVELS = ("高中", "中专", "大专", "本科", "硕士", "博士")
 
+# 学历同义归一（2026-10-07 实盘：MBA/EMBA 被判 -1 误拒赵女士——研究生级学历
+# 必须映射到规范级别）。键为子串匹配（先 lower）；顺序敏感：更高级别在前。
+_EDUCATION_SYNONYMS: tuple[tuple[str, str], ...] = (
+    ("博士", "博士"),
+    ("博士研究生", "博士"),
+    ("emba", "硕士"),
+    ("mba", "硕士"),
+    ("硕士", "硕士"),
+    ("研究生", "硕士"),  # 泛称研究生按硕士（低于博士，保守）
+    ("本科", "本科"),
+    ("学士", "本科"),
+    ("大专", "大专"),
+    ("专科", "大专"),
+    ("高职", "大专"),
+    ("中专", "中专"),
+    ("中技", "中专"),
+    ("高中", "高中"),
+)
+
 _YEARS_RE = re.compile(r"(\d+)")
 
 # 排除词扫描的文本字段（除 liepin_user_id 外的全部字符串字段）
@@ -69,16 +88,17 @@ def evaluate(rules: dict, resume: MinimalResume) -> tuple[bool, list[str]]:
 
 
 def _education_level(education: str) -> int:
-    """学历 → 级别索引；无法识别返回 -1（低于一切，保守判不通过）。
+    """学历 → 级别索引；先做同义归一（MBA/EMBA→硕士 等，2026-10-07）；无法识别 -1。
 
     -1 是对称的：evaluate 对简历侧与规则侧分别处理——简历侧 -1 判不通过
     （保守），规则侧 -1 必须 fail closed 产出"规则配置非法"理由，
     不得让两侧同为 -1 时静默通过。
     """
-    try:
-        return EDUCATION_LEVELS.index(education)
-    except ValueError:
-        return -1
+    text = (education or "").strip().lower()
+    for token, level in _EDUCATION_SYNONYMS:
+        if token in text:
+            return EDUCATION_LEVELS.index(level)
+    return -1
 
 
 def _parse_years(raw: str) -> int | None:

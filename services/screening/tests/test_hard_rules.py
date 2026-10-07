@@ -90,13 +90,48 @@ class TestFail:
         assert len(reasons) == 3
 
 
+class TestEducationSynonyms:
+    """学历同义归一（2026-10-07 实盘：MBA/EMBA 被判 -1 误拒）：研究生级写法
+    必须映射；无法识别仍按保守 -1。"""
+
+    def test_mba_emba_passes_bachelor_rule(self, make_resume):
+        passed, reasons = evaluate(
+            {"min_education": "本科"}, make_resume(education="MBA/EMBA")
+        )
+        assert passed is True, reasons
+
+    def test_lowercase_emba_and_yjsheng(self, make_resume):
+        for value in ("emba", "EMBA", "研究生", "硕士研究生"):
+            passed, reasons = evaluate(
+                {"min_education": "本科"}, make_resume(education=value)
+            )
+            assert passed is True, (value, reasons)
+
+    def test_rule_with_suffix_now_parses(self, make_resume):
+        # "本科及以上" 归一化后为合法规则（本科门槛）：博士过、大专拒
+        passed, _ = evaluate(
+            {"min_education": "本科及以上"}, make_resume(education="博士")
+        )
+        assert passed is True
+        passed, reasons = evaluate(
+            {"min_education": "本科及以上"}, make_resume(education="大专")
+        )
+        assert passed is False and reasons
+
+    def test_unknown_still_conservative(self, make_resume):
+        passed, reasons = evaluate(
+            {"min_education": "本科"}, make_resume(education="其他")
+        )
+        assert passed is False and reasons
+
+
 class TestRuleMisconfig:
     """评审 Important：规则值无法识别时 fail closed，不得静默放行。"""
 
     def test_unknown_min_education_rule_fails_closed(self, make_resume):
-        # "本科及以上" 不在级别表 → 若对称比较会静默通过；必须产出理由拒绝
+        # "PhD" 不含任何中文级别子串（同义表不命中）→ 必须产出理由拒绝
         passed, reasons = evaluate(
-            {"min_education": "本科及以上"}, make_resume(education="博士")
+            {"min_education": "PhD"}, make_resume(education="博士")
         )
         assert passed is False
         assert reasons and all(r for r in reasons)
@@ -114,8 +149,9 @@ class TestRuleMisconfig:
         self, make_resume
     ):
         # 规则值合法、简历学历无法识别：维持保守判不通过（既有行为，锁定）
+        # （2026-10-07：MBA/EMBA 已归一到硕士，改用真正无法识别的值）
         passed, reasons = evaluate(
-            {"min_education": "本科"}, make_resume(education="MBA")
+            {"min_education": "本科"}, make_resume(education="其他")
         )
         assert passed is False
         assert any("学历" in r for r in reasons)

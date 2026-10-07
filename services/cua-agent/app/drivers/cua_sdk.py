@@ -922,7 +922,19 @@ class CuaLiepinDriver:
             if str(getattr(e, "role", "")) != "AXRadioButton":
                 continue
             label = str(getattr(e, "label", "") or "")
-            if any(mark in label for mark in ("推荐人才", "猎聘", "lpt.liepin")):
+            # 猎聘标签标题随业务页变化（推荐人才/职位管理/意向人选/沟通/搜索人才…）
+            if any(
+                mark in label
+                for mark in (
+                    "推荐人才",
+                    "猎聘",
+                    "lpt.liepin",
+                    "职位管理",
+                    "意向人选",
+                    "搜索人才",
+                    "人才管理",
+                )
+            ):
                 center = self._element_center(e)
                 if center is None:
                     continue
@@ -945,7 +957,9 @@ class CuaLiepinDriver:
         if "#preview" in self._current_url(state):
             self._preview_close(pid, wid)  # 残留预览自愈（上一任务中断场景，2026-10-07）
             state = self._live_state(pid, wid)
-        if self.RECOMMEND_PATH not in self._current_url(state):
+        # 2026-10-07：仅当当前页不在猎聘域时才需切标签；已在猎聘（任意业务页，如职位管理）
+        # 直接走侧栏导航，避免误切其他标签（Cmd+1 会把 LeetCode 等页切到前台）
+        if self.URL_MARKER not in self._current_url(state):
             if self.CHAT_PATH not in self._current_url(state):
                 state = self._focus_liepin_tab(pid, wid)
             if self.RECOMMEND_PATH not in self._current_url(state):
