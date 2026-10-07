@@ -30,7 +30,9 @@ run_migrations()
 app = FastAPI(title="hr-workbuddy pipeline")
 
 from app.api import router as jobs_router  # noqa: E402  （路由装配在迁移之后）
+from app.hr_api import router as hr_router  # noqa: E402
 from app.task_results import router as internal_router  # noqa: E402
 
 app.include_router(jobs_router)
 app.include_router(internal_router)
+app.include_router(hr_router)
