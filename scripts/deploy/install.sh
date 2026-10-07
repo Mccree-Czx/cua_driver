@@ -1,5 +1,10 @@
 #!/bin/bash
-# 安装 launchd 常驻守护（四服务：pipeline / screening / scheduler / worker）。
+# 安装 launchd 常驻守护（服务：pipeline / screening / scheduler / worker / backup）。
+#
+# 用法（2026-10-07 起支持分批）：
+#   bash install.sh                 # 默认：pipeline screening worker backup
+#   bash install.sh scheduler       # 单独补装 scheduler（会 5min 内自动跑 inbound_round
+#                                   # —— 账号操作！仅在账号恢复窗口开启后安装）
 #
 # 2026-10-07 修订：plist 直连 venv 解释器（不经 /bin/bash）。
 #   背景：launchd 拉起的 bash 无「桌面文件夹」访问权（TCC），四服务 exit 126；
@@ -81,10 +86,70 @@ write_plist() {
   echo "已安装并启动：${label}（解释器直连）"
 }
 
-write_plist pipeline  "$PY" -m uvicorn app.main:app --app-dir "$REPO/services/pipeline"  --host 127.0.0.1 --port 8000 --log-level info
-write_plist screening "$PY" -m uvicorn app.main:app --app-dir "$REPO/services/screening" --host 127.0.0.1 --port 8001 --log-level info
-write_plist scheduler "$PY" -m app.main
-write_plist worker    "$PY" -m arq app.worker.WorkerSettings
+write_backup_plist() {
+  # 备份：每日 21:30 日历任务（非 KeepAlive；backup.py 自读 env_common 配置）
+  local label="com.hr-workbuddy.backup"
+  local plist="$AGENTS_DIR/$label.plist"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0">'
+    echo '<dict>'
+    echo "  <key>Label</key><string>$label</string>"
+    echo '  <key>ProgramArguments</key>'
+    echo '  <array>'
+    echo "    <string>$PY</string>"
+    echo "    <string>$REPO/scripts/backup.py</string>"
+    echo '  </array>'
+    echo "  <key>WorkingDirectory</key><string>$REPO</string>"
+    echo '  <key>EnvironmentVariables</key>'
+    echo '  <dict>'
+    env_common
+    echo '  </dict>'
+    echo '  <key>RunAtLoad</key><false/>'
+    echo '  <key>StartCalendarInterval</key>'
+    echo '  <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>30</integer></dict>'
+    echo "  <key>StandardOutPath</key><string>$REPO/.run/logs/backup.out.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$REPO/.run/logs/backup.err.log</string>"
+    echo '</dict>'
+    echo '</plist>'
+  } > "$plist"
+  launchctl bootout "gui/$UID_NUM" "$plist" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_NUM" "$plist"
+  echo "已安装（每日 21:30）：${label}"
+}
+
+# —— 服务选择（分批安装）——
+SERVICES=("$@")
+if [ ${#SERVICES[@]} -eq 0 ]; then
+  # scheduler 默认排除：它会 5min 内自动跑 inbound_round（账号操作）——
+  # 仅当账号恢复窗口开启后，显式 `bash install.sh scheduler` 补装
+  SERVICES=(pipeline screening worker backup)
+fi
+
+for svc in "${SERVICES[@]}"; do
+  case "$svc" in
+    pipeline)
+      write_plist pipeline "$PY" -m uvicorn app.main:app --app-dir "$REPO/services/pipeline" --host 127.0.0.1 --port 8000 --log-level info
+      ;;
+    screening)
+      write_plist screening "$PY" -m uvicorn app.main:app --app-dir "$REPO/services/screening" --host 127.0.0.1 --port 8001 --log-level info
+      ;;
+    scheduler)
+      write_plist scheduler "$PY" -m app.main
+      ;;
+    worker)
+      write_plist worker "$PY" -m arq app.worker.WorkerSettings
+      ;;
+    backup)
+      write_backup_plist
+      ;;
+    *)
+      echo "未知服务：$svc（可选：pipeline screening scheduler worker backup）" >&2
+      exit 1
+      ;;
+  esac
+done
 
 echo
 echo "解释器：$PY"

@@ -307,3 +307,17 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 - Step 4：汇报 + 定 OUTBOUND 观察期节奏（轮次/限额/是否开自动）
 - 铁律：批量页（showbatchresumelist）为敏感页——除 inbound 正常单次流程外不得回访；
   旧 batch token 链接禁止再次打开
+
+## 常驻部署现状（2026-10-07 分批安装）
+
+- **已常驻（launchd 直连解释器）**：`com.hr-workbuddy.{pipeline,screening,worker}` +
+  `com.hr-workbuddy.backup`（每日 21:30 日历任务，DB+MinIO，各留 14 份）
+- **scheduler 暂缓**：它会启动后 5min 内自动跑 `inbound_round`（账号操作）——
+  仅在账号恢复窗口进入阶段 2（观察期）后执行 `bash scripts/deploy/install.sh scheduler`
+- **console**：仍手工 `cd apps/hr-console && pnpm start`（:3000）
+- 重装/补装：`bash scripts/deploy/install.sh [服务名...]`（默认 pipeline screening worker backup）
+- 查看：`launchctl list | grep hr-workbuddy`；日志：`.run/logs/<名>.{out,err}.log`
+- **跑 E2E 前必须先让出 8000**：
+  `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
+  跑完后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
+- 手动立跑一次备份：`DATABASE_URL=... MINIO_BUCKET=hr-workbuddy .venv/bin/python scripts/backup.py`
