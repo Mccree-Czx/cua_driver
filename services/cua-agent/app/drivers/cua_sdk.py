@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import re
 import subprocess
 import tempfile
 import threading
@@ -54,6 +55,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hr_workbuddy import MinimalResume
+
+_CARD_STATUS_RE = re.compile(r"^(在线|离线|.*活跃)$")  # 推荐卡状态词（头像后第 1 个文本）
 
 
 class CuaNotInstalledError(RuntimeError):
@@ -148,6 +151,7 @@ class CuaLiepinDriver:
     }
     CHAT_PATH = "lpt.liepin.com/chat"  # 聊天页 URL 片段（实测 /chat/im）
     BATCH_PATH = "resume/showbatchresumelist"  # 批量预览简历页 URL 片段
+    RECOMMEND_PATH = "lpt.liepin.com/recommend"  # 推荐人页 URL 片段（M2 路径二）
     SETTLE_SECONDS = 2.0  # SPA 页内切换/导航后的渲染等待（实测 1-2s）
     SCREENSHOT_PX_PER_POINT = 2.0  # 桌面截图像素:屏幕点比例（Retina 实测 2880px:1440pt；换环境需校准）
     ATTACHMENT_EXTS = (".pdf", ".doc", ".docx", ".zip")  # 附件简历文件扩展名
@@ -867,15 +871,151 @@ class CuaLiepinDriver:
         self._back_to_chat_page(pid, wid)
         return ids
 
-    def list_recommended(self) -> list[str]:
-        """推荐人列表读取（M2 路径二）——待 W7 真实页面校准后实装。
+    def _element_center(self, element: Any) -> tuple[float, float] | None:
+        """元素 frame → 屏幕点中心；不可解析返回 None（调用方放弃点击，不盲 点）。"""
+        frame = getattr(element, "frame", None)
+        if frame is None:
+            return None
+        try:
+            vals = list(frame)
+            if len(vals) == 4:
+                x, y, w, h = (float(v) for v in vals)
+                return x + w / 2.0, y + h / 2.0
+        except TypeError:
+            pass
+        x = getattr(frame, "x", None)
+        y = getattr(frame, "y", None)
+        w = getattr(frame, "w", getattr(frame, "width", None))
+        h = getattr(frame, "h", getattr(frame, "height", None))
+        if None not in (x, y, w, h):
+            return float(x) + float(w) / 2.0, float(y) + float(h) / 2.0
+        return None
 
-        页面结构（入口/列表项 liepin_user_id 取数/职位切换）均未校准；mock/E2E
-        走 FakeLiepinDriver.list_recommended（剧本 recommended 标记）。校准清单见
-        docs/superpowers/plans/2026-10-06-liepin-m2.md §7。"""
-        raise NotImplementedError(
-            "list_recommended 待 W7 真实页面校准（先只读探针，低密度）"
+    def _hotkey_tab_1(self) -> None:
+        """Cmd+1 切第 1 个标签（2026-10-07 实测：比坐标点页签可靠）。"""
+        script = 'tell application "System Events" to keystroke "1" using {command down}'
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=15
         )
+        if result.returncode != 0:
+            raise LocatorFailedError(
+                f"Cmd+1 切换标签失败（osascript rc={result.returncode}）："
+                f"{result.stderr.strip()[:160]}"
+            )
+
+    def _goto_recommend(self, pid: int, wid: int) -> Any:
+        """确保停在推荐页（已在→直接用；否则 Cmd+1 → 点侧栏「人才推荐」）。"""
+        state = self._live_state(pid, wid)
+        if self.RECOMMEND_PATH in self._current_url(state):
+            return state
+        if self.CHAT_PATH not in self._current_url(state):
+            self._hotkey_tab_1()
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
+        if self.RECOMMEND_PATH not in self._current_url(state):
+            nav = self._find(state, role="AXLink", label="人才推荐")
+            center = self._element_center(nav) if nav is not None else None
+            if center is None:
+                raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
+            self._click_point(pid, wid, *center)
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
+        if self.RECOMMEND_PATH not in self._current_url(state):
+            raise LocatorFailedError(f"未到达推荐页（URL={self._current_url(state)[:120]}）")
+        return state
+
+    def _recommend_cards(self, state: Any) -> list[tuple[str, tuple[float, float] | None]]:
+        """推荐页卡片：返回 [(姓名, 姓名中心或 None)]。
+
+        锚点=「系统推荐」标题之后的「头像」图像；姓名=其后 5 个元素内跳过状态词的
+        首个文本（2026-10-07 实测结构）；frame 缺失时中心为 None（调用方跳过）。
+        """
+        els = list(getattr(state, "elements", []) or [])
+        start = 0
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "") == "系统推荐":
+                start = pos
+                break
+        cards: list[tuple[str, tuple[float, float] | None]] = []
+        for pos in range(start, len(els)):
+            e = els[pos]
+            if (
+                str(getattr(e, "role", "")) != "AXImage"
+                or str(getattr(e, "label", "") or "") != "头像"
+            ):
+                continue
+            texts: list[Any] = []
+            for nxt in els[pos + 1 : pos + 6]:
+                if str(getattr(nxt, "role", "")) == "AXStaticText" and str(
+                    getattr(nxt, "label", "") or ""
+                ).strip():
+                    texts.append(nxt)
+            if not texts:
+                continue
+            name_el = texts[0]
+            if len(texts) >= 2 and _CARD_STATUS_RE.match(
+                str(getattr(texts[0], "label", "") or "").strip()
+            ):
+                name_el = texts[1]
+            name = str(getattr(name_el, "label", "") or "").strip()
+            cards.append((name, self._element_center(name_el)))
+        return cards
+
+    def _preview_close(self, pid: int, wid: int) -> None:
+        """关闭候选预览（recommend#preview → 回列表）：右上 close 图 / 浏览器返回 双通道。"""
+        for attempt in range(2):
+            state = self._live_state(pid, wid)
+            if "#preview" not in self._current_url(state):
+                return
+            el = (
+                self._find(state, role="AXImage", label="close")
+                if attempt == 0
+                else self._find(state, role="AXButton", label="返回")
+            )
+            center = self._element_center(el) if el is not None else None
+            if center is None:
+                continue
+            self._click_point(pid, wid, *center)
+            time.sleep(self.SETTLE_SECONDS)
+        state = self._live_state(pid, wid)
+        if "#preview" in self._current_url(state):
+            raise LocatorFailedError("预览页关闭失败（未回到推荐列表）")
+
+    def list_recommended(self, limit: int = 5) -> list[str]:
+        """推荐人列表读取（M2 路径二）——逐卡开预览提取「简历编号」。
+
+        2026-10-07 真实校准（证据 .scratch/recommended_probe/n2_*）：推荐页卡片
+        无编号直读；点击卡片姓名区 → `#preview` 详情（含「简历编号」，与批量页
+        同格式）。流程：确保在推荐页 → 取前 limit 张卡的姓名坐标 → 点击 → 校验
+        #preview → 提取编号 → 关闭预览 → 下一张。只读（不发消息、不输入）；卡片
+        定位失败跳过（不盲点），全部失败抛 LocatorFailedError；风控页/窗口异常
+        上抛（失败即停）。
+        """
+        pid, wid = self._ensure_visible_and_resolved()
+        self._goto_recommend(pid, wid)
+        ids: list[str] = []
+        seen: set[str] = set()
+        for idx in range(max(1, int(limit))):
+            state = self._live_state(pid, wid)
+            cards = self._recommend_cards(state)
+            if idx >= len(cards):
+                break  # 可见卡片不足（v1 不滚动翻页）
+            _, center = cards[idx]
+            if center is None:
+                continue  # 姓名 frame 缺失：跳过该卡（不盲点）
+            self._click_point(pid, wid, *center)
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
+            if "#preview" not in self._current_url(state):
+                continue  # 该卡未打开预览：跳过（不重试、不猜测）
+            lid = self._detail_liepin_id(state)
+            if lid and lid not in seen:
+                seen.add(lid)
+                ids.append(lid)
+            self._preview_close(pid, wid)
+        if not ids:
+            raise LocatorFailedError("推荐页未提取到任何「简历编号」（卡片定位/预览失败）")
+        return ids
 
     def open_conversation(self, candidate_liepin_id: str) -> None:
         """打开候选人会话：批量页按「简历编号」定位选项卡 →「继续沟通」进入聊天浮层。

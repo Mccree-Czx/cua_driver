@@ -230,7 +230,7 @@ class _StubLiepinDriver:
     def list_unread_conversations(self) -> list[str]:
         return []
 
-    def list_recommended(self) -> list[str]:
+    def list_recommended(self, limit: int = 5) -> list[str]:
         return []
 
     def open_conversation(self, candidate_liepin_id: str) -> None:

@@ -106,9 +106,11 @@ class FakeLiepinDriver:
     def list_unread_conversations(self) -> list[str]:
         return [c.liepin_user_id for c in self.world.conversations if c.unread]
 
-    def list_recommended(self) -> list[str]:
-        """M2 推荐人列表：剧本 recommended 标记的会话（顺序即列表顺序）。"""
-        return [c.liepin_user_id for c in self.world.conversations if c.recommended]
+    def list_recommended(self, limit: int = 5) -> list[str]:
+        """M2 推荐人列表：剧本 recommended 标记的会话（顺序即列表顺序），
+        最多 limit 张（与真实驱动语义对齐：可见/可读上限）。"""
+        ids = [c.liepin_user_id for c in self.world.conversations if c.recommended]
+        return ids[: max(1, int(limit))]
 
     def open_conversation(self, candidate_liepin_id: str) -> None:
         self._conversation(candidate_liepin_id)  # 未知 id 抛错

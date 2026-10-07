@@ -214,7 +214,7 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
 | 跑完 E2E 后真实批次的 MinIO 归档消失 | E2E `reset_state` 会清空 bucket 内 `snapshots/` 与 `resumes/` 全部对象（含生产库模式下的真实归档）。**跑 E2E 前对 MinIO 一并做备份，或选无真实归档的时段**；DB 记录（object_key）不受影响，平台侧原件仍在，必要时重跑下载任务补归档（2026-10-06 晚实测：本批 PDF×10 + 截图×10 被清） |
 | worker 日志「窗口不可达（off_space_or_ax_unresolved）」 | 窗口 AX 面不可解析（风控/登录跳转或用户切屏的伴生状态）：任务已转 failed_needs_manual（保守化：不自动重试；不触发全局熔断）。确认桌面与浏览器窗口恢复后重跑该任务 |
 | 任务 evidence 出现 `llm_fallback` / `fallback_exhausted` | 读取链（check_login/list_unread/read_resume/check_attachment）定位失败触发 LLM 视觉兜底：`llm_fallback`=兜底诊断与动作（用量计入 brain_tokens 账目）；`fallback_exhausted`=兜底执行后仍失败已转人工（不重试）。发送类/下载类不兜底；兜底动作全程不绕过风控检测（撞风控页同样触发全局熔断） |
-| real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）已完成 7 个页面方法校准（check_login / list_unread / open_conversation / read_online_resume / send_message / check_attachment / download_attachment）；若再现说明代码回退 |
+| real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）完成 7 个页面方法校准；2026-10-07 完成第 8 个 `list_recommended`（推荐页逐卡开预览提取「简历编号」；入口/结构/出口均实测）；若再现说明代码回退 |
 | 回调 `404 {"detail":"Not Found"}`；E2E 卡在 read_resume「max retries 4 exceeded」 | **本机代理环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向本地代理时，httpx（默认 `trust_env=True`）会把 `127.0.0.1` 的内网回调也发给代理，被拦成 404（实测特征：同一连接首请求 200、其后全 404；`http.client` 与新建连接均正常）。服务侧已用 `trust_env=False` 绕过硬编码内网调用；自建脚本请设 `NO_PROXY=127.0.0.1,localhost,::1`（或 `set HTTP_PROXY=` 清空）。排查命令：`echo $env:HTTP_PROXY` |
 
 ### 5.7 两路径流程差异（2026-10-06 策略）

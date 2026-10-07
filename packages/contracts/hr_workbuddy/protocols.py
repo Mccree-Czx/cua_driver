@@ -17,8 +17,9 @@ class LiepinDriver(Protocol):
 
     def list_unread_conversations(self) -> list[str]: ...
 
-    def list_recommended(self) -> list[str]:
-        """推荐人列表页可见的 liepin_user_id 列表（M2 路径二；翻页不在 v1）。"""
+    def list_recommended(self, limit: int = 5) -> list[str]:
+        """推荐人列表页读取（M2 路径二）：逐卡提取 liepin_user_id，最多 limit 张；
+        页码/滚动翻页不在 v1（可见卡片不足时少于 limit）。"""
 
     def open_conversation(self, candidate_liepin_id: str) -> None: ...
 

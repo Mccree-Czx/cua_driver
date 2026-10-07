@@ -109,6 +109,14 @@ def _send_text(task: AtomicTask) -> str:
     return str(text)
 
 
+def _recommend_limit(task: AtomicTask) -> int:
+    """LIST_RECOMMENDED 逐卡读取上限（爬坡节流点，来自调度 context.limit）。"""
+    try:
+        return max(1, int(task.context.get("limit") or 5))
+    except (TypeError, ValueError):
+        return 5
+
+
 def _page_capture(deps: ExecutorDeps, raw: Any) -> bytes:
     """动作后另拍页面截图（判定型/触达型/下载型动作）。"""
     return deps.capture()
@@ -167,8 +175,8 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
         artifact=_none_artifact,
     ),
     AtomicTaskType.LIST_RECOMMENDED: ActionSpec(
-        # M2 路径二：推荐人列表读取（mock 剧本 recommended 标记；real 待 W7 校准）
-        perform=lambda d, t: d.list_recommended(),
+        # M2 路径二：推荐人列表读取（逐卡开预览提取编号；真实页面 2026-10-07 校准）
+        perform=lambda d, t: d.list_recommended(_recommend_limit(t)),
         screenshot=_page_capture,
         criteria=lambda r: "推荐人列表已打开，可见候选人推荐列表",
         evidence=lambda d, r: {"recommended_ids": r},

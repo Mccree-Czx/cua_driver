@@ -816,3 +816,38 @@ def test_llm_fallback_risk_control_propagates():
         LlmFallback(driver=driver, brain=MockBrain()).recover(
             make_task(AtomicTaskType.LIST_UNREAD), RuntimeError("x")
         )
+
+
+# —— M2：LIST_RECOMMENDED（limit 透传 + evidence）——
+
+
+def test_list_recommended_passes_limit_and_returns_evidence():
+    """LIST_RECOMMENDED：context.limit → 驱动逐卡上限；evidence.recommended_ids 落账。"""
+    world = make_world(
+        conversations=[
+            ConversationScript(liepin_user_id="r1", recommended=True),
+            ConversationScript(liepin_user_id="r2", recommended=True),
+            ConversationScript(liepin_user_id="r3", recommended=True),
+        ]
+    )
+    fixtures = make_deps()
+    fixtures["deps"].executor.driver = FakeLiepinDriver(world)
+    result = run(
+        make_task(AtomicTaskType.LIST_RECOMMENDED, context={"limit": 2}), fixtures
+    )
+    assert result.outcome == "success"
+    assert result.evidence["recommended_ids"] == ["r1", "r2"]  # 驱动侧按 limit 截断
+
+
+def test_list_recommended_default_limit_when_context_missing():
+    """context 无 limit → 默认 5（爬坡缺省）。"""
+    world = make_world(
+        conversations=[
+            ConversationScript(liepin_user_id=f"r{i}", recommended=True) for i in range(7)
+        ]
+    )
+    fixtures = make_deps()
+    fixtures["deps"].executor.driver = FakeLiepinDriver(world)
+    result = run(make_task(AtomicTaskType.LIST_RECOMMENDED, context={}), fixtures)
+    assert result.outcome == "success"
+    assert result.evidence["recommended_ids"] == [f"r{i}" for i in range(5)]

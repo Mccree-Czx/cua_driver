@@ -48,3 +48,12 @@
 - 账号：静置期（第三次风控：2026-10-07 检出，建议 ≥48h 零操作）结束 + 用户完成安全验证
 - 常驻：`scripts/deploy/install.sh`（修复版）重装后，四服务应即起（python3.12 已获桌面目录授权）
 - 环境：Docker（Redis/MinIO）+ MySQL 常驻
+
+## 进度更新（2026-10-07 中午）
+
+- A1 done：install.sh 多字节 bug 已修（`${label}`）
+- A2/A3 done：第二轮探针完成 + **real `list_recommended(limit)` 已实装**（契约 limit 透传、
+  fake 对齐、executor `_recommend_limit`、单测 +2）；307 单测全绿
+- A4 部分：设计稿 §7 已更新校准结论；「立即沟通」语义测试与推荐人 read/send 链适配
+  留待静置期后（用户已授权点一次）
+- 其余（M3/M4/console）未动，待账号静置与工程排期
