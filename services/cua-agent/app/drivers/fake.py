@@ -79,6 +79,7 @@ class FakeLiepinDriver:
         self.now = now  # 时钟注入：None = 剧本 tick（world.tick）
         self.sent_messages: list[tuple[str, str]] = []
         self.resume_requests: list[str] = []  # M2 定稿：平台「向TA索要」调用记录
+        self.read_prefer_flags: list[bool] = []  # READ_RESUME 的 prefer_recommend 透传记录
         self.opened: set[str] = set()
 
     # —— 剧本查询 ——
@@ -120,6 +121,7 @@ class FakeLiepinDriver:
     def read_online_resume(
         self, candidate_liepin_id: str, *, prefer_recommend: bool = False
     ) -> tuple[bytes, MinimalResume]:
+        self.read_prefer_flags.append(prefer_recommend)
         conv = self._conversation(candidate_liepin_id)
         if conv.resume_fixture is None:
             raise NoResumeFixtureError(

@@ -1311,6 +1311,8 @@ def test_list_recommended_creates_and_dispatches_reads(client, fake_queue, sessi
     reads = [t for t in fake_queue.enqueued if t.type is AtomicTaskType.READ_RESUME]
     assert {t.candidate_liepin_id for t in reads} == {lid_a, lid_b}
     assert all(t.job_id == job_id for t in reads)
+    # 2026-10-07 风控修复：推荐人 read 任务带 source 提示 → 驱动直连推荐页
+    assert all(t.context == {"source": "recommended"} for t in reads)
 
 
 def test_list_recommended_skip_touched_dedup_and_limit(client, fake_queue, session):

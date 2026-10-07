@@ -308,6 +308,28 @@ def test_send_message_native_channel_calls_request_resume():
     ]
 
 
+def test_read_resume_prefer_recommend_passthrough():
+    """READ_RESUME(context.source=recommended) → prefer_recommend=True 透传
+    （2026-10-07 风控修复：推荐人直连推荐页，不碰批量页）。"""
+    fixtures = make_deps()
+    result = run(
+        make_task(AtomicTaskType.READ_RESUME, context={"source": "recommended"}),
+        fixtures,
+    )
+
+    assert result.outcome == "success"
+    assert fixtures["driver"].read_prefer_flags == [True]
+
+
+def test_read_resume_default_no_prefer():
+    """READ_RESUME 无 source 上下文（inbound 等）→ prefer_recommend=False（批量页主路径）。"""
+    fixtures = make_deps()
+    result = run(make_task(AtomicTaskType.READ_RESUME, context={}), fixtures)
+
+    assert result.outcome == "success"
+    assert fixtures["driver"].read_prefer_flags == [False]
+
+
 def test_check_attachment_negative_is_success():
     """CHECK_ATTACHMENT 无附件：success + has_attachment=False（pipeline 等下一轮巡检）。"""
     fixtures = make_deps()
