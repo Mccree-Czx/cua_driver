@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "hr-workbuddy"  # E2E 用独立 bucket（hr-workbuddy-e2e）隔离生产归档
     screening_url: str = "http://127.0.0.1:8001"
+    daily_resume_target: int = 50  # 日回收目标（回收端 KPI；未达标日低分简历照常入库）
 
 
 @lru_cache

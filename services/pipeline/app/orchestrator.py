@@ -230,7 +230,9 @@ def _apply_screening_result(
     """spec §3 步骤 3-5 判定分支，返回待入队的后继任务（由 HTTP 层在 commit 后入队）：
 
     - degraded → 只存证据不推进：status 保持 new、judge_reason=deferred、不发消息
-    - rejected_hard / rejected_llm → 对应状态 + judge_reason 落库，零触达
+    - rejected_hard → 终态 + judge_reason 落库，零触达
+    - rejected_llm（hard_pass=True）→ 2026-10-07 策略「硬过即发」：LLM 低分
+      不再拦发送——记录分数与 judge_reason 标注后按 screened_pass 路径处理
     - screened_pass → 按 source 走各自路径边（inbound：直接请求；outbound：greet→greeted
       →请求，greet_request 合并单条）→ 渲染话术产出 SEND_MESSAGE；
       一人一消息全域化（2026-10-06 M2）：候选人任意岗位已触达 → 不派发消息
@@ -238,14 +240,14 @@ def _apply_screening_result(
     if sres.degraded:
         jc.judge_reason = sres.judge_reason or DEFERRED_REASON
         return []
+    # 2026-10-07 策略：硬过即发——LLM 低分仅记录分档（参考排序/日报），不拦发送
+    low_score_pass = (
+        sres.status is CandidateStatus.REJECTED_LLM and sres.hard_pass
+    )
     if sres.status is CandidateStatus.REJECTED_HARD:
         _advance(jc, StateEvent.REJECT_HARD)
         jc.judge_reason = sres.judge_reason
-    elif sres.status is CandidateStatus.REJECTED_LLM:
-        _advance(jc, StateEvent.REJECT_LLM)
-        jc.judge_reason = sres.judge_reason
-        jc.match_score = sres.score
-    elif sres.status is CandidateStatus.SCREENED_PASS:
+    elif sres.status is CandidateStatus.SCREENED_PASS or low_score_pass:
         _advance(jc, StateEvent.SCREEN_PASS)
         jc.match_score = sres.score
         if session is not None and _candidate_has_out_message(session, candidate.id):
@@ -261,8 +263,17 @@ def _apply_screening_result(
             # 状态机路径键取 source 值（OUTBOUND="recommended"）——显式传候选 人 source
             _advance(jc, StateEvent.GREET, TransitionContext(source=candidate.source))
             _advance(jc, StateEvent.REQUEST_RESUME, TransitionContext(source=candidate.source))
-        jc.judge_reason = sres.judge_reason
+        jc.judge_reason = (
+            f"{sres.judge_reason}（评分低于阈值，按策略仍发送）"
+            if low_score_pass
+            else sres.judge_reason
+        )
         return next_tasks(jc, job=job, candidate=candidate)
+    elif sres.status is CandidateStatus.REJECTED_LLM:
+        # 兼容路径：hard_pass=False 的 LLM 拒（现服务语义下不应出现；保留防御）
+        _advance(jc, StateEvent.REJECT_LLM)
+        jc.judge_reason = sres.judge_reason
+        jc.match_score = sres.score
     return []
 
 

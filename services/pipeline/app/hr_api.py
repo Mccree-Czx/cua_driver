@@ -110,7 +110,12 @@ def hr_overview(
         "job": {"id": job.id, "title": job.title, "llm_threshold": job.llm_threshold} if job else None,
         "status_counts": status_counts,
         "score_buckets": buckets,
-        "today": {"touches_out": touches or 0, "received": received or 0, "manual": manual or 0},
+        "today": {
+            "touches_out": touches or 0,
+            "received": received or 0,
+            "received_target": get_settings().daily_resume_target,
+            "manual": manual or 0,
+        },
     }
 
 
@@ -119,11 +124,12 @@ def hr_candidates(
     job_id: int | None = None,
     status: str | None = None,
     q: str | None = None,
+    min_score: int | None = Query(None, ge=0, le=100, description="仅看达标分档（评分>=此值）"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """候选人列表（筛选 + 分页；新到在前）。"""
+    """候选人列表（筛选 + 分页；新到在前）。min_score：达标分档视图（回收目标口径）。"""
     stmt = (
         select(models.JobCandidate, models.Candidate)
         .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
@@ -143,6 +149,9 @@ def hr_candidates(
         condition = models.Candidate.name.like(like) | models.Candidate.liepin_user_id.like(like)
         stmt = stmt.where(condition)
         count_stmt = count_stmt.where(condition)
+    if min_score is not None:
+        stmt = stmt.where(models.JobCandidate.match_score >= min_score)
+        count_stmt = count_stmt.where(models.JobCandidate.match_score >= min_score)
     total = session.scalar(count_stmt) or 0
     rows = session.execute(stmt.limit(limit).offset(offset)).all()
     items = [

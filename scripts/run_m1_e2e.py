@@ -860,10 +860,11 @@ def scenario_c(log_dir: Path) -> ScenarioReport:
 
 
 def scenario_d(log_dir: Path) -> ScenarioReport:
-    """LP101（推荐人，两层通过 82）→ 打招呼 greet_request（含岗位名）→ awaited；
+    """LP101（推荐人，两层通过 82）→ 向TA索要 → awaited；LP103（LLM 低分 55）
+    按 2026-10-07 策略「硬过即发」→ 同样发送；LP102（硬拒）零触达。
 
-    tick1 回传附件 → 复巡下载入库（前置评分 82 保留，无收到后补评）；
-    LP102（硬拒）/ LP103（LLM 拒 55）零触达。同时验证 outbound_round（M2 轮次）。
+    tick1 回传附件 → 复巡下载入库（前置评分保留，无收到后补评）；同时验证
+    outbound_round（M2 轮次）。
     """
     checks: list[str] = []
     reset_state()
@@ -878,9 +879,9 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
         poll_until(
             lambda: _jc("LP101").get("status") == "awaiting_resume"
             and _jc("LP102").get("status") == "rejected_hard"
-            and _jc("LP103").get("status") == "rejected_llm",
+            and _jc("LP103").get("status") == "awaiting_resume",
             timeout=180,
-            what="剧本 D 三推荐人判定完成（LP101 向TA索要待回复 / LP102 硬拒 / LP103 LLM 拒）",
+            what="剧本 D 三推荐人判定完成（LP101/LP103 向TA索要待回复 / LP102 硬拒）",
         )
         jc1 = _jc("LP101")
         assert jc1["match_score"] == 82, "outbound 前置评分保留（两层判定）"
@@ -893,15 +894,25 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
             "我想要一份你的简历，你是否同意？"
         ), "LP101 平台「向TA索要」系统文案（2026-10-07 实测定稿）"
         checks.append("LP101 向TA索要（原生问候+简历请求）→ awaiting_resume；前置评分 82")
-        for lid, st in (("LP102", "rejected_hard"), ("LP103", "rejected_llm")):
-            jcx = _jc(lid)
-            assert jcx["status"] == st, f"{lid} 应为 {st}，实际 {jcx['status']}"
-            assert _interactions(jcx["id"]) == [], f"{lid} 零触达"
-        checks.append("LP102 硬拒 / LP103 LLM 拒 → 零触达")
-        # 附件链：首巡（tick 0）无附件 → tick1 送达 → 复巡（清在途键）下载入库
+        jc102 = _jc("LP102")
+        assert jc102["status"] == "rejected_hard", jc102["status"]
+        assert _interactions(jc102["id"]) == [], "LP102 零触达"
+        jc103 = _jc("LP103")
+        assert jc103["status"] == "awaiting_resume", jc103["status"]
+        assert jc103["match_score"] == 55, "LP103 低分分档记录保留"
+        assert "按策略仍发送" in (jc103["judge_reason"] or "")
+        rows3 = _interactions(jc103["id"])
+        assert [(r["direction"], r["msg_type"]) for r in rows3] == [
+            ("out", "greet_request")
+        ], f"LP103 interactions 偏差：{rows3}"
+        checks.append(
+            "LP102 硬拒 → 零触达；LP103 低分（55）硬过即发 → 向TA索要（2026-10-07 策略）"
+        )
+        # 附件链：LP101/LP103 双 awaiting——首巡（tick 0）无附件 → tick1 送达 →
+        # 复巡（清在途键）下载入库
         baseline = _task_log_count()
         sweep = awaiting_resume_sweep(_deps())
-        assert sweep.dispatched == 1, f"LP101 awaiting 首巡：{sweep}"
+        assert sweep.dispatched == 2, f"LP101+LP103 awaiting 首巡：{sweep}"
         poll_until(
             lambda: _task_log_count() > baseline,
             timeout=60,
@@ -910,9 +921,10 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
         _write_world(M2_RECOMMENDED_WORLD, {**world_d, "tick": 1})  # 附件送达
         client = _redis()
         client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc1["id"]))
+        client.delete(in_flight_key(AtomicTaskType.CHECK_ATTACHMENT, jc103["id"]))
         client.close()
         sweep = awaiting_resume_sweep(_deps())
-        assert sweep.dispatched == 1
+        assert sweep.dispatched == 2
         poll_until(
             lambda: _jc("LP101").get("status") == "resume_received",
             timeout=180,
@@ -932,7 +944,7 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
         assert jc1["match_score"] == 82, "outbound 前置评分不回退（无收到后补评）"
         checks.append(f"LP101 回传入库：PDF={pdf}（前置评分 82 保留）")
         return ScenarioReport(
-            name="剧本 D：推荐人 outbound（两层判定 → 打招呼 → 回传入库）", checks=checks
+            name="剧本 D：推荐人 outbound（硬过即发 → 向TA索要 → 回传入库）", checks=checks
         )
     finally:
         stop_proc(worker)

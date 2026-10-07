@@ -6,7 +6,7 @@ type Overview = {
   job?: { id: number; title: string; llm_threshold: number } | null;
   status_counts: Record<string, number>;
   score_buckets: Record<string, number>;
-  today: { touches_out: number; received: number; manual: number };
+  today: { touches_out: number; received: number; received_target?: number; manual: number };
 };
 
 type DailyDay = {
@@ -67,6 +67,22 @@ export default function Home() {
             <div className="rounded-lg border border-gray-200 bg-white p-4">
               <div className="text-xs text-gray-500">今日收到简历</div>
               <div className="text-2xl font-semibold">{overview.today.received}</div>
+              <div className="mt-1 text-xs text-gray-400">
+                目标 {overview.today.received_target ?? 50} / 天
+              </div>
+              <div className="mt-1 h-1.5 w-full rounded bg-gray-100">
+                <div
+                  className="h-1.5 rounded bg-blue-500"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(
+                        (overview.today.received / (overview.today.received_target ?? 50)) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
             </div>
             <div className="rounded-lg border border-gray-200 bg-white p-4">
               <div className="text-xs text-gray-500">今日转人工</div>

@@ -379,28 +379,16 @@ def test_degraded_stays_new_no_message(client, fake_queue, fake_screening, sessi
             CandidateStatus.REJECTED_HARD.value,
             None,
         ),
-        (
-            ScreeningResult(
-                hard_pass=True,
-                hard_reasons=[],
-                score=55,
-                judge_reason="LLM 评分 55 未达阈值",
-                status=CandidateStatus.REJECTED_LLM,
-                degraded=False,
-            ),
-            CandidateStatus.REJECTED_LLM.value,
-            55,
-        ),
     ],
-    ids=["rejected_hard", "rejected_llm"],
+    ids=["rejected_hard"],
 )
 def test_rejected_zero_contact(
     client, fake_queue, fake_screening, session, result, expected_status, expected_score
 ):
-    """rejected_hard / rejected_llm → 对应状态 + judge_reason 落库，零触达。
+    """rejected_hard → 终态 + judge_reason 落库，零触达。
 
-    2026-10-06 策略后 rejected_llm 仅存于 outbound（llm_scoring=True）；两种
-    拒绝语义均以 recommended 候选人验证（inbound 直索要不产生 rejected_llm）。
+    2026-10-07 策略「硬过即发」后：hard_pass=True 的 rejected_llm（低分）改为
+    发送路径，不再属于本用例——见 test_outbound_low_score_still_sends。
     """
     job_id, _ = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
@@ -1069,6 +1057,43 @@ def test_outbound_uses_greet_variant_and_llm_scoring(
         select(models.Interaction).where(models.Interaction.job_candidate_id == jc.id)
     ).scalar_one()
     assert interaction.msg_type == "greet_request"  # outbound 原通道
+
+
+def test_outbound_low_score_still_sends(client, fake_queue, fake_screening, session):
+    """2026-10-07 策略「硬过即发」：LLM 低分（hard_pass=True）不再拦发送——
+    分数落库 + judge_reason 标注，仍派发 SEND（native 向TA索要）。"""
+    job_id, _ = _create_job(client)
+    liepin = f"LP{uuid4().hex[:12]}"
+    session.add(
+        models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended")
+    )
+    session.commit()
+    fake_screening.set(
+        liepin,
+        ScreeningResult(
+            hard_pass=True,
+            hard_reasons=[],
+            score=40,
+            judge_reason="LLM 评分 40 未过阈值",
+            status=CandidateStatus.REJECTED_LLM,
+            degraded=False,
+        ),
+    )
+
+    read_task = _make_read_task(job_id, liepin)
+    fake_queue.record(read_task)
+    resp = _post_read_result(client, read_task, liepin)
+    assert resp.status_code == 200, resp.text
+    _reload(session)
+    jc = session.execute(
+        select(models.JobCandidate).where(models.JobCandidate.job_id == job_id)
+    ).scalar_one()
+    assert jc.status == CandidateStatus.RESUME_REQUESTED.value, jc.status
+    assert jc.match_score == 40  # 分档记录（参考）
+    assert "按策略仍发送" in (jc.judge_reason or "")
+    (send_task,) = fake_queue.enqueued
+    assert send_task.context["native_channel"] is True
+    assert send_task.type is AtomicTaskType.SEND_MESSAGE
 
 
 def test_inbound_post_receive_scoring_on_artifact(

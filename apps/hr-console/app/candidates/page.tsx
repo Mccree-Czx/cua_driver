@@ -41,18 +41,31 @@ export default function Candidates() {
   const [rows, setRows] = useState<CandidateRow[]>([]);
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
+  const [minScoreOnly, setMinScoreOnly] = useState(false);
+  const [threshold, setThreshold] = useState(55);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    // 达标分档阈值 = 岗位 llm_threshold（2026-10-07 策略：评分退为参考分档）
+    fetch("/api/hr/overview")
+      .then((r) => r.json())
+      .then((body) => {
+        if (body?.job?.llm_threshold) setThreshold(body.job.llm_threshold);
+      })
+      .catch(() => {});
+  }, []);
 
   const load = useCallback(() => {
     const params = new URLSearchParams();
     if (status) params.set("status", status);
     if (q) params.set("q", q);
+    if (minScoreOnly) params.set("min_score", String(threshold));
     fetch(`/api/hr/candidates?${params}`)
       .then((r) => r.json())
       .then((body) => setRows(body.items ?? []))
       .catch(() => setRows([]));
-  }, [status, q]);
+  }, [status, q, minScoreOnly, threshold]);
 
   useEffect(load, [load]);
 
@@ -103,6 +116,14 @@ export default function Candidates() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
+        <label className="flex items-center gap-1 text-xs text-gray-600">
+          <input
+            type="checkbox"
+            checked={minScoreOnly}
+            onChange={(e) => setMinScoreOnly(e.target.checked)}
+          />
+          仅达标分档（≥{threshold}）
+        </label>
         <span className="text-xs text-gray-500">{rows.length} 行</span>
         {message && <span className="text-xs text-blue-700">{message}</span>}
       </div>
