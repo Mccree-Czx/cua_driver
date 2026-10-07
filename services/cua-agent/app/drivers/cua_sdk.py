@@ -1118,11 +1118,9 @@ class CuaLiepinDriver:
                 raise LocatorFailedError(
                     f"「立即沟通」降级后未见发送成功状态（编号 {candidate_liepin_id}）"
                 )
-            try:
-                self._reload_page(pid, wid)
-                time.sleep(self.SETTLE_SECONDS)
-            except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
-                pass
+            # 2026-10-07：保留现场供后置截图校验（勿在此重载！）；
+            # 清理/收面板交下一任务的 _goto_recommend 自愈。
+            time.sleep(0.8)
             return
         center = self._element_center(btn)
         if center is not None:
@@ -1136,12 +1134,10 @@ class CuaLiepinDriver:
             raise LocatorFailedError(
                 f"「向TA索要」后未见请求已发状态（编号 {candidate_liepin_id}，页面结构可能变化）"
             )
-        # 收尾：整页重载——发送后覆盖层/预览一律清除（2026-10-07 实测：✕ 无标签，重载最可靠）
-        try:
-            self._reload_page(pid, wid)
-            time.sleep(self.SETTLE_SECONDS)
-        except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
-            pass
+        # 2026-10-07：保留现场供后置截图校验——实测踩坑：此处整页重载会把
+        # 面板（“对方暂未回复”证据）清掉，导致 verify_success 必误判失败；
+        # 清理交下一任务的 _goto_recommend 自愈（列表锚点缺席→重载）。
+        time.sleep(0.8)
 
     def send_message(self, candidate_liepin_id: str, text: str) -> None:
         """④ 发送消息（唯一触达动作；一人一消息约束由调用方/pipeline 保证）。
