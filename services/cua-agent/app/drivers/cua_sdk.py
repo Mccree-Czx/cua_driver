@@ -1133,24 +1133,91 @@ class CuaLiepinDriver:
                 raise
             raise mapped from e
 
-    def read_online_resume(self, candidate_liepin_id: str) -> tuple[bytes, MinimalResume]:
-        """③ 读在线简历：批量页定位候选人 → 提取 7 字段 + 桌面截图。
+    def _preview_name(self, state: Any) -> str:
+        """推荐预览页姓名：「查看大图」之后首个非状态词文本（实测结构）。"""
+        els = list(getattr(state, "elements", []) or [])
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "") == "查看大图":
+                for nxt in els[pos + 1 : pos + 6]:
+                    if str(getattr(nxt, "role", "")) != "AXStaticText":
+                        continue
+                    t = str(getattr(nxt, "label", "") or "").strip()
+                    if t and not _CARD_STATUS_RE.match(t):
+                        return t
+        return ""
 
-        实测路径：聊天页 →「浏览简历」→ 批量预览简历页 → 逐选项卡 AXPress → 读
-        「简历编号」比对目标 → 图标锚点提取字段（environment/work/education/
-        file-search + 求职意向薪资）；截图用桌面捕获（窗口捕获在 capture 绑定期
-        不稳定）。必填字段（city/years/education）缺失或查找失败即抛错（失败即
-        停）；experience_summary 为可选——部分候选人页面无 file-search 栏目
-        （2026-10-06 实测），缺失落空串；错误信息携带状态供人工/视觉复核。
+    def _preview_summary(self, state: Any) -> str:
+        """推荐预览页经历摘要（预览无 file-search 栏目）：「工作经历」后首个长文本段；
+        无则空串（与批量页 experience_summary 可选语义一致，2026-10-07 实测）。"""
+        els = list(getattr(state, "elements", []) or [])
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "") == "工作经历":
+                for nxt in els[pos + 1 : pos + 30]:
+                    if str(getattr(nxt, "role", "")) != "AXStaticText":
+                        continue
+                    t = str(getattr(nxt, "label", "") or "").strip()
+                    if len(t) >= 40 and not t.startswith("*"):
+                        return t[:200]
+                break
+        return ""
+
+    def _recommended_preview_by_id(
+        self, pid: int, wid: int, candidate_liepin_id: str, *, max_scan: int = 10
+    ) -> Any:
+        """推荐人回退定位：扫推荐列表（上限 max_scan 卡）逐卡开预览对「简历编号」。
+
+        2026-10-07 校准：推荐卡无编号直读，点姓名→#preview 详情含编号；命中返回
+        预览 state（不关闭，由调用方读字段）；未命中关预览继续；全扫不到抛错。
+        """
+        self._goto_recommend(pid, wid)
+        state = self._live_state(pid, wid)
+        cards = self._recommend_cards(state)
+        scanned = 0
+        for _, center in cards[: max(1, int(max_scan))]:
+            if center is None:
+                continue
+            scanned += 1
+            self._click_point(pid, wid, *center)
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
+            if "#preview" not in self._current_url(state):
+                continue  # 该卡未开预览：跳过（不猜测）
+            if self._detail_liepin_id(state) == candidate_liepin_id:
+                return state
+            self._preview_close(pid, wid)
+        raise LocatorFailedError(
+            f"推荐人列表未找到简历编号 {candidate_liepin_id}（已扫 {scanned} 张卡）"
+        )
+
+    def read_online_resume(self, candidate_liepin_id: str) -> tuple[bytes, MinimalResume]:
+        """③ 读在线简历：批量页定位（推荐人回退推荐页预览）→ 提取 7 字段 + 桌面截图。
+
+        主路径：聊天页 →「浏览简历」→ 批量预览简历页 → 逐选项卡 AXPress → 读
+        「简历编号」比对目标 → 图标锚点提取字段。**回退路径（M2，2026-10-07 校准）**：
+        候选人不属批量页（推荐人等）→ 推荐页逐卡开 #preview 按编号定位 → 预览页
+        environment/work/education 图标 + 求职意向薪资同源提取；摘要取预览「工作
+        经历」首段（预览无 file-search 栏目）。截图用桌面捕获。必填字段
+        （city/years/education；回退路含 name）缺失或两路均失败即抛错（失败即停 ）；
+        experience_summary 可缺失落空串；错误信息携带状态供人工/视觉复核。
         """
         pid, wid = self._ensure_visible_and_resolved()
-        state, name = self._candidate_detail(pid, wid, candidate_liepin_id)
+        try:
+            state, name = self._candidate_detail(pid, wid, candidate_liepin_id)
+            # 自我评价/个人优势栏目并非所有候选人都有（2026-10-06 实测：邵女士类
+            # 页面无 file-search 栏目）——缺失落空串，不作为失败；其余字段失败即停。
+            summary = self._value_after_icon(state, "file-search") or ""
+        except LocatorFailedError:
+            # M2 回退：批量页无此人（推荐人路径）→ 推荐页预览定位（含编号比对）
+            state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
+            name = self._preview_name(state)
+            summary = self._preview_summary(state)
+            if not name:
+                raise LocatorFailedError(
+                    f"推荐人预览页未取到姓名（编号 {candidate_liepin_id}，页面结构可能变化）"
+                ) from None
         city = self._value_after_icon(state, "environment")
         years = self._value_after_icon(state, "work")
         edu_full = self._value_after_icon(state, "education")
-        # 自我评价/个人优势栏目并非所有候选人都有（2026-10-06 实测：邵女士类
-        # 页面无 file-search 栏目）——缺失落空串，不作为失败；其余字段失败即停。
-        summary = self._value_after_icon(state, "file-search") or ""
         education = edu_full.split("·")[-1].strip() if edu_full else None
         missing = [
             key
