@@ -109,6 +109,15 @@ def _send_text(task: AtomicTask) -> str:
     return str(text)
 
 
+def _send_perform(driver: Any, task: AtomicTask) -> None:
+    """SEND_MESSAGE 执行分派：原生通道（outbound 平台「向TA索要」，2026-10-07
+    定稿——问候+简历请求一体、系统文案）或自定义文本发送（inbound 直索要）。"""
+    if task.context.get("native_channel"):
+        driver.request_resume(_candidate_id(task))
+        return
+    driver.send_message(_candidate_id(task), _send_text(task))
+
+
 def _recommend_limit(task: AtomicTask) -> int:
     """LIST_RECOMMENDED 逐卡读取上限（爬坡节流点，来自调度 context.limit）。"""
     try:
@@ -192,7 +201,7 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
         artifact=_resume_artifact,
     ),
     AtomicTaskType.SEND_MESSAGE: ActionSpec(
-        perform=lambda d, t: d.send_message(_candidate_id(t), _send_text(t)),
+        perform=_send_perform,
         screenshot=_page_capture,
         criteria=lambda r: "消息已成功发送并显示在会话中",
         evidence=_sent_evidence,

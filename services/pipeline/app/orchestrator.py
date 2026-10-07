@@ -35,7 +35,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.login_state import LoginStateStore
-from app.messaging import OneMessagePerCandidateError, ensure_no_out_message, render_message
+from app.messaging import (
+    NATIVE_OUTREACH_TEXT,
+    OneMessagePerCandidateError,
+    ensure_no_out_message,
+    render_message,
+)
 from app.models import Candidate, Interaction, Job, JobCandidate, TaskLog
 from app.state_machine import StateEvent, TransitionContext, transition
 from app.storage import ObjectStore, resume_object_key, snapshot_object_key
@@ -96,9 +101,9 @@ def next_tasks(
 ) -> list[AtomicTask]:
     """按当前状态产出后继任务（M1 路径一）：
 
-    - resume_requested（READ_RESUME 通过后）→ SEND_MESSAGE（渲染话术：inbound
-      直索要 direct_request / outbound 打招呼索要 greet_request；context 带
-      渲染文本 + candidate_liepin_id）
+    - resume_requested（READ_RESUME 通过后）→ SEND_MESSAGE（inbound 渲染直索要
+      direct_request 文本；outbound 走平台「向TA索要」原生通道 native_channel，
+      context.text 记录平台系统文案；均带 candidate_liepin_id）
     - awaiting_resume 且 has_attachment → DOWNLOAD_ATTACHMENT
     - 其余 → []（SEND_MESSAGE 成功后等巡检；artifact 后待 M3 复核）
     """
@@ -110,7 +115,21 @@ def next_tasks(
         variant = (
             DIRECT_REQUEST_VARIANT if candidate.source == "inbound" else GREET_VARIANT
         )
-        text = render_message(job, candidate, variant)
+        # 2026-10-07 定稿：outbound 发送 = 平台「向TA索要」（问候+简历请求系统文案，
+        # greet 语义）；native_channel 标记 executor 走 request_resume（无自定义文本）
+        native_channel = candidate.source != "inbound"
+        text = (
+            NATIVE_OUTREACH_TEXT
+            if native_channel
+            else render_message(job, candidate, variant)
+        )
+        context: dict[str, Any] = {
+            "text": text,
+            "candidate_liepin_id": candidate.liepin_user_id,
+            "variant": variant,
+        }
+        if native_channel:
+            context["native_channel"] = True
         return [
             AtomicTask(
                 task_id=uuid4(),
@@ -118,7 +137,7 @@ def next_tasks(
                 job_id=job.id,
                 job_candidate_id=jc.id,
                 candidate_liepin_id=candidate.liepin_user_id,
-                context={"text": text, "candidate_liepin_id": candidate.liepin_user_id, "variant": variant},
+                context=context,
             )
         ]
     if status is CandidateStatus.AWAITING_RESUME and has_attachment:

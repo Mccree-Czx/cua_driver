@@ -28,6 +28,7 @@ from app import models
 from app.db import SessionLocal
 from app.deps import get_queue, get_screening, get_session
 from app.main import app
+from app.messaging import NATIVE_OUTREACH_TEXT
 from app.storage import ObjectStore
 from fakes import DEGRADED_RESULT, FakeScreening, FakeTaskQueue
 from hr_workbuddy import (
@@ -1031,7 +1032,7 @@ def test_artifact_snapshot_creates_candidate_if_missing(client, fake_queue, sess
 def test_outbound_uses_greet_variant_and_llm_scoring(
     client, fake_queue, fake_screening, session
 ):
-    """outbound（recommended）：两层判定（llm_scoring=True）→ 打招呼索要 greet_request。"""
+    """outbound（recommended）：两层判定（llm_scoring=True）→ 平台「向TA索要」发送（2026-10-07 定稿）。"""
     job_id, title = _create_job(client)
     liepin = f"LP{uuid4().hex[:12]}"
     session.add(models.Candidate(liepin_user_id=liepin, name="张伟", source="recommended"))
@@ -1058,7 +1059,9 @@ def test_outbound_uses_greet_variant_and_llm_scoring(
     assert jc.match_score == 82  # outbound 仍为前置评分
     assert jc.judge_reason == "LLM 评分 82 通过"
     (send_task,) = fake_queue.enqueued
-    assert send_task.context["text"] == f"您好 张伟，看到您在看{title}岗位，方便发一份简历吗？"
+    # 2026-10-07 定稿：outbound 发送走平台原生通道（native_channel），文案=系统模板
+    assert send_task.context["native_channel"] is True
+    assert send_task.context["text"] == NATIVE_OUTREACH_TEXT
 
     assert _post_send_result(client, send_task).status_code == 200
     _reload(session)

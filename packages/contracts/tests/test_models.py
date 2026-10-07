@@ -244,6 +244,9 @@ class _StubLiepinDriver:
     def send_message(self, candidate_liepin_id: str, text: str) -> None:
         return None
 
+    def request_resume(self, candidate_liepin_id: str) -> None:
+        return None
+
     def check_attachment(self, candidate_liepin_id: str) -> bool:
         return False
 

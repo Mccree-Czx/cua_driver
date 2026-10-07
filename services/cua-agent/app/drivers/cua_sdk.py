@@ -904,8 +904,11 @@ class CuaLiepinDriver:
             )
 
     def _goto_recommend(self, pid: int, wid: int) -> Any:
-        """确保停在推荐页（已在→直接用；否则 Cmd+1 → 点侧栏「人才推荐」）。"""
+        """确保停在推荐列表页（已在→直接用；残留 #preview 先自愈关闭；否则 Cmd+1 → 点侧栏）。"""
         state = self._live_state(pid, wid)
+        if "#preview" in self._current_url(state):
+            self._preview_close(pid, wid)  # 残留预览自愈（上一任务中断场景，2026-10-07）
+            state = self._live_state(pid, wid)
         if self.RECOMMEND_PATH in self._current_url(state):
             return state
         if self.CHAT_PATH not in self._current_url(state):
@@ -1028,6 +1031,41 @@ class CuaLiepinDriver:
         self._open_chat_overlay(pid, wid, state, name)
 
     # —— 发送链（T12 步骤④ 校准，2026-10-06）——
+
+    def request_resume(self, candidate_liepin_id: str) -> None:
+        """④' outbound 发送（M2 定稿，2026-10-07 实测）：预览页点「向TA索要」——
+
+        平台一键发出系统消息（问候「你好~我这里有个职位很适合你…」+ 请求
+        「我想要一份你的简历，你是否同意？」，对方需同意）；文案平台固定、
+        无自定义输入。成功判据：新状态含「对方暂未回复」或请求文案；
+        收尾尽力揃起面板/预览（失败不影响已发送事实）。失败即停。
+        """
+        pid, wid = self._ensure_visible_and_resolved()
+        state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
+        btn = self._find(state, role="AXButton", label="向TA索要")
+        if btn is None:
+            raise LocatorFailedError(
+                f"预览页无「向TA索要」按钮（编号 {candidate_liepin_id}，可能无附件简历）"
+            )
+        center = self._element_center(btn)
+        if center is not None:
+            self._click_point(pid, wid, *center)
+        else:
+            self._press(pid, wid, btn)
+        time.sleep(self.SETTLE_SECONDS + 1.0)
+        state = self._live_state(pid, wid)
+        tree = str(getattr(state, "tree_markdown", "") or "")
+        if "对方暂未回复" not in tree and "我想要一份你的简历" not in tree:
+            raise LocatorFailedError(
+                f"「向TA索要」后未见请求已发状态（编号 {candidate_liepin_id}，页面结构可能变化）"
+            )
+        close = self._find(state, role="AXButton", label="Close")
+        if close is not None:
+            try:
+                self._press(pid, wid, close)
+                time.sleep(0.8)
+            except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
+                pass
 
     def send_message(self, candidate_liepin_id: str, text: str) -> None:
         """④ 发送消息（唯一触达动作；一人一消息约束由调用方/pipeline 保证）。

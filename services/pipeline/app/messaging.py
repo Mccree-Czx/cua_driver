@@ -25,6 +25,14 @@ DEFAULT_TEMPLATES = {
     "resume_ack": "您好 {name}，已收到您的简历，感谢关注！",
 }
 
+# 2026-10-07 实测定稿：outbound（推荐人）发送 = 平台「向TA索要」一键动作，
+# 系统固定文案（问候 + 简历同意请求，无需/无法自定义）；渲染层不再参与
+# outbound 文案，此常量用于任务 context.text 与互动流水如实记录已发内容。
+NATIVE_OUTREACH_TEXT = (
+    "你好~我这里有个职位很适合你，待遇优厚，了解一下吗？期待回复！\n"
+    "我想要一份你的简历，你是否同意？"
+)
+
 
 class OneMessagePerCandidateError(Exception):
     """该 job_candidate 已发送过 out 消息，拒绝再次发送（一人一消息，决策 3）。"""

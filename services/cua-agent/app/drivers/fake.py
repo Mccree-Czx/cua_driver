@@ -78,6 +78,7 @@ class FakeLiepinDriver:
         self.world = world
         self.now = now  # 时钟注入：None = 剧本 tick（world.tick）
         self.sent_messages: list[tuple[str, str]] = []
+        self.resume_requests: list[str] = []  # M2 定稿：平台「向TA索要」调用记录
         self.opened: set[str] = set()
 
     # —— 剧本查询 ——
@@ -133,6 +134,18 @@ class FakeLiepinDriver:
     def send_message(self, candidate_liepin_id: str, text: str) -> None:
         self._conversation(candidate_liepin_id)
         self.sent_messages.append((candidate_liepin_id, text))
+
+    def request_resume(self, candidate_liepin_id: str) -> None:
+        """M2 定稿：outbound 平台「向TA索要」（问候+简历请求一体，无自定义文本）。"""
+        self._conversation(candidate_liepin_id)
+        self.resume_requests.append(candidate_liepin_id)
+        self.sent_messages.append(
+            (
+                candidate_liepin_id,
+                "你好~我这里有个职位很适合你，待遇优厚，了解一下吗？期待回复！\n"
+                "我想要一份你的简历，你是否同意？",
+            )
+        )
 
     def check_attachment(self, candidate_liepin_id: str) -> bool:
         self._conversation(candidate_liepin_id)

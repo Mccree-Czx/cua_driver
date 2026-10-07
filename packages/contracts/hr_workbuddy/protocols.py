@@ -30,6 +30,11 @@ class LiepinDriver(Protocol):
 
     def send_message(self, candidate_liepin_id: str, text: str) -> None: ...
 
+    def request_resume(self, candidate_liepin_id: str) -> None:
+        """outbound 发送（M2 定稿，2026-10-07 实测）：平台「向TA索要」——
+        一键发出系统问候 + 简历同意请求；文案平台固定、无自定义文本。"""
+        ...
+
     def check_attachment(self, candidate_liepin_id: str) -> bool: ...
 
     def download_attachment(self, candidate_liepin_id: str) -> tuple[bytes, str]:

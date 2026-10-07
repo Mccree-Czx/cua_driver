@@ -283,6 +283,31 @@ def test_send_message_success_evidence_sent_at():
     assert fixtures["driver"].sent_messages == [(CANDIDATE, "您好，方便发一份简历吗？")]
 
 
+def test_send_message_native_channel_calls_request_resume():
+    """SEND_MESSAGE(native_channel)：走平台「向TA索要」而非自定义文本发送（M2 定稿）。"""
+    fixtures = make_deps()
+    task = make_task(
+        AtomicTaskType.SEND_MESSAGE,
+        context={
+            "text": "平台系统文案（记录用）",
+            "candidate_liepin_id": CANDIDATE,
+            "variant": "greet_request",
+            "native_channel": True,
+        },
+    )
+    result = run(task, fixtures)
+
+    assert result.outcome == "success"
+    assert fixtures["driver"].resume_requests == [CANDIDATE]
+    assert fixtures["driver"].sent_messages == [
+        (
+            CANDIDATE,
+            "你好~我这里有个职位很适合你，待遇优厚，了解一下吗？期待回复！\n"
+            "我想要一份你的简历，你是否同意？",
+        )
+    ]
+
+
 def test_check_attachment_negative_is_success():
     """CHECK_ATTACHMENT 无附件：success + has_attachment=False（pipeline 等下一轮巡检）。"""
     fixtures = make_deps()

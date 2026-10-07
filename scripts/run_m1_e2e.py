@@ -869,7 +869,7 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
             and _jc("LP102").get("status") == "rejected_hard"
             and _jc("LP103").get("status") == "rejected_llm",
             timeout=180,
-            what="剧本 D 三推荐人判定完成（LP101 打招呼待回复 / LP102 硬拒 / LP103 LLM 拒）",
+            what="剧本 D 三推荐人判定完成（LP101 向TA索要待回复 / LP102 硬拒 / LP103 LLM 拒）",
         )
         jc1 = _jc("LP101")
         assert jc1["match_score"] == 82, "outbound 前置评分保留（两层判定）"
@@ -877,11 +877,11 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
         assert [(r["direction"], r["msg_type"]) for r in rows1] == [
             ("out", "greet_request")
         ], f"LP101 interactions 偏差：{rows1}"
-        assert (
-            rows1[0]["content"]
-            == f"您好 周九，看到您在看{JOB_TITLE}岗位，方便发一份简历吗？"
-        )
-        checks.append("LP101 打招呼（greet_request，含岗位名）→ awaiting_resume；前置评分 82")
+        assert rows1[0]["content"] == (
+            "你好~我这里有个职位很适合你，待遇优厚，了解一下吗？期待回复！\n"
+            "我想要一份你的简历，你是否同意？"
+        ), "LP101 平台「向TA索要」系统文案（2026-10-07 实测定稿）"
+        checks.append("LP101 向TA索要（原生问候+简历请求）→ awaiting_resume；前置评分 82")
         for lid, st in (("LP102", "rejected_hard"), ("LP103", "rejected_llm")):
             jcx = _jc(lid)
             assert jcx["status"] == st, f"{lid} 应为 {st}，实际 {jcx['status']}"
