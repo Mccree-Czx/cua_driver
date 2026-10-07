@@ -1099,9 +1099,31 @@ class CuaLiepinDriver:
         state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
         btn = self._find(state, role="AXButton", label="向TA索要")
         if btn is None:
-            raise LocatorFailedError(
-                f"预览页无「向TA索要」按钮（编号 {candidate_liepin_id}，可能无附件简历）"
-            )
+            # 2026-10-07 晚实盘：无附件简历的候选人预览页无「向TA索要」按钮——
+            # 降级「立即沟通」（平台固定招呼，无索要能力）；两者都缺才失败
+            fallback = self._find(state, role="AXButton", label="立即沟通")
+            if fallback is None:
+                raise LocatorFailedError(
+                    f"预览页无「向TA索要」也无「立即沟通」（编号 {candidate_liepin_id}）"
+                )
+            fb_center = self._element_center(fallback)
+            if fb_center is not None:
+                self._click_point(pid, wid, *fb_center)
+            else:
+                self._press(pid, wid, fallback)
+            time.sleep(self.SETTLE_SECONDS + 1.0)
+            state = self._live_state(pid, wid)
+            tree = str(getattr(state, "tree_markdown", "") or "")
+            if "已向候选人发送消息" not in tree and "你好~我这里有个职位" not in tree:
+                raise LocatorFailedError(
+                    f"「立即沟通」降级后未见发送成功状态（编号 {candidate_liepin_id}）"
+                )
+            try:
+                self._reload_page(pid, wid)
+                time.sleep(self.SETTLE_SECONDS)
+            except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
+                pass
+            return
         center = self._element_center(btn)
         if center is not None:
             self._click_point(pid, wid, *center)
@@ -1256,29 +1278,40 @@ class CuaLiepinDriver:
     def _recommended_preview_by_id(
         self, pid: int, wid: int, candidate_liepin_id: str, *, max_scan: int = 10
     ) -> Any:
-        """推荐人回退定位：扫推荐列表（上限 max_scan 卡）逐卡开预览对「简历编号」。
+        """推荐人回退定位：扫推荐列表逐卡开预览对「简历编号」。
 
         2026-10-07 校准：推荐卡无编号直读，点姓名→#preview 详情含编号；命中返回
         预览 state（不关闭，由调用方读字段）；未命中关预览继续；全扫不到抛错。
+        2026-10-07 晚加固：列表轮换快/深卡在视口外——首屏扫完未命中则 PageDown
+        翻页（最多 3 次，总点击受 max_scan 上限）。
         """
         self._goto_recommend(pid, wid)
-        state = self._live_state(pid, wid)
-        cards = self._recommend_cards(state)
         scanned = 0
-        for _, center in cards[: max(1, int(max_scan))]:
-            if center is None:
-                continue
-            scanned += 1
-            self._click_point(pid, wid, *center)
-            time.sleep(self.SETTLE_SECONDS)
+        cap = max(1, int(max_scan))
+        for page in range(4):  # 首屏 + 最多 3 次翻页
             state = self._live_state(pid, wid)
-            if "#preview" not in self._current_url(state):
-                continue  # 该卡未开预览：跳过（不猜测）
-            if self._detail_liepin_id(state) == candidate_liepin_id:
-                return state
-            self._preview_close(pid, wid)
+            cards = self._recommend_cards(state)
+            for _, center in cards:
+                if center is None or scanned >= cap:
+                    continue
+                scanned += 1
+                self._click_point(pid, wid, *center)
+                time.sleep(self.SETTLE_SECONDS)
+                state = self._live_state(pid, wid)
+                if "#preview" not in self._current_url(state):
+                    continue  # 该卡未开预览：跳过（不猜测）
+                if self._detail_liepin_id(state) == candidate_liepin_id:
+                    return state
+                self._preview_close(pid, wid)
+            if scanned >= cap or page == 3:
+                break
+            try:
+                self._press_key(pid, wid, "PageDown")
+                time.sleep(self.SETTLE_SECONDS)
+            except Exception:  # noqa: BLE001  # 翻页失败即止，按已扫结果抛错
+                break
         raise LocatorFailedError(
-            f"推荐人列表未找到简历编号 {candidate_liepin_id}（已扫 {scanned} 张卡）"
+            f"推荐人列表未找到简历编号 {candidate_liepin_id}（已扫 {scanned} 张卡，含翻页）"
         )
 
     def _read_recommended_fields(
