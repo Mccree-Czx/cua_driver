@@ -7,6 +7,9 @@
 装配方式（controller 裁定）：
 - 数据面隔离（2026-10-06 教训后改造）：专用测试库 hr_workbuddy_test + 独立 bucket
   hr-workbuddy-e2e + 独立 Redis 库号 /1；指向生产库时拒跑（除非 E2E_ALLOW_PROD=1）
+  Redis 用专用变量 E2E_REDIS_URL（默认 /1；指向 /0 拒跑）——2026-10-07 事故：
+  环境残留 REDIS_URL 会把 E2E 任务送进生产库号，常驻 real worker 误执行。
+  常驻 launchd agent（pipeline/screening/worker/scheduler）在线时拒跑，提示先下线。
 - 数据底座复用 compose 栈（MySQL/MinIO/Redis；未起则 docker compose up -d --wait）
 - pipeline：真实 uvicorn 子进程（127.0.0.1:8000，启动即 alembic upgrade head）
 - screening：tests/e2e/fake_screening.py 假服务（127.0.0.1:8001，按
@@ -85,7 +88,15 @@ if _DB_NAME == "hr_workbuddy" and os.environ.get("E2E_ALLOW_PROD") != "1":
         "拒绝运行：E2E 指向生产库 hr_workbuddy（E2E reset 会清数据）。"
         "确需对生产库跑请显式 E2E_ALLOW_PROD=1（并先做 MySQL/MinIO 快照）。"
     )
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/1")  # E2E 独立 Redis 库号
+# 2026-10-07 加固：E2E 专用变量（勿复用通用 REDIS_URL）——环境残留值（如 shell 导出
+# 的 REDIS_URL=redis://localhost:6379，即 /0）会把 E2E 任务送进生产库号，常驻 real
+# worker 会抢走并真实模式误执行（当日事故）。
+REDIS_URL = os.environ.get("E2E_REDIS_URL", "redis://127.0.0.1:6379/1")
+if urlparse(REDIS_URL).path.lstrip("/") in ("", "0") and os.environ.get("E2E_ALLOW_PROD") != "1":
+    raise SystemExit(
+        "拒绝运行：E2E 指向生产 Redis 库号（/0）——常驻 real worker 会抢任务。"
+        "请用 E2E_REDIS_URL 指定测试库（默认 /1）；确需对生产库跑请显式 E2E_ALLOW_PROD=1。"
+    )
 PIPELINE_URL = os.environ.get("PIPELINE_URL", "http://127.0.0.1:8000")
 SCREENING_URL = os.environ.get("SCREENING_URL", "http://127.0.0.1:8001")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "127.0.0.1:9000")
@@ -931,6 +942,41 @@ def scenario_d(log_dir: Path) -> ScenarioReport:
 # —— 总装：一条命令跑全部 ——
 
 
+LAUNCHD_AGENTS = (
+    "com.hr-workbuddy.pipeline",
+    "com.hr-workbuddy.screening",
+    "com.hr-workbuddy.worker",
+    "com.hr-workbuddy.scheduler",
+)
+
+
+def ensure_no_launchd_agents() -> None:
+    """E2E 前置：常驻 launchd agent 必须全部下线（尤其 worker/scheduler）——
+    2026-10-07 事故：环境残留导致 E2E 任务与常驻 real worker 共享队列，后者
+    以真实模式误执行（幸而猎聘窗口不可达、零账户操作）。跑完再 bootstrap 恢复。
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:  # noqa: BLE001  # 非 macOS / 无 launchctl：跳过
+        return
+    loaded = [a for a in LAUNCHD_AGENTS if a in out]
+    if loaded:
+        bootouts = "\n".join(
+            f"  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/{a}.plist"
+            for a in loaded
+        )
+        bootins = "\n".join(
+            f"  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{a}.plist"
+            for a in loaded
+        )
+        raise SystemExit(
+            f"检测到常驻 agent 在运行：{', '.join(loaded)}\n"
+            f"请先下线再跑 E2E（跑完恢复）：\n{bootouts}\n恢复：\n{bootins}"
+        )
+
+
 def run_e2e() -> E2EReport:
     """一条命令跑全部：compose 复用 → 建 E2E 专用库/bucket（生产隔离）→ 起 pipeline / 假
     screening 子进程 → 剧本 A → 剧本 B → 剧本 C → 剧本 D → finally 杀干净全部子进程。
@@ -940,6 +986,7 @@ def run_e2e() -> E2EReport:
     _PROCS = []
     scenarios: list[ScenarioReport] = []
     try:
+        ensure_no_launchd_agents()  # 常驻 agent 下线前置（2026-10-07 竞态事故加固）
         ensure_compose()
         ensure_test_database()  # E2E 专用库（生产隔离）
         ensure_test_bucket()  # E2E 专用 bucket（生产隔离）

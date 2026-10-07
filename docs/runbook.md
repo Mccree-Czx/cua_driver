@@ -321,3 +321,20 @@ uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑�
   `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
   跑完后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
 - 手动立跑一次备份：`DATABASE_URL=... MINIO_BUCKET=hr-workbuddy .venv/bin/python scripts/backup.py`
+
+## 五号事件：E2E 隔离竞态（2026-10-07 13:45，同日修复）
+
+- **现象**：跑 E2E 时卡在剧本 A（LP001 未达 resume_received）；排查发现 E2E 全量任务
+  实际落在 **Redis /0**——shell 环境残留 `REDIS_URL=redis://localhost:6379`（无库号=
+  /0）被脚本 `os.environ.get("REDIS_URL")` 拾取；**常驻 real worker（/0）抢到
+  E2E 的 download 任务，以真实模式试跑 3 次**（均因猎聘窗口不可达失败，**零账户操作**）
+- **修复（脚本层硬件门禁，已提交）**：
+  1. E2E 改用专用变量 `E2E_REDIS_URL`（默认 /1）；解析库号，**指向 /0 直接拒跑**
+  2. 新增前置 `ensure_no_launchd_agents()`：pipeline/screening/worker/scheduler
+     任一常驻在线即拒跑并打印 bootout/bootstrap 命令
+  3. 事故残局清理：/0 队列与派发键已清、常驻 worker 已重启（内存重试态清零）
+- **E2E 标准流程（更新）**：先下线常驻三件 → 跑 E2E → 恢复三件：
+  `for s in pipeline screening worker; do launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.$s.plist; done`
+  （跑完 bootstrap 同队列；备份 job 无需下线）
+- **纪律附录**：任何脚本/终端会话不得导出 `REDIS_URL`/`DATABASE_URL` 等生产变量；
+  E2E 只经专用变量注入
