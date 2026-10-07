@@ -117,7 +117,9 @@ class FakeLiepinDriver:
         self._conversation(candidate_liepin_id)  # 未知 id 抛错
         self.opened.add(candidate_liepin_id)
 
-    def read_online_resume(self, candidate_liepin_id: str) -> tuple[bytes, MinimalResume]:
+    def read_online_resume(
+        self, candidate_liepin_id: str, *, prefer_recommend: bool = False
+    ) -> tuple[bytes, MinimalResume]:
         conv = self._conversation(candidate_liepin_id)
         if conv.resume_fixture is None:
             raise NoResumeFixtureError(

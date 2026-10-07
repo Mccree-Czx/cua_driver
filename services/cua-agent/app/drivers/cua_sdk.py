@@ -152,6 +152,7 @@ class CuaLiepinDriver:
     CHAT_PATH = "lpt.liepin.com/chat"  # 聊天页 URL 片段（实测 /chat/im）
     BATCH_PATH = "resume/showbatchresumelist"  # 批量预览简历页 URL 片段
     RECOMMEND_PATH = "lpt.liepin.com/recommend"  # 推荐人页 URL 片段（M2 路径二）
+    RECOMMEND_ANCHOR = "系统推荐"  # 推荐列表区标题（卡片解析锚点 + 覆盖层自愈判据）
     SETTLE_SECONDS = 2.0  # SPA 页内切换/导航后的渲染等待（实测 1-2s）
     SCREENSHOT_PX_PER_POINT = 2.0  # 桌面截图像素:屏幕点比例（Retina 实测 2880px:1440pt；换环境需校准）
     ATTACHMENT_EXTS = (".pdf", ".doc", ".docx", ".zip")  # 附件简历文件扩展名
@@ -259,7 +260,12 @@ class CuaLiepinDriver:
                 continue
             try:
                 if not self._probe_liepin(pid, wid):
-                    continue
+                    # 2026-10-07：多标签窗口里猎聘常非活动标签（标题/URL 均探不到）
+                    # → 扫标签栏，命中猎聘标签则切页后再探一次
+                    if not self._activate_liepin_tab(pid, wid):
+                        continue
+                    if not self._probe_liepin(pid, wid):
+                        continue
                 st = self.window_state(pid, wid)
             except Exception:
                 continue
@@ -903,26 +909,61 @@ class CuaLiepinDriver:
                 f"{result.stderr.strip()[:160]}"
             )
 
+    def _activate_liepin_tab(self, pid: int, wid: int) -> bool:
+        """扫标签栏找猎聘标签并点击激活；命中 True（找不到 False，不抛错）。
+
+        （2026-10-07 实测：多标签窗口里猎聘常非活动标签，标题/URL 均探不到。）
+        """
+        try:
+            st = self.window_state(pid, wid)
+        except Exception:  # noqa: BLE001  # 读窗失败按未命中
+            return False
+        for e in list(getattr(st, "elements", []) or []):
+            if str(getattr(e, "role", "")) != "AXRadioButton":
+                continue
+            label = str(getattr(e, "label", "") or "")
+            if any(mark in label for mark in ("推荐人才", "猎聘", "lpt.liepin")):
+                center = self._element_center(e)
+                if center is None:
+                    continue
+                self._click_point(pid, wid, *center)
+                time.sleep(self.SETTLE_SECONDS)
+                return True
+        return False
+
+    def _focus_liepin_tab(self, pid: int, wid: int) -> Any:
+        """把猎聘标签页切到前台（2026-10-07 实测：多标签窗口里猎聘常非首标签，
+        Cmd+1 会切错页）→ 按标签栏标题匹配点击；无匹配才回退 Cmd+1。"""
+        if not self._activate_liepin_tab(pid, wid):
+            self._hotkey_tab_1()  # 兜底：无匹配标签（单标签窗口等）
+            time.sleep(self.SETTLE_SECONDS)
+        return self._live_state(pid, wid)
+
     def _goto_recommend(self, pid: int, wid: int) -> Any:
-        """确保停在推荐列表页（已在→直接用；残留 #preview 先自愈关闭；否则 Cmd+1 → 点侧栏）。"""
+        """确保停在推荐列表页（已在→校验列表在树；残留预览/覆盖层自愈；否则 Cmd+1 → 点侧栏）。"""
         state = self._live_state(pid, wid)
         if "#preview" in self._current_url(state):
             self._preview_close(pid, wid)  # 残留预览自愈（上一任务中断场景，2026-10-07）
             state = self._live_state(pid, wid)
-        if self.RECOMMEND_PATH in self._current_url(state):
-            return state
-        if self.CHAT_PATH not in self._current_url(state):
-            self._hotkey_tab_1()
-            time.sleep(self.SETTLE_SECONDS)
-            state = self._live_state(pid, wid)
         if self.RECOMMEND_PATH not in self._current_url(state):
-            nav = self._find(state, role="AXLink", label="人才推荐")
-            center = self._element_center(nav) if nav is not None else None
-            if center is None:
-                raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
-            self._click_point(pid, wid, *center)
-            time.sleep(self.SETTLE_SECONDS)
-            state = self._live_state(pid, wid)
+            if self.CHAT_PATH not in self._current_url(state):
+                state = self._focus_liepin_tab(pid, wid)
+            if self.RECOMMEND_PATH not in self._current_url(state):
+                nav = self._find(state, role="AXLink", label="人才推荐")
+                center = self._element_center(nav) if nav is not None else None
+                if center is None:
+                    raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
+                self._click_point(pid, wid, *center)
+                time.sleep(self.SETTLE_SECONDS)
+                state = self._live_state(pid, wid)
+        # 覆盖层自愈（2026-10-07 实测：聊天面板会遮挡列表且 ✕ 无标签）→ 整页重载一次
+        if self.RECOMMEND_ANCHOR not in str(getattr(state, "tree_markdown", "") or ""):
+            try:
+                self._reload_page(pid, wid)
+                time.sleep(self.SETTLE_SECONDS + 1.0)
+                state = self._live_state(pid, wid)
+            except Exception:  # noqa: BLE001  # 重载失败按原状态继续校验
+                pass
         if self.RECOMMEND_PATH not in self._current_url(state):
             raise LocatorFailedError(f"未到达推荐页（URL={self._current_url(state)[:120]}）")
         return state
@@ -936,7 +977,7 @@ class CuaLiepinDriver:
         els = list(getattr(state, "elements", []) or [])
         start = 0
         for pos, e in enumerate(els):
-            if str(getattr(e, "label", "") or "") == "系统推荐":
+            if str(getattr(e, "label", "") or "") == self.RECOMMEND_ANCHOR:
                 start = pos
                 break
         cards: list[tuple[str, tuple[float, float] | None]] = []
@@ -1059,13 +1100,12 @@ class CuaLiepinDriver:
             raise LocatorFailedError(
                 f"「向TA索要」后未见请求已发状态（编号 {candidate_liepin_id}，页面结构可能变化）"
             )
-        close = self._find(state, role="AXButton", label="Close")
-        if close is not None:
-            try:
-                self._press(pid, wid, close)
-                time.sleep(0.8)
-            except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
-                pass
+        # 收尾：整页重载——发送后覆盖层/预览一律清除（2026-10-07 实测：✕ 无标签，重载最可靠）
+        try:
+            self._reload_page(pid, wid)
+            time.sleep(self.SETTLE_SECONDS)
+        except Exception:  # noqa: BLE001  # 收尾失败不影响已发送事实
+            pass
 
     def send_message(self, candidate_liepin_id: str, text: str) -> None:
         """④ 发送消息（唯一触达动作；一人一消息约束由调用方/pipeline 保证）。
@@ -1227,7 +1267,22 @@ class CuaLiepinDriver:
             f"推荐人列表未找到简历编号 {candidate_liepin_id}（已扫 {scanned} 张卡）"
         )
 
-    def read_online_resume(self, candidate_liepin_id: str) -> tuple[bytes, MinimalResume]:
+    def _read_recommended_fields(
+        self, pid: int, wid: int, candidate_liepin_id: str
+    ) -> tuple[Any, str, str]:
+        """推荐人读取：预览页定位 + 姓名/摘要提取（prefer 直连与批量回退共用）。"""
+        state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
+        name = self._preview_name(state)
+        summary = self._preview_summary(state)
+        if not name:
+            raise LocatorFailedError(
+                f"推荐人预览页未取到姓名（编号 {candidate_liepin_id}，页面结构可能变化）"
+            )
+        return state, name, summary
+
+    def read_online_resume(
+        self, candidate_liepin_id: str, *, prefer_recommend: bool = False
+    ) -> tuple[bytes, MinimalResume]:
         """③ 读在线简历：批量页定位（推荐人回退推荐页预览）→ 提取 7 字段 + 桌面截图。
 
         主路径：聊天页 →「浏览简历」→ 批量预览简历页 → 逐选项卡 AXPress → 读
@@ -1239,20 +1294,23 @@ class CuaLiepinDriver:
         experience_summary 可缺失落空串；错误信息携带状态供人工/视觉复核。
         """
         pid, wid = self._ensure_visible_and_resolved()
-        try:
-            state, name = self._candidate_detail(pid, wid, candidate_liepin_id)
-            # 自我评价/个人优势栏目并非所有候选人都有（2026-10-06 实测：邵女士类
-            # 页面无 file-search 栏目）——缺失落空串，不作为失败；其余字段失败即停。
-            summary = self._value_after_icon(state, "file-search") or ""
-        except LocatorFailedError:
-            # M2 回退：批量页无此人（推荐人路径）→ 推荐页预览定位（含编号比对）
-            state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
-            name = self._preview_name(state)
-            summary = self._preview_summary(state)
-            if not name:
-                raise LocatorFailedError(
-                    f"推荐人预览页未取到姓名（编号 {candidate_liepin_id}，页面结构可能变化）"
-                ) from None
+        if prefer_recommend:
+            # 2026-10-07 风控教训：推荐人（outbound）不在批量页，直连推荐页读取——
+            # 批量页（旧 batch token）反复访问会触发「账号行为异常」安全验证（实证）
+            state, name, summary = self._read_recommended_fields(
+                pid, wid, candidate_liepin_id
+            )
+        else:
+            try:
+                state, name = self._candidate_detail(pid, wid, candidate_liepin_id)
+                # 自我评价/个人优势栏目并非所有候选人都有（2026-10-06 实测：邵女士类
+                # 页面无 file-search 栏目）——缺失落空串，不作为失败；其余字段失败即停。
+                summary = self._value_after_icon(state, "file-search") or ""
+            except LocatorFailedError:
+                # M2 回退：批量页无此人（推荐人路径）→ 推荐页预览定位（含编号比对）
+                state, name, summary = self._read_recommended_fields(
+                    pid, wid, candidate_liepin_id
+                )
         city = self._value_after_icon(state, "environment")
         years = self._value_after_icon(state, "work")
         edu_full = self._value_after_icon(state, "education")

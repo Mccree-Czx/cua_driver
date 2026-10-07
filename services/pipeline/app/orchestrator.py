@@ -606,7 +606,8 @@ def _handle_list_recommended_result(
                 job_id=dispatched.job_id,
                 job_candidate_id=jc.id,
                 candidate_liepin_id=liepin_id,
-                context={},
+                # source 提示驱动：推荐人 read 直连推荐页，不碰批量页（2026-10-07 风控教训）
+                context={"source": "recommended"},
             )
         )
     return pending

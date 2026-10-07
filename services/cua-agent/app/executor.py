@@ -192,7 +192,10 @@ _ACTIONS: dict[AtomicTaskType, ActionSpec] = {
         artifact=_none_artifact,
     ),
     AtomicTaskType.READ_RESUME: ActionSpec(
-        perform=lambda d, t: d.read_online_resume(_candidate_id(t)),
+        perform=lambda d, t: d.read_online_resume(
+            _candidate_id(t),
+            prefer_recommend=(t.context.get("source") == "recommended"),
+        ),
         screenshot=_resume_png,
         # T12 校准：（2026-10-06 真实页面）读简历收尾在批量预览简历页（候选人
         # 完整简历展示），非 T8 骨架设想的会话页——判据按实测页面语义描述。

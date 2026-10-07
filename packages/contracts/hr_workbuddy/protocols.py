@@ -24,9 +24,13 @@ class LiepinDriver(Protocol):
     def open_conversation(self, candidate_liepin_id: str) -> None: ...
 
     def read_online_resume(
-        self, candidate_liepin_id: str
+        self, candidate_liepin_id: str, *, prefer_recommend: bool = False
     ) -> tuple[bytes, MinimalResume]:
-        """返回 (PNG bytes 截图, 最小简历)。"""
+        """返回 (PNG bytes 截图, 最小简历)。
+
+        prefer_recommend=True：推荐人（outbound）直连推荐页读取，不碰批量页
+        （2026-10-07 风控实证：批量页旧 token 反复访问触发账号行为验证）。
+        """
 
     def send_message(self, candidate_liepin_id: str, text: str) -> None: ...
 
