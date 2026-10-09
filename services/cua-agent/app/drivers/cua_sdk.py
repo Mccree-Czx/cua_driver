@@ -47,7 +47,6 @@ import asyncio
 import concurrent.futures
 import json
 import re
-import subprocess
 import tempfile
 import threading
 import time
@@ -55,6 +54,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hr_workbuddy import MinimalResume
+
+from app.drivers.platform.base import PlatformAdapter, Role
+from app.drivers.platform.macos import MacOsAdapter
 
 _CARD_STATUS_RE = re.compile(r"^(在线|离线|.*活跃)$")  # 推荐卡状态词（头像后第 1 个文本）
 
@@ -126,35 +128,17 @@ class _RuntimeBridge:
 
 
 class CuaLiepinDriver:
-    """真实驱动。构造即初始化 SDK runtime（进程内 EMBEDDED 模式）。"""
+    """真实驱动。构造即初始化 SDK runtime（进程内 EMBEDDED 模式）与平台 adapter。"""
 
-    # 窗口定位候补（list_windows 的 app_name / title 匹配）
-    BROWSER_APPS = (
-        "Google Chrome",
-        "Safari",
-        "Microsoft Edge",
-        "Arc",
-        "Chromium",
-        "Firefox",
-    )
     LIEPIN_TITLE_MARKERS = ("猎聘", "liepin")  # 快速通道；实测 tab 标题可能是业务名
-    URL_MARKER = "liepin.com"  # 权威判据：AX 树的地址栏值
+    URL_MARKER = "liepin.com"  # 权威判据：地址栏值
     BACKEND_MARKERS = ("人才推荐", "搜索人才", "职位管理", "招聘工作台")  # 已登录后台导航锚点
     LOGIN_PAGE_MARKERS = ("扫码登录", "密码登录", "短信登录", "验证码登录")  # 登录页锚点
-    BROWSER_BUNDLE_IDS = {  # open -b 激活用；跨 Space 唤起浏览器
-        "Google Chrome": "com.google.Chrome",
-        "Safari": "com.apple.Safari",
-        "Microsoft Edge": "com.microsoft.edgemac",
-        "Arc": "company.thebrowser.Browser",
-        "Chromium": "org.chromium.Chromium",
-        "Firefox": "org.mozilla.firefox",
-    }
     CHAT_PATH = "lpt.liepin.com/chat"  # 聊天页 URL 片段（实测 /chat/im）
     BATCH_PATH = "resume/showbatchresumelist"  # 批量预览简历页 URL 片段
     RECOMMEND_PATH = "lpt.liepin.com/recommend"  # 推荐人页 URL 片段（M2 路径二）
     RECOMMEND_ANCHOR = "系统推荐"  # 推荐列表区标题（卡片解析锚点 + 覆盖层自愈判据）
     SETTLE_SECONDS = 2.0  # SPA 页内切换/导航后的渲染等待（实测 1-2s）
-    SCREENSHOT_PX_PER_POINT = 2.0  # 桌面截图像素:屏幕点比例（Retina 实测 2880px:1440pt；换环境需校准）
     ATTACHMENT_EXTS = (".pdf", ".doc", ".docx", ".zip")  # 附件简历文件扩展名
 
     def __init__(self) -> None:
@@ -166,6 +150,8 @@ class CuaLiepinDriver:
             ) from e
         self._bridge = _RuntimeBridge()
         self._driver: Any = self._bridge.call(CuaDriver.create)
+        # 阶段 1 先硬编码 macOS；Task 5 换成 create_adapter() 按平台分发
+        self._plat: PlatformAdapter = MacOsAdapter(self._bridge, self._driver)
         self._session_started = False
         self._window_cache: tuple[int, int] | None = None  # 猎聘窗口 (pid, window_id) 缓存
 
@@ -237,7 +223,7 @@ class CuaLiepinDriver:
         hit = self._scan_liepin()
         if hit is None:
             # 全部探测失败（典型：窗口被遮挡/在别的 Space，AX 冻结）→ 激活一次重试
-            self._activate_browser(0)
+            self._plat.activate(self._browser_windows_all(), 0)
             time.sleep(1.2)
             hit = self._scan_liepin()
         if hit is None:
@@ -247,7 +233,7 @@ class CuaLiepinDriver:
 
     def _scan_liepin(self) -> tuple[int, int, Any] | None:
         """扫描浏览器窗口找猎聘页（标题命中优先、在屏窗口优先；逐窗口 query 浅探）。"""
-        windows = self._browser_windows()
+        windows = self._plat.candidate_windows(self._browser_windows_all())
         windows.sort(
             key=lambda w: (
                 0 if self._title_matches(w) else 1,
@@ -272,17 +258,6 @@ class CuaLiepinDriver:
             return pid, wid, st
         return None
 
-    def _browser_windows(self) -> list[Any]:
-        try:
-            out = self._bridge.run(self._list_windows_async())
-        except Exception:
-            return []
-        return [
-            w
-            for w in (getattr(out, "windows", []) or [])
-            if getattr(w, "app_name", "") in self.BROWSER_APPS
-        ]
-
     # —— 窗口可见性（T12 实测：遮挡下 Chrome 冻结渲染，读取/操作前必须确保可见）——
 
     def ensure_visible(self, pid: int, window_id: int, *, attempts: int = 3) -> None:
@@ -293,9 +268,10 @@ class CuaLiepinDriver:
         attempts 次仍不可见则抛错（调用方按失败处理）。
         """
         for index in range(attempts):
-            if self._is_window_on_screen(pid, window_id):
+            windows = self._browser_windows_all()
+            if self._plat.is_on_screen(windows, pid, window_id):
                 return
-            self._activate_browser(pid)
+            self._plat.activate(windows, pid)
             try:
                 self._bridge.run(
                     self._driver.call_tool(
@@ -305,47 +281,14 @@ class CuaLiepinDriver:
                 )
             except Exception:
                 pass
-            if not self._is_window_on_screen(pid, window_id):
-                self._raise_via_window_menu(pid, window_id)
+            windows = self._browser_windows_all()
+            if not self._plat.is_on_screen(windows, pid, window_id):
+                self._plat.raise_window(windows, pid, window_id)
             time.sleep(1.5 if index == 0 else 1.0)
-        if not self._is_window_on_screen(pid, window_id):
+        if not self._plat.is_on_screen(self._browser_windows_all(), pid, window_id):
             raise RuntimeError(
                 f"窗口 {window_id}（pid {pid}）无法置于可见桌面：多 Space 遮挡或窗口已消失"
             )
-
-    def _raise_via_window_menu(self, pid: int, window_id: int) -> bool:
-        """跨 Space 精确前置：经「窗口」菜单 makeKeyAndOrderFront（实测配方）。
-
-        需要先激活应用且存在一个在屏窗口作为菜单上下文；失败返回 False。
-        """
-        title = ""
-        context_wid = None
-        for w in self._browser_windows_all():
-            if getattr(w, "pid", None) != pid:
-                continue
-            if getattr(w, "window_id", None) == window_id:
-                title = str(getattr(w, "title", "") or "").strip()
-            elif getattr(w, "is_on_screen", False) and context_wid is None:
-                context_wid = getattr(w, "window_id", None)
-        if not title or context_wid is None:
-            return False
-        try:
-            self._bridge.run(
-                self._driver.call_tool(
-                    "invoke_menu",
-                    json.dumps({"pid": pid, "window_id": context_wid, "path": ["窗口", title]}),
-                )
-            )
-        except Exception:
-            return False
-        time.sleep(1.5)
-        return self._is_window_on_screen(pid, window_id)
-
-    def _is_window_on_screen(self, pid: int, window_id: int) -> bool:
-        for w in self._browser_windows_all():
-            if getattr(w, "pid", None) == pid and getattr(w, "window_id", None) == window_id:
-                return bool(getattr(w, "is_on_screen", False))
-        return False
 
     def _browser_windows_all(self) -> list[Any]:
         """全部窗口（不限浏览器应用；用于按 pid/wid 精确查询）。"""
@@ -354,23 +297,6 @@ class CuaLiepinDriver:
         except Exception:
             return []
         return list(getattr(out, "windows", []) or [])
-
-    def _activate_browser(self, pid: int) -> None:
-        """激活浏览器应用（open -b <bundle>；跨 Space 有效，已激活时幂等）。"""
-        bundle = "com.google.Chrome"
-        if pid:
-            for w in self._browser_windows_all():
-                if getattr(w, "pid", None) == pid:
-                    bundle = self.BROWSER_BUNDLE_IDS.get(
-                        str(getattr(w, "app_name", "")), bundle
-                    )
-                    break
-        try:
-            subprocess.run(
-                ["open", "-b", bundle], capture_output=True, check=False, timeout=10
-            )
-        except Exception:
-            pass
 
     def _title_matches(self, window: Any) -> bool:
         title = str(getattr(window, "title", "") or "").lower()
@@ -460,26 +386,24 @@ class CuaLiepinDriver:
         return state
 
     def _current_url(self, state: Any) -> str:
-        for e in (getattr(state, "elements", []) or []):
-            if getattr(e, "role", "") == "AXTextField" and "地址" in str(getattr(e, "label", "") or ""):
-                return str(getattr(e, "value", "") or "")
-        return ""
+        return self._plat.url_of(state)
 
     def _find(
         self,
         state: Any,
         *,
-        role: str | None = None,
+        role: Role | None = None,
         label: str | None = None,
         label_contains: str | None = None,
         max_index: int | None = None,
     ) -> Any | None:
-        """按 role/label 即时定位元素；max_index 仅作范围过滤（禁跨快照复用索引）。"""
+        """按语义角色/label 即时定位元素；max_index 仅作范围过滤（禁跨快照复用索引）。"""
+        want = self._plat.role_name(role) if role is not None else None
         for e in (getattr(state, "elements", []) or []):
             idx = getattr(e, "element_index", 0)
             if max_index is not None and idx >= max_index:
                 continue
-            if role is not None and str(getattr(e, "role", "")) != role:
+            if want is not None and str(getattr(e, "role", "")) != want:
                 continue
             lbl = str(getattr(e, "label", "") or "")
             if label is not None and lbl != label:
@@ -518,8 +442,10 @@ class CuaLiepinDriver:
         实测结构：选项卡是顶层 webarea 的直接子级静态文本，直到嵌套详情
         webarea（也是直接子级）出现为止；账户名「陈智旭」排除。
         """
+        web_area = self._plat.role_name(Role.WEB_AREA)
+        static_text = self._plat.role_name(Role.TEXT)
         els = list(getattr(state, "elements", []) or [])
-        top = next((e for e in els if str(getattr(e, "role", "")) == "AXWebArea"), None)
+        top = next((e for e in els if str(getattr(e, "role", "")) == web_area), None)
         if top is None:
             return []
         names: list[str] = []
@@ -529,9 +455,9 @@ class CuaLiepinDriver:
             if getattr(e, "parent_index", None) != top.element_index:
                 continue
             role = str(getattr(e, "role", ""))
-            if role == "AXWebArea":
+            if role == web_area:
                 break  # 嵌套详情 webarea：选项卡区结束
-            if role != "AXStaticText":
+            if role != static_text:
                 continue
             lbl = str(getattr(e, "label", "") or "").strip()
             if not lbl or lbl == "陈智旭" or lbl in names:
@@ -541,9 +467,11 @@ class CuaLiepinDriver:
 
     def _press_tab(self, pid: int, wid: int, name: str) -> Any:
         """按名字即时定位并点击候选人选项卡，返回切换后的最新 state。"""
+        web_area = self._plat.role_name(Role.WEB_AREA)
+        static_text = self._plat.role_name(Role.TEXT)
         state = self._live_state(pid, wid)
         els = list(getattr(state, "elements", []) or [])
-        top = next((e for e in els if str(getattr(e, "role", "")) == "AXWebArea"), None)
+        top = next((e for e in els if str(getattr(e, "role", "")) == web_area), None)
         tab = None
         if top is not None:
             for e in els:
@@ -551,10 +479,10 @@ class CuaLiepinDriver:
                     continue
                 if getattr(e, "parent_index", None) != top.element_index:
                     continue
-                if str(getattr(e, "role", "")) == "AXWebArea":
+                if str(getattr(e, "role", "")) == web_area:
                     break
                 if (
-                    str(getattr(e, "role", "")) == "AXStaticText"
+                    str(getattr(e, "role", "")) == static_text
                     and str(getattr(e, "label", "") or "").strip() == name
                 ):
                     tab = e
@@ -578,11 +506,13 @@ class CuaLiepinDriver:
 
     def _value_after_icon(self, state: Any, icon: str) -> str | None:
         """字段图标锚点（environment/work/education/file-search）后的首个文本值。"""
+        image = self._plat.role_name(Role.IMAGE)
+        static_text = self._plat.role_name(Role.TEXT)
         els = list(getattr(state, "elements", []) or [])
         for pos, e in enumerate(els):
-            if str(getattr(e, "role", "")) == "AXImage" and str(getattr(e, "label", "") or "") == icon:
+            if str(getattr(e, "role", "")) == image and str(getattr(e, "label", "") or "") == icon:
                 for nxt in els[pos + 1:pos + 4]:
-                    if str(getattr(nxt, "role", "")) == "AXStaticText":
+                    if str(getattr(nxt, "role", "")) == static_text:
                         t = str(getattr(nxt, "label", "") or "").strip()
                         if t:
                             return t
@@ -645,7 +575,7 @@ class CuaLiepinDriver:
     def _reload_page(self, pid: int, wid: int) -> None:
         """重载当前页（懒渲染自愈：面板滚动/切换后部分区块不再进 AX 缓存）。"""
         state = self._live_state(pid, wid)
-        btn = self._find(state, role="AXButton", label="重新加载")
+        btn = self._find(state, role=Role.BUTTON, label="重新加载")
         if btn is not None:
             self._press(pid, wid, btn)
         time.sleep(1.0)
@@ -654,7 +584,7 @@ class CuaLiepinDriver:
         """切回「在线沟通」标签页（消息列表页）——list_unread 收尾语义：
         worker 后置校验判据=「消息列表页已打开，可见未读会话列表」（实测）。"""
         state = self._live_state(pid, wid)
-        tab = self._find(state, role="AXRadioButton", label="在线沟通")
+        tab = self._find(state, role=Role.RADIO, label="在线沟通")
         if tab is None:
             raise LocatorFailedError("未找到「在线沟通」标签页（无法回到消息列表页）")
         self._press(pid, wid, tab)
@@ -665,9 +595,10 @@ class CuaLiepinDriver:
 
     def _attachment_filename(self, state: Any) -> str | None:
         """详情附件文件名（取带附件扩展名的最靠后静态文本=详情区条目）。"""
+        static_text = self._plat.role_name(Role.TEXT)
         name = None
         for e in (getattr(state, "elements", []) or []):
-            if str(getattr(e, "role", "")) != "AXStaticText":
+            if str(getattr(e, "role", "")) != static_text:
                 continue
             lbl = str(getattr(e, "label", "") or "").strip()
             if lbl.lower().endswith(self.ATTACHMENT_EXTS):
@@ -676,7 +607,7 @@ class CuaLiepinDriver:
 
     def _download_button(self, state: Any) -> Any | None:
         """附件区「下载」按钮（AXButton label=下载，实测位于附件文件名旁）。"""
-        return self._find(state, role="AXButton", label="下载")
+        return self._find(state, role=Role.BUTTON, label="下载")
 
     def _reach_batch_page(self, pid: int, wid: int) -> Any:
         """确保位于批量预览简历页：已有批量标签页优先切回；否则经聊天页→「浏览简历」。
@@ -690,7 +621,7 @@ class CuaLiepinDriver:
         url = self._current_url(state)
         if self.BATCH_PATH in url:
             return state
-        batch_tab = self._find(state, role="AXRadioButton", label="批量预览简历")
+        batch_tab = self._find(state, role=Role.RADIO, label="批量预览简历")
         if batch_tab is not None:
             self._press(pid, wid, batch_tab)
             time.sleep(self.SETTLE_SECONDS)
@@ -699,7 +630,7 @@ class CuaLiepinDriver:
                 return state
             url = self._current_url(state)
         if self.CHAT_PATH not in url:
-            nav = self._find(state, role="AXLink", label_contains="沟通")
+            nav = self._find(state, role=Role.LINK, label_contains="沟通")
             if nav is None:
                 raise LocatorFailedError(f"不在聊天/批量页且未找到「沟通」导航（URL={url[:120]}）")
             self._press(pid, wid, nav)
@@ -710,7 +641,7 @@ class CuaLiepinDriver:
                 raise LocatorFailedError(f"点击「沟通」后未到达聊天页（URL={url[:120]}）")
         if self.BATCH_PATH in url:
             return state
-        btn = self._find(state, role="AXButton", label="浏览简历")
+        btn = self._find(state, role=Role.BUTTON, label="浏览简历")
         if btn is None:
             # T12 补丁（2026-10-06）：无批量标签页且「浏览简历」不可见——先点
             # 「收到简历」通知行露出消息面板（实测底部含「浏览简历」；即批量页
@@ -718,13 +649,13 @@ class CuaLiepinDriver:
             if not self._open_batch_notification(pid, wid, state):
                 raise LocatorFailedError("聊天页未找到「浏览简历」按钮（会话未选中或页面结构变化）")
             state = self._live_state(pid, wid)
-            btn = self._find(state, role="AXButton", label="浏览简历")
+            btn = self._find(state, role=Role.BUTTON, label="浏览简历")
         if btn is None:
             raise LocatorFailedError("点击通知行后仍未找到「浏览简历」按钮（页面结构变化？）")
         # 实测（2026-10-06）：「浏览简历」为批量动作——未勾选候选人时点击无效果；
         # 先勾底部「全部」复选框（AXCheckBox，与顶部同名筛选 AXRadioButton 区分；
         # value=1 已勾选则跳过，避免反选）。
-        check_all = self._find(state, role="AXCheckBox", label="全部")
+        check_all = self._find(state, role=Role.CHECKBOX, label="全部")
         if check_all is not None and str(getattr(check_all, "value", "0")) != "1":
             self._press(pid, wid, check_all)
             time.sleep(0.5)
@@ -744,9 +675,10 @@ class CuaLiepinDriver:
         Events 坐标点击；点击后面板底部出现「浏览简历」（批量页入口）。锚点=通知行
         预览文本「…人的简历」（唯一性高于标题「收到简历」）。
         """
+        static_text = self._plat.role_name(Role.TEXT)
         row = None
         for e in getattr(state, "elements", []) or []:
-            if str(getattr(e, "role", "")) != "AXStaticText":
+            if str(getattr(e, "role", "")) != static_text:
                 continue
             lbl = str(getattr(e, "label", "") or "")
             if "人的简历" in lbl and getattr(e, "frame", None) is not None:
@@ -761,18 +693,11 @@ class CuaLiepinDriver:
         return True
 
     def _click_point(self, pid: int, wid: int, x: float, y: float) -> None:
-        """坐标点击（System Events；实测通道：无 AXPress 的列表行元素）。
+        """坐标点击（转交平台 adapter；实测通道：无 AXPress 的列表行元素）。
 
         前提：窗口可见（调用方 ensure_visible）且目标点在窗口内；失败即停。
         """
-        script = f'tell application "System Events" to click at {{{x:.0f}, {y:.0f}}}'
-        result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=15
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"坐标点击失败（osascript rc={result.returncode}）：{result.stderr.strip()[:200]}"
-            )
+        self._plat.click_point(pid, wid, x, y)
 
     def click_text_contains(self, text: str) -> bool:
         """LLM 兜底通道：按 label 包含定位元素并后台 AXPress；找不到返回 False。
@@ -802,8 +727,8 @@ class CuaLiepinDriver:
         if bounds is None:
             return False
         bx, by, bw, bh = bounds
-        x_pt = x_px / self.SCREENSHOT_PX_PER_POINT
-        y_pt = y_px / self.SCREENSHOT_PX_PER_POINT
+        x_pt = x_px / self._plat.screenshot_px_per_point
+        y_pt = y_px / self._plat.screenshot_px_per_point
         if not (bx <= x_pt <= bx + bw and by <= y_pt <= by + bh):
             return False
         self._click_point(pid, wid, x_pt, y_pt)
@@ -898,16 +823,15 @@ class CuaLiepinDriver:
         return None
 
     def _hotkey_tab_1(self) -> None:
-        """Cmd+1 切第 1 个标签（2026-10-07 实测：比坐标点页签可靠）。"""
-        script = 'tell application "System Events" to keystroke "1" using {command down}'
-        result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=15
-        )
-        if result.returncode != 0:
-            raise LocatorFailedError(
-                f"Cmd+1 切换标签失败（osascript rc={result.returncode}）："
-                f"{result.stderr.strip()[:160]}"
-            )
+        """切第 1 个标签（转交平台 adapter；2026-10-07 实测：比坐标点页签可靠）。
+
+        adapter 抛底层 RuntimeError；此处转 LocatorFailedError 以保持原语义
+        （读取链可走 LLM 视觉兜底一次）。
+        """
+        try:
+            self._plat.switch_to_first_tab()
+        except Exception as e:  # noqa: BLE001 - 保持原 LocatorFailedError 语义
+            raise LocatorFailedError(f"切换标签失败：{e}") from e
 
     def _activate_liepin_tab(self, pid: int, wid: int) -> bool:
         """扫标签栏找猎聘标签并点击激活；命中 True（找不到 False，不抛错）。
@@ -918,8 +842,9 @@ class CuaLiepinDriver:
             st = self.window_state(pid, wid)
         except Exception:  # noqa: BLE001  # 读窗失败按未命中
             return False
+        radio = self._plat.role_name(Role.RADIO)
         for e in list(getattr(st, "elements", []) or []):
-            if str(getattr(e, "role", "")) != "AXRadioButton":
+            if str(getattr(e, "role", "")) != radio:
                 continue
             label = str(getattr(e, "label", "") or "")
             # 猎聘标签标题随业务页变化（推荐人才/职位管理/意向人选/沟通/搜索人才…）
@@ -963,7 +888,7 @@ class CuaLiepinDriver:
             if self.CHAT_PATH not in self._current_url(state):
                 state = self._focus_liepin_tab(pid, wid)
             if self.RECOMMEND_PATH not in self._current_url(state):
-                nav = self._find(state, role="AXLink", label="人才推荐")
+                nav = self._find(state, role=Role.LINK, label="人才推荐")
                 center = self._element_center(nav) if nav is not None else None
                 if center is None:
                     raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
@@ -994,17 +919,19 @@ class CuaLiepinDriver:
             if str(getattr(e, "label", "") or "") == self.RECOMMEND_ANCHOR:
                 start = pos
                 break
+        image = self._plat.role_name(Role.IMAGE)
+        static_text = self._plat.role_name(Role.TEXT)
         cards: list[tuple[str, tuple[float, float] | None]] = []
         for pos in range(start, len(els)):
             e = els[pos]
             if (
-                str(getattr(e, "role", "")) != "AXImage"
+                str(getattr(e, "role", "")) != image
                 or str(getattr(e, "label", "") or "") != "头像"
             ):
                 continue
             texts: list[Any] = []
             for nxt in els[pos + 1 : pos + 6]:
-                if str(getattr(nxt, "role", "")) == "AXStaticText" and str(
+                if str(getattr(nxt, "role", "")) == static_text and str(
                     getattr(nxt, "label", "") or ""
                 ).strip():
                     texts.append(nxt)
@@ -1026,9 +953,9 @@ class CuaLiepinDriver:
             if "#preview" not in self._current_url(state):
                 return
             el = (
-                self._find(state, role="AXImage", label="close")
+                self._find(state, role=Role.IMAGE, label="close")
                 if attempt == 0
-                else self._find(state, role="AXButton", label="返回")
+                else self._find(state, role=Role.BUTTON, label="返回")
             )
             center = self._element_center(el) if el is not None else None
             if center is None:
@@ -1097,11 +1024,11 @@ class CuaLiepinDriver:
         """
         pid, wid = self._ensure_visible_and_resolved()
         state = self._recommended_preview_by_id(pid, wid, candidate_liepin_id)
-        btn = self._find(state, role="AXButton", label="向TA索要")
+        btn = self._find(state, role=Role.BUTTON, label="向TA索要")
         if btn is None:
             # 2026-10-07 晚实盘：无附件简历的候选人预览页无「向TA索要」按钮——
             # 降级「立即沟通」（平台固定招呼，无索要能力）；两者都缺才失败
-            fallback = self._find(state, role="AXButton", label="立即沟通")
+            fallback = self._find(state, role=Role.BUTTON, label="立即沟通")
             if fallback is None:
                 raise LocatorFailedError(
                     f"预览页无「向TA索要」也无「立即沟通」（编号 {candidate_liepin_id}）"
@@ -1157,19 +1084,19 @@ class CuaLiepinDriver:
 
     def _open_chat_overlay(self, pid: int, wid: int, state: Any, name: str) -> None:
         """在候选人详情页点「继续沟通」打开聊天浮层，并做身份锚点校验。"""
-        btn = self._find(state, role="AXButton", label_contains="继续沟通")
+        btn = self._find(state, role=Role.BUTTON, label_contains="继续沟通")
         if btn is None:
             raise RuntimeError("候选人详情未找到「继续沟通」按钮（页面结构变化？）")
         self._press(pid, wid, btn)
         time.sleep(self.SETTLE_SECONDS)
         state = self._live_state(pid, wid)
-        if self._find(state, role="AXStaticText", label=f"{name}的简历") is None:
+        if self._find(state, role=Role.TEXT, label=f"{name}的简历") is None:
             raise RuntimeError(f"聊天浮层身份校验失败：未找到「{name}的简历」锚点（拒绝发送）")
 
     def _fill_and_send(self, pid: int, wid: int, text: str) -> None:
         """清空 → 输入（读回校验）→ 发送 → 上屏校验；失败即停、绝不盲目重发。"""
         state = self._live_state(pid, wid)
-        box = self._find(state, role="AXTextArea")
+        box = self._find(state, role=Role.TEXT_AREA)
         if box is None:
             raise RuntimeError("聊天浮层未找到输入框（页面结构变化？）")
         self._press(pid, wid, box)
@@ -1183,20 +1110,20 @@ class CuaLiepinDriver:
             self._type_text(pid, wid, box, text)
             time.sleep(0.8)
             state = self._live_state(pid, wid)
-            cur = self._find(state, role="AXTextArea")
+            cur = self._find(state, role=Role.TEXT_AREA)
             actual = str(getattr(cur, "value", "") or "") if cur is not None else ""
             if actual == text:
                 break
             box = cur if cur is not None else box
         if actual != text:
             raise RuntimeError(f"输入校验失败：期望 {text!r}（拒绝发送）")
-        send_btn = self._find(state, role="AXButton", label="发送")
+        send_btn = self._find(state, role=Role.BUTTON, label="发送")
         if send_btn is None:
             raise RuntimeError("未找到「发送」按钮（页面结构变化？）")
         self._press(pid, wid, send_btn)
         time.sleep(self.SETTLE_SECONDS)
         state = self._live_state(pid, wid)
-        if self._find(state, role="AXStaticText", label=text) is None:
+        if self._find(state, role=Role.TEXT, label=text) is None:
             raise RuntimeError("发送后未确认消息上屏——消息可能已发出，禁止重试，请人工/账目核对")
 
     def _press_key(
@@ -1245,11 +1172,12 @@ class CuaLiepinDriver:
 
     def _preview_name(self, state: Any) -> str:
         """推荐预览页姓名：「查看大图」之后首个非状态词文本（实测结构）。"""
+        static_text = self._plat.role_name(Role.TEXT)
         els = list(getattr(state, "elements", []) or [])
         for pos, e in enumerate(els):
             if str(getattr(e, "label", "") or "") == "查看大图":
                 for nxt in els[pos + 1 : pos + 6]:
-                    if str(getattr(nxt, "role", "")) != "AXStaticText":
+                    if str(getattr(nxt, "role", "")) != static_text:
                         continue
                     t = str(getattr(nxt, "label", "") or "").strip()
                     if t and not _CARD_STATUS_RE.match(t):
@@ -1259,11 +1187,12 @@ class CuaLiepinDriver:
     def _preview_summary(self, state: Any) -> str:
         """推荐预览页经历摘要（预览无 file-search 栏目）：「工作经历」后首个长文本段；
         无则空串（与批量页 experience_summary 可选语义一致，2026-10-07 实测）。"""
+        static_text = self._plat.role_name(Role.TEXT)
         els = list(getattr(state, "elements", []) or [])
         for pos, e in enumerate(els):
             if str(getattr(e, "label", "") or "") == "工作经历":
                 for nxt in els[pos + 1 : pos + 30]:
-                    if str(getattr(nxt, "role", "")) != "AXStaticText":
+                    if str(getattr(nxt, "role", "")) != static_text:
                         continue
                     t = str(getattr(nxt, "label", "") or "").strip()
                     if len(t) >= 40 and not t.startswith("*"):

@@ -5,6 +5,7 @@ _element_center（M2 推荐人 read 回退路径的解析层）。"""
 from types import SimpleNamespace
 
 from app.drivers.cua_sdk import CuaLiepinDriver
+from app.drivers.platform.macos import MacOsAdapter
 
 
 def _el(role: str, label: str = "", frame=None) -> SimpleNamespace:
@@ -12,8 +13,13 @@ def _el(role: str, label: str = "", frame=None) -> SimpleNamespace:
 
 
 def _driver() -> CuaLiepinDriver:
-    """绕过 __init__（不初始化 SDK runtime）——仅测纯解析方法。"""
-    return CuaLiepinDriver.__new__(CuaLiepinDriver)
+    """绕过 __init__（不初始化 SDK runtime）——仅测纯解析方法。
+
+    注入 macOS adapter：解析方法按语义 Role 查平台角色名（2026-10-09 平台抽象后）。
+    """
+    driver = CuaLiepinDriver.__new__(CuaLiepinDriver)
+    driver._plat = MacOsAdapter()
+    return driver
 
 
 def test_preview_name_after_view_big_image():

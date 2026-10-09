@@ -45,7 +45,7 @@
 - Produces:
   - `Role`（`StrEnum`）：`TEXT` `BUTTON` `RADIO` `CHECKBOX` `IMAGE` `LINK` `TEXT_INPUT` `TEXT_AREA` `WEB_AREA`
   - `WindowRef`（`dataclass(frozen=True)`）：`pid: int`、`window_id: int`、`app_name: str`、`title: str`、`is_on_screen: bool`
-  - `PlatformAdapter`（`Protocol`）：`name: str`、`screenshot_px_per_point: float`、`candidate_windows(windows) -> list[WindowRef]`、`url_of(state) -> str`、`is_on_screen(windows, pid, window_id) -> bool`、`activate(windows, pid) -> None`、`raise_window(pid, window_id) -> bool`、`role_name(role: Role) -> str`、`web_area_roots(elements) -> list[Any]`、`click_point(pid, window_id, x, y) -> None`、`switch_to_first_tab() -> None`
+  - `PlatformAdapter`（`Protocol`）：`name: str`、`screenshot_px_per_point: float`、`candidate_windows(windows) -> list[WindowRef]`、`url_of(state) -> str`、`is_on_screen(windows, pid, window_id) -> bool`、`activate(windows, pid) -> None`、`raise_window(pid, window_id) -> bool`、`role_name(role: Role) -> str`、`click_point(pid, window_id, x, y) -> None`、`switch_to_first_tab() -> None`
   - `MACOS_ROLE_MAP: dict[Role, str]`、`WINDOWS_ROLE_MAP: dict[Role, str]`
 
 - [ ] **Step 1: 写失败测试**
