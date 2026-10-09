@@ -11,6 +11,30 @@ from typing import Any, Protocol, Sequence
 # 求职意向里的薪资格式（如 11-22k×12薪 / 16-35k×12薪）—— 两侧共用的判据
 SALARY_RE = re.compile(r"\d+\s*-\s*\d+\s*k(?:\s*×\s*\d+\s*薪)?", re.IGNORECASE)
 
+# 推荐卡状态词（头像/卡片首部的状态文本，如「今天活跃」「隐藏」）
+CARD_STATUS_RE = re.compile(r"^(在线|离线|隐藏|.*活跃)$")
+
+
+def element_center(element: Any) -> tuple[float, float] | None:
+    """元素 frame 的屏幕点中心；不可解析时返回 None（调用方放弃点击，不盲点）。"""
+    frame = getattr(element, "frame", None)
+    if frame is None:
+        return None
+    try:
+        vals = list(frame)
+    except TypeError:
+        vals = []
+    if len(vals) == 4:
+        x, y, w, h = (float(v) for v in vals)
+        return x + w / 2.0, y + h / 2.0
+    x = getattr(frame, "x", None)
+    y = getattr(frame, "y", None)
+    w = getattr(frame, "w", getattr(frame, "width", None))
+    h = getattr(frame, "h", getattr(frame, "height", None))
+    if None not in (x, y, w, h):
+        return float(x) + float(w) / 2.0, float(y) + float(h) / 2.0
+    return None
+
 
 class Role(StrEnum):
     """平台无关的树元素角色。各平台映射见 macos.py / windows.py。"""
@@ -71,7 +95,15 @@ class PlatformAdapter(Protocol):
         """求职意向里的薪资项（形如 11-22k×12薪）；页面未提供时返回空串。"""
         ...
 
+    def recommend_cards(self, state: Any) -> list[tuple[str, Any | None]]:
+        """推荐页卡片 [(姓名, 姓名元素或 None)]（卡片锚点平台差异大，故下沉）。"""
+        ...
+
     # —— 动作 ——
     def click_point(self, pid: int, window_id: int, x: float, y: float) -> None: ...
+
+    def click_element(self, pid: int, window_id: int, element: Any) -> None:
+        """元素级点击：macOS 走元素中心坐标，Windows 走 SDK element_token。"""
+        ...
 
     def switch_to_first_tab(self) -> None: ...

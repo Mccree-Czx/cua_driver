@@ -85,7 +85,9 @@ def test_recommend_cards_names_and_centers_after_section_anchor():
     )
     cards = _driver()._recommend_cards(state)
     assert [name for name, _ in cards] == ["卢杰", "刘先生"]
-    assert cards[0][1] == (316.0, 570.0)
+    # 2026-10-09：卡片改为返回姓名元素本身（点击通道由平台 adapter 决定：
+    # macOS 走元素中心坐标、Windows 走 element_token）
+    assert cards[0][1].label == "卢杰"
 
 
 def test_element_center_none_on_missing_frame():

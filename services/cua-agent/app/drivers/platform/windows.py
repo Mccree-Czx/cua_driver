@@ -11,9 +11,16 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Sequence
 
-from .base import SALARY_RE, Role, WindowRef
+from .base import (  # noqa: F401
+    CARD_STATUS_RE,
+    SALARY_RE,
+    Role,
+    WindowRef,
+    element_center,
+)
 
 WINDOWS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT: "Text",
@@ -179,6 +186,47 @@ class WindowsAdapter:
             return value or None
         return None
 
+    def recommend_cards(self, state: Any) -> list[tuple[str, Any | None]]:
+        """推荐页卡片 [(姓名, 姓名元素或 None)]。
+
+        实测（2026-10-09）：「头像」Image 不进 elements，故改用 Button「立即沟通」
+        作卡片锚点（每卡一个、在 elements 内）；姓名取该按钮所在 Group 的直接子级
+        里、跳过状态词与空文本后的首个 Text。
+        """
+        btn_role = WINDOWS_ROLE_MAP[Role.BUTTON]
+        text_role = WINDOWS_ROLE_MAP[Role.TEXT]
+        els = list(getattr(state, "elements", []) or [])
+        start = 0
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "") == "系统推荐":
+                start = pos
+                break
+        out: list[tuple[str, Any | None]] = []
+        seen: set[int] = set()
+        for e in els[start:]:
+            if str(getattr(e, "role", "")) != btn_role:
+                continue
+            if str(getattr(e, "label", "") or "") not in ("立即沟通", "向TA索要"):
+                continue
+            card_idx = getattr(e, "parent_index", None)
+            if card_idx is None or card_idx in seen:
+                continue
+            seen.add(card_idx)
+            name_el = None
+            for child in els:
+                if getattr(child, "parent_index", None) != card_idx:
+                    continue
+                if str(getattr(child, "role", "")) != text_role:
+                    continue
+                lbl = str(getattr(child, "label", "") or "").strip()
+                if not lbl or CARD_STATUS_RE.match(lbl):
+                    continue
+                name_el = child
+                break
+            name = str(getattr(name_el, "label", "") or "").strip() if name_el is not None else ""
+            out.append((name, name_el))
+        return out
+
     def salary(self, state: Any) -> str:
         """求职意向里的薪资项。
 
@@ -235,10 +283,39 @@ class WindowsAdapter:
         _restore_window(pid)
         return self._call_tool_silent("bring_to_front", {"pid": pid, "window_id": window_id})
 
-    def click_point(self, pid: int, window_id: int, x: float, y: float) -> None:
-        """坐标点击（SDK 原生 ClickPosition.COORDINATES；取代 osascript）。"""
+    def click_element(self, pid: int, window_id: int, element: Any) -> None:
+        """元素级点击（Windows）：直接用 SDK 的 element_token。
+
+        坐标点击在 Windows 上不可用 —— 窗口截图报 "capture binding is invalid"，
+        而 SDK 要求「本会话拥有的截图」才放行像素坐标。
+        """
         from cua_driver import ActionTarget, ClickInput, ClickPosition, InputDeliveryMode
 
+        try:
+            self._bridge.run(
+                self._driver.click(
+                    ClickInput(
+                        target=ActionTarget.WINDOW(pid, window_id),
+                        position=ClickPosition.ELEMENT(element.element_token),
+                        delivery_mode=InputDeliveryMode.BACKGROUND,
+                        session=None,
+                        button=None,
+                        count=None,
+                    )
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"元素点击失败（Windows/SDK）：{e}") from e
+
+    def click_point(self, pid: int, window_id: int, x: float, y: float) -> None:
+        """坐标点击（SDK 原生 ClickPosition.COORDINATES；取代 osascript）。
+
+        Windows 要求目标窗口先有「本会话拥有的截图快照」，否则 SDK 报
+        "does not contain a screenshot owned by this session" —— 故先补拍一次。
+        """
+        from cua_driver import ActionTarget, ClickInput, ClickPosition, InputDeliveryMode
+
+        self._snapshot_window(pid, window_id)
         try:
             self._bridge.run(
                 self._driver.click(
@@ -254,6 +331,38 @@ class WindowsAdapter:
             )
         except Exception as e:  # noqa: BLE001 - 统一为 RuntimeError，与 macOS 侧一致
             raise RuntimeError(f"坐标点击失败（Windows/SDK）：{e}") from e
+
+    def _snapshot_window(self, pid: int, window_id: int) -> None:
+        """给目标窗口拍一次本会话截图（坐标点击的前置条件）；失败静默。"""
+        import tempfile
+
+        from cua_driver import GetWindowStateInput
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        out = Path(tmp.name)
+        try:
+            self._bridge.run(
+                self._driver.get_window_state(
+                    GetWindowStateInput(
+                        pid=pid,
+                        window_id=window_id,
+                        session=None,
+                        query=None,
+                        include_accessibility_tree=False,
+                        include_screenshot=True,
+                        screenshot_out_file=str(out),
+                        max_elements=None,
+                        max_depth=None,
+                        max_dimension=None,
+                        max_image_dimension=None,
+                    )
+                )
+            )
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        finally:
+            out.unlink(missing_ok=True)
 
     def switch_to_first_tab(self) -> None:
         """Ctrl+1 切第 1 个标签（SDK HotkeyInput；取代 macOS 的 Cmd+1）。"""

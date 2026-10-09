@@ -824,19 +824,29 @@ class CuaLiepinDriver:
         if "#preview" in self._current_url(state):
             self._preview_close(pid, wid)  # 残留预览自愈（上一任务中断场景，2026-10-07）
             state = self._live_state(pid, wid)
-        # 2026-10-07：仅当当前页不在猎聘域时才需切标签；已在猎聘（任意业务页，如职位管理）
-        # 直接走侧栏导航，避免误切其他标签（Cmd+1 会把 LeetCode 等页切到前台）
+        # 2026-10-07：仅当当前页不在猎聘域时才需切标签（避免误切其他标签，
+        # Cmd+1 会把 LeetCode 等页切到前台）
         if self.URL_MARKER not in self._current_url(state):
             if self.CHAT_PATH not in self._current_url(state):
                 state = self._focus_liepin_tab(pid, wid)
-            if self.RECOMMEND_PATH not in self._current_url(state):
-                nav = self._find(state, role=Role.LINK, label="人才推荐")
-                center = self._element_center(nav) if nav is not None else None
-                if center is None:
-                    raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
-                self._click_point(pid, wid, *center)
-                time.sleep(self.SETTLE_SECONDS)
-                state = self._live_state(pid, wid)
+        # 2026-10-09（Windows 实测）：侧栏导航必须独立于「是否在猎聘域」——
+        # 批量页（showbatchresumelist）同属猎聘域但不在推荐页，旧写法会卡死。
+        if self.RECOMMEND_PATH not in self._current_url(state):
+            nav = self._find(state, role=Role.LINK, label="人才推荐")
+            if nav is None:
+                # 2026-10-09（Windows 实测）：批量页等页面不渲染侧栏导航 →
+                # 先点站点 logo 回首页，侧栏随之出现，再取一次。
+                home = self._find_home_link(state)
+                if home is not None:
+                    self._plat.click_element(pid, wid, home)
+                    time.sleep(self.SETTLE_SECONDS + 1.0)
+                    state = self._live_state(pid, wid)
+                    nav = self._find(state, role=Role.LINK, label="人才推荐")
+            if nav is None:
+                raise LocatorFailedError("未找到「人才推荐」侧栏入口（页面结构变化？）")
+            self._plat.click_element(pid, wid, nav)
+            time.sleep(self.SETTLE_SECONDS)
+            state = self._live_state(pid, wid)
         # 覆盖层自愈（2026-10-07 实测：聊天面板会遮挡列表且 ✕ 无标签）→ 整页重载一次
         if self.RECOMMEND_ANCHOR not in str(getattr(state, "tree_markdown", "") or ""):
             try:
@@ -849,44 +859,19 @@ class CuaLiepinDriver:
             raise LocatorFailedError(f"未到达推荐页（URL={self._current_url(state)[:120]}）")
         return state
 
-    def _recommend_cards(self, state: Any) -> list[tuple[str, tuple[float, float] | None]]:
-        """推荐页卡片：返回 [(姓名, 姓名中心或 None)]。
+    def _find_home_link(self, state: Any) -> Any | None:
+        """站点 logo（指向 lpt.liepin.com 首页的 Hyperlink）——无侧栏页面的回首页通道。"""
+        link = self._plat.role_name(Role.LINK)
+        for e in getattr(state, "elements", []) or []:
+            if str(getattr(e, "role", "")) != link:
+                continue
+            if str(getattr(e, "value", "") or "").rstrip("/") == "https://lpt.liepin.com":
+                return e
+        return None
 
-        锚点=「系统推荐」标题之后的「头像」图像；姓名=其后 5 个元素内跳过状态词的
-        首个文本（2026-10-07 实测结构）；frame 缺失时中心为 None（调用方跳过）。
-        """
-        els = list(getattr(state, "elements", []) or [])
-        start = 0
-        for pos, e in enumerate(els):
-            if str(getattr(e, "label", "") or "") == self.RECOMMEND_ANCHOR:
-                start = pos
-                break
-        image = self._plat.role_name(Role.IMAGE)
-        static_text = self._plat.role_name(Role.TEXT)
-        cards: list[tuple[str, tuple[float, float] | None]] = []
-        for pos in range(start, len(els)):
-            e = els[pos]
-            if (
-                str(getattr(e, "role", "")) != image
-                or str(getattr(e, "label", "") or "") != "头像"
-            ):
-                continue
-            texts: list[Any] = []
-            for nxt in els[pos + 1 : pos + 6]:
-                if str(getattr(nxt, "role", "")) == static_text and str(
-                    getattr(nxt, "label", "") or ""
-                ).strip():
-                    texts.append(nxt)
-            if not texts:
-                continue
-            name_el = texts[0]
-            if len(texts) >= 2 and _CARD_STATUS_RE.match(
-                str(getattr(texts[0], "label", "") or "").strip()
-            ):
-                name_el = texts[1]
-            name = str(getattr(name_el, "label", "") or "").strip()
-            cards.append((name, self._element_center(name_el)))
-        return cards
+    def _recommend_cards(self, state: Any) -> list[tuple[str, Any | None]]:
+        """推荐页卡片 [(姓名, 姓名元素)]（解析下沉到 adapter）。"""
+        return self._plat.recommend_cards(state)
 
     def _preview_close(self, pid: int, wid: int) -> None:
         """关闭候选预览（recommend#preview → 回列表）：右上 close 图 / 浏览器返回 双通道。"""
@@ -899,10 +884,9 @@ class CuaLiepinDriver:
                 if attempt == 0
                 else self._find(state, role=Role.BUTTON, label="返回")
             )
-            center = self._element_center(el) if el is not None else None
-            if center is None:
+            if el is None:
                 continue
-            self._click_point(pid, wid, *center)
+            self._plat.click_element(pid, wid, el)
             time.sleep(self.SETTLE_SECONDS)
         state = self._live_state(pid, wid)
         if "#preview" in self._current_url(state):
@@ -927,10 +911,10 @@ class CuaLiepinDriver:
             cards = self._recommend_cards(state)
             if idx >= len(cards):
                 break  # 可见卡片不足（v1 不滚动翻页）
-            _, center = cards[idx]
-            if center is None:
-                continue  # 姓名 frame 缺失：跳过该卡（不盲点）
-            self._click_point(pid, wid, *center)
+            _, name_el = cards[idx]
+            if name_el is None:
+                continue  # 姓名元素缺失：跳过该卡（不盲点）
+            self._plat.click_element(pid, wid, name_el)
             time.sleep(self.SETTLE_SECONDS)
             state = self._live_state(pid, wid)
             if "#preview" not in self._current_url(state):
@@ -1158,11 +1142,11 @@ class CuaLiepinDriver:
         for page in range(4):  # 首屏 + 最多 3 次翻页
             state = self._live_state(pid, wid)
             cards = self._recommend_cards(state)
-            for _, center in cards:
-                if center is None or scanned >= cap:
+            for _, name_el in cards:
+                if name_el is None or scanned >= cap:
                     continue
                 scanned += 1
-                self._click_point(pid, wid, *center)
+                self._plat.click_element(pid, wid, name_el)
                 time.sleep(self.SETTLE_SECONDS)
                 state = self._live_state(pid, wid)
                 if "#preview" not in self._current_url(state):

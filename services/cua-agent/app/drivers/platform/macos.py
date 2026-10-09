@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import Any, Sequence
 
-from .base import SALARY_RE, Role, WindowRef
+from .base import CARD_STATUS_RE, SALARY_RE, Role, WindowRef, element_center
 
 MACOS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT: "AXStaticText",
@@ -111,6 +111,41 @@ class MacOsAdapter:
                             return t
         return None
 
+    def recommend_cards(self, state: Any) -> list[tuple[str, Any | None]]:
+        """推荐页卡片（原 cua_sdk._recommend_cards 逻辑）。
+
+        锚点=「系统推荐」标题之后的「头像」图像；姓名=其后 5 个元素内跳过状态词
+        的首个文本（2026-10-07 实测结构）。
+        """
+        image = MACOS_ROLE_MAP[Role.IMAGE]
+        static_text = MACOS_ROLE_MAP[Role.TEXT]
+        els = list(getattr(state, "elements", []) or [])
+        start = 0
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "") == "系统推荐":
+                start = pos
+                break
+        out: list[tuple[str, Any | None]] = []
+        for pos in range(start, len(els)):
+            e = els[pos]
+            if str(getattr(e, "role", "")) != image or str(getattr(e, "label", "") or "") != "头像":
+                continue
+            texts = [
+                nxt
+                for nxt in els[pos + 1 : pos + 6]
+                if str(getattr(nxt, "role", "")) == static_text
+                and str(getattr(nxt, "label", "") or "").strip()
+            ]
+            if not texts:
+                continue
+            name_el = texts[0]
+            if len(texts) >= 2 and CARD_STATUS_RE.match(
+                str(getattr(texts[0], "label", "") or "").strip()
+            ):
+                name_el = texts[1]
+            out.append((str(getattr(name_el, "label", "") or "").strip(), name_el))
+        return out
+
     def salary(self, state: Any) -> str:
         """求职意向列表中的薪资项（原 cua_sdk._detail_salary 逻辑）。
 
@@ -184,6 +219,13 @@ class MacOsAdapter:
             return False
         time.sleep(1.5)
         return True
+
+    def click_element(self, pid: int, window_id: int, element: Any) -> None:
+        """元素级点击（macOS）：按元素中心屏幕坐标点击（原 cua_sdk 口径）。"""
+        center = element_center(element)
+        if center is None:
+            raise RuntimeError("元素无可用 frame，无法坐标点击")
+        self.click_point(pid, window_id, *center)
 
     def click_point(self, pid: int, window_id: int, x: float, y: float) -> None:
         """坐标点击（System Events；实测通道：无 AXPress 的列表行元素）。"""
