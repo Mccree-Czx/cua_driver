@@ -1142,9 +1142,16 @@ class CuaLiepinDriver:
         for page in range(4):  # 首屏 + 最多 3 次翻页
             state = self._live_state(pid, wid)
             cards = self._recommend_cards(state)
-            for _, name_el in cards:
-                if name_el is None or scanned >= cap:
+            for ci in range(len(cards)):
+                if scanned >= cap:
+                    break
+                # Windows 的 element_token 与最近一次快照绑定 —— 点击前重读快照并
+                # 重定位，避免中途任何一次 get_window_state 让 token 失效
+                fresh = self._live_state(pid, wid)
+                fresh_cards = self._recommend_cards(fresh)
+                if ci >= len(fresh_cards) or fresh_cards[ci][1] is None:
                     continue
+                _, name_el = fresh_cards[ci]
                 scanned += 1
                 self._plat.click_element(pid, wid, name_el)
                 time.sleep(self.SETTLE_SECONDS)
