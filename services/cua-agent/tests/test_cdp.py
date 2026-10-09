@@ -6,7 +6,7 @@
 
 import pytest
 
-from app.drivers.platform.cdp import _key_params, _modifier_mask
+from app.drivers.platform.cdp import _key_params, _modifier_mask, _parse_textarea_center
 
 
 def test_key_params_letters():
@@ -39,3 +39,17 @@ def test_modifier_mask():
     assert _modifier_mask(["cmd"]) == 4  # Meta=4
     assert _modifier_mask(None) == 0
     assert _modifier_mask([]) == 0
+
+
+def test_parse_textarea_center():
+    assert _parse_textarea_center({"x": 100.5, "y": 200.25}) == (100.5, 200.25)
+    assert _parse_textarea_center({"x": "10", "y": "20"}) == (10.0, 20.0)  # 字符串可转浮点
+
+
+def test_parse_textarea_center_rejects_invalid():
+    with pytest.raises(ValueError):
+        _parse_textarea_center(None)  # 不是 dict
+    with pytest.raises(ValueError):
+        _parse_textarea_center({"x": 1})  # 缺 y
+    with pytest.raises(ValueError):
+        _parse_textarea_center({"x": "abc", "y": 2})  # x 不可转浮点

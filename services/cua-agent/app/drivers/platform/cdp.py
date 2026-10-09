@@ -52,10 +52,12 @@ _MODIFIER_BITS: dict[str, int] = {
     "shift": 8,
 }
 
-# 聚焦可见 textarea（聊天输入框是 ant-im textarea，非 contenteditable）
-_FOCUS_TEXTAREA_JS = """
+# 可见 textarea 中心坐标（真实点击聚焦用；JS focus 会被 ant-im 抢走焦点，见 _focus_textarea）
+_TEXTAREA_CENTER_JS = """
 (() => { const e = [...document.querySelectorAll('textarea')].find(x => x.offsetWidth > 0);
-  if (!e) return false; e.focus(); return true; })()
+  if (!e) return null;
+  const b = e.getBoundingClientRect();
+  return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; })()
 """
 
 _FOCUSED_TEXTAREA_JS = (
@@ -83,6 +85,16 @@ def _modifier_mask(modifiers: list[str] | None) -> int:
     for m in modifiers or []:
         mask |= _MODIFIER_BITS.get(m.lower(), 0)
     return mask
+
+
+def _parse_textarea_center(center: Any) -> tuple[float, float]:
+    """解析 _TEXTAREA_CENTER_JS 返回的中心坐标 → (x, y)；非法抛 ValueError。"""
+    if not isinstance(center, dict):
+        raise ValueError(f"textarea 中心坐标不是对象：{center!r}")
+    try:
+        return float(center["x"]), float(center["y"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"textarea 中心坐标缺 x/y：{center!r}") from e
 
 
 class _Session:
@@ -159,10 +171,30 @@ class CdpClient:
             raise RuntimeError(f"CDP WebSocket 连接失败：{e}") from e
         return _Session(ws)
 
+    async def _focus_textarea(self, sess: _Session) -> None:
+        """真实点击聚焦可见 textarea；失败抛 RuntimeError（失败即停）。
+
+        JS focus() 会被 ant-im 抢走焦点（实测 activeElement 变 BUTTON），
+        Input.insertText 因而注入到错误目标。改用 Input.dispatchMouseEvent 点击
+        中心，再校验 activeElement 确实是 textarea。
+        """
+        center = await sess.eval(_TEXTAREA_CENTER_JS)
+        try:
+            x, y = _parse_textarea_center(center)
+        except ValueError as e:
+            raise RuntimeError(f"无法定位聊天输入框（textarea 不可见或缺失）：{e}") from e
+        for typ in ("mousePressed", "mouseReleased"):
+            await sess.call(
+                "Input.dispatchMouseEvent",
+                {"type": typ, "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+        if not await sess.eval(_FOCUSED_TEXTAREA_JS):
+            raise RuntimeError("点击后 textarea 未成为 activeElement（ant-im 焦点被抢？）")
+
     async def _insert_text(self, text: str) -> None:
         sess = await self._connect_chat_page()
         try:
-            await sess.eval(_FOCUS_TEXTAREA_JS)
+            await self._focus_textarea(sess)
             await sess.call("Input.insertText", {"text": text})
         finally:
             await sess.close()
@@ -170,7 +202,7 @@ class CdpClient:
     async def _press_key(self, key: str, modifiers: list[str] | None) -> None:
         sess = await self._connect_chat_page()
         try:
-            await sess.eval(_FOCUS_TEXTAREA_JS)
+            await self._focus_textarea(sess)
             code, vk = _key_params(key)
             mask = _modifier_mask(modifiers)
             for typ in ("rawKeyDown", "keyUp"):
