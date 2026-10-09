@@ -1055,41 +1055,19 @@ class CuaLiepinDriver:
     def _press_key(
         self, pid: int, wid: int, key: str, *, modifiers: list[str] | None = None
     ) -> None:
-        """键盘按键（后台注入；输入框辅助操作：cmd+A 全选、delete 清空等）。"""
-        payload: dict[str, Any] = {
-            "key": key,
-            "pid": pid,
-            "window_id": wid,
-            "delivery_mode": "background",
-        }
-        if modifiers:
-            payload["modifiers"] = modifiers
+        """键盘按键（平台下沉：macOS CGEvent / Windows CDP；全选/清空草稿等辅助操作）。"""
         try:
-            self._bridge.run(self._driver.call_tool("press_key", json.dumps(payload)))
+            self._plat.press_key(pid, wid, key, modifiers=modifiers)
         except Exception as e:
             mapped = _translate_driver_error(e)
             if mapped is e:
                 raise
             raise mapped from e
-        time.sleep(0.2)
 
     def _type_text(self, pid: int, wid: int, element: Any, text: str) -> None:
-        """向元素输入文本（实测：聚焦后经 CGEvent 注入，AX 读回作辅助校验）。"""
+        """向元素输入文本（平台下沉：macOS CGEvent / Windows CDP insertText；AX 读回校验）。"""
         try:
-            self._bridge.run(
-                self._driver.call_tool(
-                    "type_text",
-                    json.dumps(
-                        {
-                            "text": text,
-                            "pid": pid,
-                            "window_id": wid,
-                            "element_token": element.element_token,
-                            "delivery_mode": "background",
-                        }
-                    ),
-                )
-            )
+            self._plat.type_text(pid, wid, element, text)
         except Exception as e:
             mapped = _translate_driver_error(e)
             if mapped is e:

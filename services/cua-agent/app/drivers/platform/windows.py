@@ -123,6 +123,7 @@ class WindowsAdapter:
     def __init__(self, bridge: Any = None, driver: Any = None) -> None:
         self._bridge = bridge
         self._driver = driver
+        self._cdp_client: Any = None
         self.screenshot_px_per_point = _system_dpi_scale()
 
     def role_name(self, role: Role) -> str:
@@ -376,6 +377,27 @@ class WindowsAdapter:
             )
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"Ctrl+1 切换标签失败（Windows/SDK）：{e}") from e
+
+    def press_key(
+        self, pid: int, window_id: int, key: str, *, modifiers: list[str] | None = None
+    ) -> None:
+        """键盘按键（CDP Input.dispatchKeyEvent；取代 SDK call_tool 的 CGEvent，后者 Windows 不生效）。
+
+        pid/window_id 不参与定位 —— CDP 经 /json 自行找到聚焦 textarea 所在的猎聘页标签。
+        """
+        self._cdp().press_key(key, modifiers)
+
+    def type_text(self, pid: int, window_id: int, element: Any, text: str) -> None:
+        """向聚焦的聊天 textarea 注入文本（CDP Input.insertText）。element 不参与定位。"""
+        self._cdp().insert_text(text)
+
+    def _cdp(self) -> Any:
+        """懒建 CDP 客户端（避免 windows 模块导入即触发 websockets 依赖）。"""
+        if self._cdp_client is None:
+            from .cdp import CdpClient
+
+            self._cdp_client = CdpClient(self._bridge)
+        return self._cdp_client
 
     def _call_tool_silent(self, name: str, payload: dict[str, Any]) -> bool:
         try:

@@ -248,3 +248,38 @@ class MacOsAdapter:
             raise RuntimeError(
                 f"Cmd+1 切换标签失败（osascript rc={result.returncode}）：{result.stderr.strip()[:160]}"
             )
+
+    def press_key(
+        self, pid: int, window_id: int, key: str, *, modifiers: list[str] | None = None
+    ) -> None:
+        """键盘按键（SDK call_tool("press_key")，CGEvent 后台注入；原 cua_sdk._press_key 逻辑）。
+
+        原始 SDK 错误向上抛，由驱动委托层统一翻译（off_space → WindowUnavailableError）。
+        """
+        payload: dict[str, Any] = {
+            "key": key,
+            "pid": pid,
+            "window_id": window_id,
+            "delivery_mode": "background",
+        }
+        if modifiers:
+            payload["modifiers"] = modifiers
+        self._bridge.run(self._driver.call_tool("press_key", json.dumps(payload)))
+        time.sleep(0.2)
+
+    def type_text(self, pid: int, window_id: int, element: Any, text: str) -> None:
+        """向元素注入文本（SDK call_tool("type_text")，CGEvent；原 cua_sdk._type_text 逻辑）。"""
+        self._bridge.run(
+            self._driver.call_tool(
+                "type_text",
+                json.dumps(
+                    {
+                        "text": text,
+                        "pid": pid,
+                        "window_id": window_id,
+                        "element_token": element.element_token,
+                        "delivery_mode": "background",
+                    }
+                ),
+            )
+        )

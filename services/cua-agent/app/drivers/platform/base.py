@@ -106,4 +106,14 @@ class PlatformAdapter(Protocol):
         """元素级点击：macOS 走元素中心坐标，Windows 走 SDK element_token。"""
         ...
 
+    def press_key(
+        self, pid: int, window_id: int, key: str, *, modifiers: list[str] | None = None
+    ) -> None:
+        """键盘按键（后台注入）：macOS 走 SDK call_tool(CGEvent)，Windows 走 CDP Input。"""
+        ...
+
+    def type_text(self, pid: int, window_id: int, element: Any, text: str) -> None:
+        """向聚焦元素注入文本：macOS CGEvent，Windows CDP Input.insertText。"""
+        ...
+
     def switch_to_first_tab(self) -> None: ...
