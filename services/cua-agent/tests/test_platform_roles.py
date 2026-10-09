@@ -38,3 +38,44 @@ def test_windows_map_uses_uia_control_types():
     """UIA 标准 ControlType 名；阶段 2 校准时以真实树为准修正。"""
     assert WINDOWS_ROLE_MAP[Role.BUTTON] == "Button"
     assert WINDOWS_ROLE_MAP[Role.TEXT_INPUT] == "Edit"
+
+
+# —— WindowsAdapter 的纯逻辑（不碰 SDK runtime）——
+
+
+def _win(app_name: str, pid: int):
+    """构造 SDK WindowInfo 形状的最小对象。"""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        app_name=app_name, pid=pid, window_id=pid, title="", is_on_screen=True
+    )
+
+
+def test_candidate_windows_matches_process_name_variants():
+    """chrome.exe / Chrome.exe 都应命中；无关进程不命中。"""
+    from app.drivers.platform.windows import WindowsAdapter
+
+    adapter = WindowsAdapter(bridge=None)
+    windows = [
+        _win("Chrome.exe", pid=1),
+        _win("chrome.exe", pid=2),
+        _win("Feishu.exe", pid=3),
+        _win("msedge.exe", pid=4),
+    ]
+    assert [w.pid for w in adapter.candidate_windows(windows)] == [1, 2, 4]
+
+
+def test_windows_is_on_screen_false_for_unknown_pid():
+    """已关闭窗口 / 失效 pid：应返回 False，不得抛异常。"""
+    from app.drivers.platform.windows import WindowsAdapter
+
+    assert WindowsAdapter(bridge=None).is_on_screen([], pid=999999, window_id=1) is False
+
+
+def test_windows_screenshot_scale_is_not_retina_default():
+    """不得沿用 macOS 的 2.0 —— 否则兜底坐标点击会系统性打偏。"""
+    from app.drivers.platform.windows import WindowsAdapter
+
+    scale = WindowsAdapter(bridge=None).screenshot_px_per_point
+    assert scale > 0 and scale <= 4
