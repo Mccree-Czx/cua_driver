@@ -24,6 +24,7 @@ WINDOWS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT_INPUT: "Edit",
     Role.TEXT_AREA: "Edit",
     Role.WEB_AREA: "Document",
+    Role.TAB: "TabItem",
 }
 
 # 浏览器进程名（小写比较；本机实测 chrome.exe / msedge.exe）
@@ -64,6 +65,7 @@ class WindowsAdapter:
     """Windows 原语实现。`bridge` 驱动 SDK 协程，`driver` 用于 click / hotkey / call_tool。"""
 
     name = "windows"
+    primary_modifier = "ctrl"
 
     def __init__(self, bridge: Any = None, driver: Any = None) -> None:
         self._bridge = bridge

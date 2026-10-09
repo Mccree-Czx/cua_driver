@@ -24,6 +24,7 @@ MACOS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT_INPUT: "AXTextField",
     Role.TEXT_AREA: "AXTextArea",
     Role.WEB_AREA: "AXWebArea",
+    Role.TAB: "AXRadioButton",
 }
 
 BROWSER_APPS = ("Google Chrome", "Safari", "Microsoft Edge", "Arc", "Chromium", "Firefox")
@@ -53,6 +54,7 @@ class MacOsAdapter:
 
     name = "macos"
     screenshot_px_per_point = 2.0  # Retina 实测 2880px:1440pt；换环境需校准
+    primary_modifier = "cmd"
 
     def __init__(self, bridge: Any = None, driver: Any = None) -> None:
         self._bridge = bridge

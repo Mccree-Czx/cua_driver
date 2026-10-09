@@ -11,7 +11,7 @@ from app.drivers.platform.windows import WINDOWS_ROLE_MAP
 def test_role_enum_is_complete():
     assert {r.name for r in Role} == {
         "TEXT", "BUTTON", "RADIO", "CHECKBOX", "IMAGE",
-        "LINK", "TEXT_INPUT", "TEXT_AREA", "WEB_AREA",
+        "LINK", "TEXT_INPUT", "TEXT_AREA", "WEB_AREA", "TAB",
     }
 
 
@@ -75,14 +75,6 @@ def test_windows_is_on_screen_false_for_unknown_pid():
     assert WindowsAdapter(bridge=None).is_on_screen([], pid=999999, window_id=1) is False
 
 
-def test_windows_screenshot_scale_is_not_retina_default():
-    """不得沿用 macOS 的 2.0 —— 否则兜底坐标点击会系统性打偏。"""
-    from app.drivers.platform.windows import WindowsAdapter
-
-    scale = WindowsAdapter(bridge=None).screenshot_px_per_point
-    assert scale > 0 and scale <= 4
-
-
 # —— create_adapter 平台分发 ——
 
 
@@ -105,3 +97,39 @@ def test_create_adapter_picks_windows(monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "win32")
     assert isinstance(create_adapter(bridge=None), WindowsAdapter)
+
+
+# —— 平台边界的收口（review 反馈的三处）——
+
+
+def test_role_enum_has_tab():
+    """浏览器标签页需要独立的语义角色：macOS 与 Windows 的角色名不同。"""
+    assert Role.TAB.name == "TAB"
+
+
+def test_tab_role_maps_per_platform():
+    """选项卡角色：macOS 实测为 AXRadioButton；Windows UIA 为 TabItem（阶段 2 校准验证）。"""
+    assert MACOS_ROLE_MAP[Role.TAB] == "AXRadioButton"
+    assert WINDOWS_ROLE_MAP[Role.TAB] == "TabItem"
+
+
+def test_adapters_expose_primary_modifier():
+    """主修饰键（全选等操作用）：macOS Cmd、Windows Ctrl —— 不得在共享层写死。"""
+    from app.drivers.platform.macos import MacOsAdapter
+    from app.drivers.platform.windows import WindowsAdapter
+
+    assert MacOsAdapter().primary_modifier == "cmd"
+    assert WindowsAdapter().primary_modifier == "ctrl"
+
+
+def test_windows_scale_derives_from_system_dpi(monkeypatch):
+    """必须真正取自系统 DPI —— 硬编码 2.0（Retina 值）应被此测试拒绝。"""
+    import ctypes
+
+    from app.drivers.platform.windows import _system_dpi_scale
+
+    monkeypatch.setattr(ctypes.windll.user32, "GetDpiForSystem", lambda: 144)
+    assert _system_dpi_scale() == 1.5
+
+    monkeypatch.setattr(ctypes.windll.user32, "GetDpiForSystem", lambda: 96)
+    assert _system_dpi_scale() == 1.0

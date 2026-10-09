@@ -20,6 +20,7 @@ class Role(StrEnum):
     TEXT_INPUT = "TEXT_INPUT"
     TEXT_AREA = "TEXT_AREA"
     WEB_AREA = "WEB_AREA"
+    TAB = "TAB"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class PlatformAdapter(Protocol):
 
     name: str
     screenshot_px_per_point: float
+    primary_modifier: str  # 主修饰键：macOS "cmd" / Windows "ctrl"（共享层不写死）
 
     # —— 窗口 ——
     def candidate_windows(self, windows: Sequence[Any]) -> list[WindowRef]: ...

@@ -841,9 +841,9 @@ class CuaLiepinDriver:
             st = self.window_state(pid, wid)
         except Exception:  # noqa: BLE001  # 读窗失败按未命中
             return False
-        radio = self._plat.role_name(Role.RADIO)
+        tab_role = self._plat.role_name(Role.TAB)
         for e in list(getattr(st, "elements", []) or []):
-            if str(getattr(e, "role", "")) != radio:
+            if str(getattr(e, "role", "")) != tab_role:
                 continue
             label = str(getattr(e, "label", "") or "")
             # 猎聘标签标题随业务页变化（推荐人才/职位管理/意向人选/沟通/搜索人才…）
@@ -1100,7 +1100,7 @@ class CuaLiepinDriver:
             raise RuntimeError("聊天浮层未找到输入框（页面结构变化？）")
         self._press(pid, wid, box)
         time.sleep(0.4)
-        self._press_key(pid, wid, "a", modifiers=["cmd"])  # 清残留草稿
+        self._press_key(pid, wid, "a", modifiers=[self._plat.primary_modifier])  # 清残留草稿
         time.sleep(0.2)
         self._press_key(pid, wid, "delete")
         time.sleep(0.4)
