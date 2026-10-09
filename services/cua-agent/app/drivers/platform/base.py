@@ -3,9 +3,13 @@
 元素对象沿用 SDK 原生的 WindowElement / WindowStateOutput，此处不做包装。
 """
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, Sequence
+
+# 求职意向里的薪资格式（如 11-22k×12薪 / 16-35k×12薪）—— 两侧共用的判据
+SALARY_RE = re.compile(r"\d+\s*-\s*\d+\s*k(?:\s*×\s*\d+\s*薪)?", re.IGNORECASE)
 
 
 class Role(StrEnum):
@@ -54,6 +58,18 @@ class PlatformAdapter(Protocol):
 
     # —— 解析 ——
     def role_name(self, role: Role) -> str: ...
+
+    def tab_elements(self, state: Any) -> list[tuple[str, Any]]:
+        """批量页候选人选项卡 [(姓名, 元素)]（树结构平台差异大，故下沉）。"""
+        ...
+
+    def field_value(self, state: Any, icon: str) -> str | None:
+        """字段图标锚点（environment/work/education/file-search）后的首个文本值。"""
+        ...
+
+    def salary(self, state: Any) -> str:
+        """求职意向里的薪资项（形如 11-22k×12薪）；页面未提供时返回空串。"""
+        ...
 
     # —— 动作 ——
     def click_point(self, pid: int, window_id: int, x: float, y: float) -> None: ...

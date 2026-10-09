@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import Any, Sequence
 
-from .base import Role, WindowRef
+from .base import SALARY_RE, Role, WindowRef
 
 MACOS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT: "AXStaticText",
@@ -62,6 +62,69 @@ class MacOsAdapter:
 
     def role_name(self, role: Role) -> str:
         return MACOS_ROLE_MAP[role]
+
+    def tab_elements(self, state: Any) -> list[tuple[str, Any]]:
+        """批量页候选人选项卡 [(姓名, 元素)]（原 cua_sdk._tab_names 逻辑）。
+
+        实测结构：选项卡是顶层 webarea 的直接子级静态文本，直到嵌套详情
+        webarea（也是直接子级）出现为止；账户名「陈智旭」排除。
+        """
+        web_area = MACOS_ROLE_MAP[Role.WEB_AREA]
+        static_text = MACOS_ROLE_MAP[Role.TEXT]
+        els = list(getattr(state, "elements", []) or [])
+        top = next((e for e in els if str(getattr(e, "role", "")) == web_area), None)
+        if top is None:
+            return []
+        out: list[tuple[str, Any]] = []
+        seen: list[str] = []
+        for e in els:
+            if getattr(e, "element_index", 0) <= top.element_index:
+                continue
+            if getattr(e, "parent_index", None) != top.element_index:
+                continue
+            role = str(getattr(e, "role", ""))
+            if role == web_area:
+                break  # 嵌套详情 webarea：选项卡区结束
+            if role != static_text:
+                continue
+            lbl = str(getattr(e, "label", "") or "").strip()
+            if not lbl or lbl == "陈智旭" or lbl in seen:
+                continue
+            seen.append(lbl)
+            out.append((lbl, e))
+        return out
+
+    def field_value(self, state: Any, icon: str) -> str | None:
+        """图标锚点后的首个文本值（原 cua_sdk._value_after_icon 逻辑）。
+
+        macOS：字段图标作为 AXImage 出现在 elements 里，label 即图标名。
+        """
+        image = MACOS_ROLE_MAP[Role.IMAGE]
+        static_text = MACOS_ROLE_MAP[Role.TEXT]
+        els = list(getattr(state, "elements", []) or [])
+        for pos, e in enumerate(els):
+            if str(getattr(e, "role", "")) == image and str(getattr(e, "label", "") or "") == icon:
+                for nxt in els[pos + 1 : pos + 4]:
+                    if str(getattr(nxt, "role", "")) == static_text:
+                        t = str(getattr(nxt, "label", "") or "").strip()
+                        if t:
+                            return t
+        return None
+
+    def salary(self, state: Any) -> str:
+        """求职意向列表中的薪资项（原 cua_sdk._detail_salary 逻辑）。
+
+        判据用「数字+k」正则而非裸 'k'（裸 'k' 会误命中工作经历里的 KOL / Net-30）。
+        """
+        els = list(getattr(state, "elements", []) or [])
+        for pos, e in enumerate(els):
+            if str(getattr(e, "label", "") or "").strip() == "求职意向":
+                for nxt in els[pos + 1 : pos + 40]:
+                    t = str(getattr(nxt, "label", "") or "").strip()
+                    if SALARY_RE.search(t):
+                        return t
+                return ""
+        return ""
 
     def candidate_windows(self, windows: Sequence[Any]) -> list[WindowRef]:
         return [_win_ref(w) for w in windows if getattr(w, "app_name", "") in BROWSER_APPS]

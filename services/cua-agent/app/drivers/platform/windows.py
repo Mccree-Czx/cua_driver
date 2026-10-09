@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Sequence
 
-from .base import Role, WindowRef
+from .base import SALARY_RE, Role, WindowRef
 
 WINDOWS_ROLE_MAP: dict[Role, str] = {
     Role.TEXT: "Text",
@@ -61,6 +62,51 @@ def _system_dpi_scale() -> float:
     return 1.0
 
 
+def _top_level_windows(pid: int) -> list[tuple[int, bool]]:
+    """该 pid 的可见顶层窗口 [(hwnd, 是否最小化)]；读不到时返回 []。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found: list[tuple[int, bool]] = []
+
+        def cb(hwnd, _lparam):
+            wpid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and user32.IsWindowVisible(hwnd):
+                found.append((hwnd, bool(user32.IsIconic(hwnd))))
+            return True
+
+        proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(proc(cb), 0)
+        return found
+    except Exception:
+        return []
+
+
+def _window_is_minimized(pid: int) -> bool:
+    return any(minimized for _, minimized in _top_level_windows(pid))
+
+
+def _restore_window(pid: int) -> None:
+    """还原并前置该 pid 的最小化顶层窗口。
+
+    SDK 的 bring_to_front 不还原最小化状态，而最小化窗口的元素点击会报
+    「window … is minimized」——必须先显式 SW_RESTORE。
+    """
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        for hwnd, minimized in _top_level_windows(pid):
+            if minimized:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
 class WindowsAdapter:
     """Windows 原语实现。`bridge` 驱动 SDK 协程，`driver` 用于 click / hotkey / call_tool。"""
 
@@ -74,6 +120,80 @@ class WindowsAdapter:
 
     def role_name(self, role: Role) -> str:
         return WINDOWS_ROLE_MAP[role]
+
+    def tab_elements(self, state: Any) -> list[tuple[str, Any]]:
+        """批量页候选人选项卡 [(姓名, 元素)]。
+
+        实测结构（2026-10-09 本机 Windows）：选项卡是顶层 Document 的直接子级
+        Group，每个 Group 内第一个 Text 为姓名（后随一个无 label 的 Image）；
+        到第一个嵌套 Document（详情 iframe）为止；账户名「陈智旭」排除。
+        """
+        doc = WINDOWS_ROLE_MAP[Role.WEB_AREA]
+        text = WINDOWS_ROLE_MAP[Role.TEXT]
+        els = list(getattr(state, "elements", []) or [])
+        top = next((e for e in els if str(getattr(e, "role", "")) == doc), None)
+        if top is None:
+            return []
+        # 实测：顶层 Document 的直接子级只有一个 Group，选项卡区与详情 iframe
+        # 都在该 Group 之下 —— 需要下钻一层。
+        kids = [e for e in els if getattr(e, "parent_index", None) == top.element_index]
+        if len(kids) == 1 and str(getattr(kids[0], "role", "")) == "Group":
+            container = kids[0]
+        else:
+            container = top
+        out: list[tuple[str, Any]] = []
+        seen: list[str] = []
+        for e in els:
+            if getattr(e, "parent_index", None) != container.element_index:
+                continue
+            role = str(getattr(e, "role", ""))
+            if role == doc:
+                break  # 详情 iframe：选项卡区结束
+            if role != "Group":
+                continue
+            for child in els:
+                if getattr(child, "parent_index", None) != e.element_index:
+                    continue
+                if str(getattr(child, "role", "")) != text:
+                    continue
+                lbl = str(getattr(child, "label", "") or "").strip()
+                if lbl and lbl != "陈智旭" and lbl not in seen:
+                    seen.append(lbl)
+                    out.append((lbl, child))
+                break
+        return out
+
+    def field_value(self, state: Any, icon: str) -> str | None:
+        """图标锚点后的首个文本值。
+
+        实测（2026-10-09）：字段图标 Image（environment/work/education…）只出现在
+        tree_markdown（该行无 [N] 索引前缀），不进 elements 列表 —— 故从树文本解析。
+        """
+        tree = str(getattr(state, "tree_markdown", "") or "")
+        m = re.search(
+            rf'Image "{re.escape(icon)}"[^\n]*\n\s*-\s*(?:\[\d+\]\s*)?Text "([^"]*)"',
+            tree,
+        )
+        if m:
+            value = m.group(1).strip()
+            return value or None
+        return None
+
+    def salary(self, state: Any) -> str:
+        """求职意向里的薪资项。
+
+        实测（2026-10-09）：薪资只出现在 tree_markdown 的 ListItem label
+        （如 ListItem "海外销售16-35k×12薪中国、上海…"），不进 elements 列表。
+        """
+        tree = str(getattr(state, "tree_markdown", "") or "")
+        i = tree.find("求职意向")
+        if i < 0:
+            return ""
+        m = re.search(r'ListItem "([^"]*)"', tree[i : i + 600])
+        if m is None:
+            return ""
+        sm = SALARY_RE.search(m.group(1))
+        return sm.group(0) if sm else ""
 
     def candidate_windows(self, windows: Sequence[Any]) -> list[WindowRef]:
         return [
@@ -92,20 +212,27 @@ class WindowsAdapter:
         return ""
 
     def is_on_screen(self, windows: Sequence[Any], pid: int, window_id: int) -> bool:
+        # 最小化窗口 SDK 仍报 is_on_screen=True，会误导 ensure_visible 直接返回；
+        # 这里显式降级为不可见，好让 ensure_visible 走还原路径。
+        if _window_is_minimized(pid):
+            return False
         for w in windows:
             if getattr(w, "pid", None) == pid and getattr(w, "window_id", None) == window_id:
                 return bool(getattr(w, "is_on_screen", False))
         return False
 
     def activate(self, windows: Sequence[Any], pid: int) -> None:
-        """激活窗口（best-effort；失败静默，与 macOS 侧口径一致）。"""
-        if pid:
-            self._call_tool_silent("bring_to_front", {"pid": pid})
+        """激活窗口：先 Win32 还原最小化，再 SDK bring_to_front（best-effort）。"""
+        if not pid:
+            return
+        _restore_window(pid)
+        self._call_tool_silent("bring_to_front", {"pid": pid})
 
     def raise_window(self, windows: Sequence[Any], pid: int, window_id: int) -> bool:
         """精确前置；返回「调用是否成功」，可见性判定由调用方重新枚举。"""
         if not pid or not window_id:
             return False
+        _restore_window(pid)
         return self._call_tool_silent("bring_to_front", {"pid": pid, "window_id": window_id})
 
     def click_point(self, pid: int, window_id: int, x: float, y: float) -> None:

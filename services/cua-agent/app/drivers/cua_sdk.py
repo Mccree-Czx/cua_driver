@@ -436,56 +436,16 @@ class CuaLiepinDriver:
             raise mapped from e
 
     def _tab_names(self, state: Any) -> list[str]:
-        """批量页顶部候选人选项卡名。
-
-        实测结构：选项卡是顶层 webarea 的直接子级静态文本，直到嵌套详情
-        webarea（也是直接子级）出现为止；账户名「陈智旭」排除。
-        """
-        web_area = self._plat.role_name(Role.WEB_AREA)
-        static_text = self._plat.role_name(Role.TEXT)
-        els = list(getattr(state, "elements", []) or [])
-        top = next((e for e in els if str(getattr(e, "role", "")) == web_area), None)
-        if top is None:
-            return []
-        names: list[str] = []
-        for e in els:
-            if getattr(e, "element_index", 0) <= top.element_index:
-                continue
-            if getattr(e, "parent_index", None) != top.element_index:
-                continue
-            role = str(getattr(e, "role", ""))
-            if role == web_area:
-                break  # 嵌套详情 webarea：选项卡区结束
-            if role != static_text:
-                continue
-            lbl = str(getattr(e, "label", "") or "").strip()
-            if not lbl or lbl == "陈智旭" or lbl in names:
-                continue
-            names.append(lbl)
-        return names
+        """批量页顶部候选人选项卡名（树解析下沉到平台 adapter）。"""
+        return [name for name, _ in self._plat.tab_elements(state)]
 
     def _press_tab(self, pid: int, wid: int, name: str) -> Any:
-        """按名字即时定位并点击候选人选项卡，返回切换后的最新 state。"""
-        web_area = self._plat.role_name(Role.WEB_AREA)
-        static_text = self._plat.role_name(Role.TEXT)
+        """按名字即时定位并点击候选人选项卡，返回切换后的最新 state。
+
+        定位与点击之间不读取 state（Windows 上 element_token 会随每次快照失效）。
+        """
         state = self._live_state(pid, wid)
-        els = list(getattr(state, "elements", []) or [])
-        top = next((e for e in els if str(getattr(e, "role", "")) == web_area), None)
-        tab = None
-        if top is not None:
-            for e in els:
-                if getattr(e, "element_index", 0) <= top.element_index:
-                    continue
-                if getattr(e, "parent_index", None) != top.element_index:
-                    continue
-                if str(getattr(e, "role", "")) == web_area:
-                    break
-                if (
-                    str(getattr(e, "role", "")) == static_text
-                    and str(getattr(e, "label", "") or "").strip() == name
-                ):
-                    tab = e
-                    break
+        tab = next((el for n, el in self._plat.tab_elements(state) if n == name), None)
         if tab is None:
             raise LocatorFailedError(f"批量页未找到选项卡「{name}」（页面结构变化？）")
         self._press(pid, wid, tab)
@@ -504,30 +464,12 @@ class CuaLiepinDriver:
         return None
 
     def _value_after_icon(self, state: Any, icon: str) -> str | None:
-        """字段图标锚点（environment/work/education/file-search）后的首个文本值。"""
-        image = self._plat.role_name(Role.IMAGE)
-        static_text = self._plat.role_name(Role.TEXT)
-        els = list(getattr(state, "elements", []) or [])
-        for pos, e in enumerate(els):
-            if str(getattr(e, "role", "")) == image and str(getattr(e, "label", "") or "") == icon:
-                for nxt in els[pos + 1:pos + 4]:
-                    if str(getattr(nxt, "role", "")) == static_text:
-                        t = str(getattr(nxt, "label", "") or "").strip()
-                        if t:
-                            return t
-        return None
+        """字段图标锚点后的首个文本值（解析方式平台各异，下沉到 adapter）。"""
+        return self._plat.field_value(state, icon)
 
     def _detail_salary(self, state: Any) -> str:
-        """求职意向列表中的薪资项（形如 11-22k×12薪）；页面确实未提供时返回空串。"""
-        els = list(getattr(state, "elements", []) or [])
-        for pos, e in enumerate(els):
-            if str(getattr(e, "label", "") or "") == "求职意向":
-                for nxt in els[pos + 1:pos + 40]:
-                    t = str(getattr(nxt, "label", "") or "").strip()
-                    if "k" in t.lower() and ("薪" in t or "-" in t):
-                        return t
-                return ""
-        return ""
+        """求职意向里的薪资项（解析方式平台各异，下沉到 adapter）。"""
+        return self._plat.salary(state)
 
     def _ensure_visible_and_resolved(self) -> tuple[int, int]:
         """resolve + ensure_visible 组合（读链/写链统一入口）。"""
@@ -583,7 +525,7 @@ class CuaLiepinDriver:
         """切回「在线沟通」标签页（消息列表页）——list_unread 收尾语义：
         worker 后置校验判据=「消息列表页已打开，可见未读会话列表」（实测）。"""
         state = self._live_state(pid, wid)
-        tab = self._find(state, role=Role.RADIO, label="在线沟通")
+        tab = self._find(state, role=Role.TAB, label_contains="在线沟通")
         if tab is None:
             raise LocatorFailedError("未找到「在线沟通」标签页（无法回到消息列表页）")
         self._press(pid, wid, tab)
@@ -620,7 +562,7 @@ class CuaLiepinDriver:
         url = self._current_url(state)
         if self.BATCH_PATH in url:
             return state
-        batch_tab = self._find(state, role=Role.RADIO, label="批量预览简历")
+        batch_tab = self._find(state, role=Role.TAB, label_contains="批量预览简历")
         if batch_tab is not None:
             self._press(pid, wid, batch_tab)
             time.sleep(self.SETTLE_SECONDS)
@@ -654,7 +596,8 @@ class CuaLiepinDriver:
         # 实测（2026-10-06）：「浏览简历」为批量动作——未勾选候选人时点击无效果；
         # 先勾底部「全部」复选框（AXCheckBox，与顶部同名筛选 AXRadioButton 区分；
         # value=1 已勾选则跳过，避免反选）。
-        check_all = self._find(state, role=Role.CHECKBOX, label="全部")
+        # Windows 上 label 带尾随不换行空格（实测 "全部 \xa0"），精确匹配会落空 → 用 contains
+        check_all = self._find(state, role=Role.CHECKBOX, label_contains="全部")
         if check_all is not None and str(getattr(check_all, "value", "0")) != "1":
             self._press(pid, wid, check_all)
             time.sleep(0.5)
