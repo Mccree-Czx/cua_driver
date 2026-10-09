@@ -1,6 +1,8 @@
 # services/cua-agent/tests/test_platform_roles.py
 """角色映射表：把平台无关 Role 翻成各平台的树角色名。"""
 
+import pytest
+
 from app.drivers.platform.base import Role
 from app.drivers.platform.macos import MACOS_ROLE_MAP
 from app.drivers.platform.windows import WINDOWS_ROLE_MAP
@@ -79,3 +81,27 @@ def test_windows_screenshot_scale_is_not_retina_default():
 
     scale = WindowsAdapter(bridge=None).screenshot_px_per_point
     assert scale > 0 and scale <= 4
+
+
+# —— create_adapter 平台分发 ——
+
+
+def test_create_adapter_rejects_unknown_platform(monkeypatch):
+    """未知平台必须明确抛错，不得静默选到错误实现。"""
+    import sys
+
+    from app.drivers.platform import create_adapter
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(RuntimeError, match="不支持"):
+        create_adapter(bridge=None)
+
+
+def test_create_adapter_picks_windows(monkeypatch):
+    import sys
+
+    from app.drivers.platform import create_adapter
+    from app.drivers.platform.windows import WindowsAdapter
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert isinstance(create_adapter(bridge=None), WindowsAdapter)

@@ -55,8 +55,8 @@ from typing import Any, Callable
 
 from hr_workbuddy import MinimalResume
 
+from app.drivers.platform import create_adapter
 from app.drivers.platform.base import PlatformAdapter, Role
-from app.drivers.platform.macos import MacOsAdapter
 
 _CARD_STATUS_RE = re.compile(r"^(在线|离线|.*活跃)$")  # 推荐卡状态词（头像后第 1 个文本）
 
@@ -150,8 +150,7 @@ class CuaLiepinDriver:
             ) from e
         self._bridge = _RuntimeBridge()
         self._driver: Any = self._bridge.call(CuaDriver.create)
-        # 阶段 1 先硬编码 macOS；Task 5 换成 create_adapter() 按平台分发
-        self._plat: PlatformAdapter = MacOsAdapter(self._bridge, self._driver)
+        self._plat: PlatformAdapter = create_adapter(self._bridge, self._driver)
         self._session_started = False
         self._window_cache: tuple[int, int] | None = None  # 猎聘窗口 (pid, window_id) 缓存
 
