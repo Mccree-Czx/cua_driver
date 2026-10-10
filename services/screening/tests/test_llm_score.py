@@ -2,11 +2,11 @@
 
 四种判定结果：
 - hard_pass=False → rejected_hard（短路，不调 LLM）
-- score >= threshold → screened_pass（judge_reason = LLM reason）
-- score < threshold → rejected_llm
+- stars >= min_stars → screened_pass（judge_reason = LLM reason）
+- stars < min_stars → rejected_llm
 - provider 错误 / 输出 schema 非法 → degraded，HTTP 200 不抛到 API 层（Review Focus 2）
 
-全部用例注入 MockLLM，零真实网络调用；threshold 走 ScreenRequest（R6，默认 70）。
+全部用例注入 MockLLM，零真实网络调用；min_stars 走 ScreenRequest（默认 3）。
 """
 
 import json
@@ -140,42 +140,42 @@ class TestRejectedHard:
 
 
 class TestScreenedPass:
-    def test_score_82_above_threshold_passes(self, post):
-        mock = MockLLM({"score": 82, "reason": "匹配度高"})
+    def test_4_stars_above_min_passes(self, post):
+        mock = MockLLM({"stars": 4, "reason": "匹配度高"})
         resp = post(mock, _request().model_dump(mode="json"))
         assert resp.status_code == 200
         result = ScreeningResult.model_validate(resp.json())
         assert result.hard_pass is True
         assert result.hard_reasons == []
-        assert result.score == 82
+        assert result.score == 4
         assert result.judge_reason == "匹配度高"
         assert result.status is CandidateStatus.SCREENED_PASS
         assert result.degraded is False
         assert mock.calls == 1
 
-    def test_score_equal_to_default_threshold_passes(self, post):
-        # 阈值边界：>= 通过（默认 threshold 70，R6）
-        mock = MockLLM({"score": 70, "reason": "达标"})
+    def test_stars_equal_to_default_min_passes(self, post):
+        # 阈值边界：>= 通过（默认 min_stars 3）
+        mock = MockLLM({"stars": 3, "reason": "达标"})
         resp = post(mock, _request().model_dump(mode="json"))
         assert resp.status_code == 200
         assert resp.json()["status"] == "screened_pass"
 
-    def test_custom_threshold_from_request_is_used(self, post):
+    def test_custom_min_stars_from_request_is_used(self, post):
         # R6：阈值由请求携带，screening 不维护自身阈值配置
-        mock = MockLLM({"score": 40, "reason": "一般"})
-        resp = post(mock, _request(threshold=30).model_dump(mode="json"))
+        mock = MockLLM({"stars": 2, "reason": "一般"})
+        resp = post(mock, _request(min_stars=2).model_dump(mode="json"))
         assert resp.status_code == 200
         assert resp.json()["status"] == "screened_pass"
 
 
 class TestRejectedLLM:
-    def test_score_below_threshold(self, post):
-        mock = MockLLM({"score": 40, "reason": "经验不匹配"})
+    def test_stars_below_min(self, post):
+        mock = MockLLM({"stars": 1, "reason": "经验不匹配"})
         resp = post(mock, _request().model_dump(mode="json"))
         assert resp.status_code == 200
         result = ScreeningResult.model_validate(resp.json())
         assert result.hard_pass is True
-        assert result.score == 40
+        assert result.score == 1
         assert result.judge_reason == "经验不匹配"
         assert result.status is CandidateStatus.REJECTED_LLM
         assert result.degraded is False
@@ -184,8 +184,8 @@ class TestRejectedLLM:
 class TestDegraded:
     """Review Focus 2：schema 非法与 provider 失败都进 degraded，HTTP 200。"""
 
-    def test_score_out_of_range_degrades(self, post):
-        mock = MockLLM({"score": 150, "reason": "离谱"})
+    def test_stars_out_of_range_degrades(self, post):
+        mock = MockLLM({"stars": 6, "reason": "离谱"})
         resp = post(mock, _request().model_dump(mode="json"))
         assert resp.status_code == 200
         result = ScreeningResult.model_validate(resp.json())
@@ -198,11 +198,11 @@ class TestDegraded:
     @pytest.mark.parametrize(
         "payload",
         [
-            {"score": "82", "reason": "字符串分数"},  # 非整数
-            {"score": 82.5, "reason": "小数分数"},
-            {"reason": "缺 score 字段"},
-            {"score": 82},  # 缺 reason 字段
-            {"score": 82, "reason": "多字段", "extra": 1},
+            {"stars": "4", "reason": "字符串星级"},  # 非整数
+            {"stars": 4.5, "reason": "小数星级"},
+            {"reason": "缺 stars 字段"},
+            {"stars": 4},  # 缺 reason 字段
+            {"stars": 4, "reason": "多字段", "extra": 1},
         ],
     )
     def test_illegal_output_degrades(self, post, payload):

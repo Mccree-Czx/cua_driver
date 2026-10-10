@@ -15,8 +15,9 @@ from hr_workbuddy import MinimalResume
 from app.schemas import LLMScoreOutput
 
 SYSTEM_PROMPT = (
-    "你是招聘初筛评分助手。根据岗位 JD 与候选人简历给出 0-100 的匹配分并说明理由。"
-    '只输出 JSON 对象：{"score": 0-100 的整数, "reason": "理由"}。'
+    "你是招聘初筛评分助手。根据岗位 JD 与候选人简历给出 1-5 星的匹配评级并说明理由。"
+    "评级标准：1 星=不匹配；2 星=勉强；3 星=基本符合；4 星=完全符合；5 星=符合且有亮点。"
+    '只输出 JSON 对象：{"stars": 1-5 的整数, "reason": "理由"}。'
 )
 
 
@@ -37,12 +38,35 @@ def build_client(base_url: str, api_key: str) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
+def _scoring_prefs_block(prefs: dict) -> str:
+    """把评分卡偏好（加分点/否决点/其他要求）拼成评分提示词片段。"""
+    boosters = prefs.get("boosters") or []
+    veto = prefs.get("veto") or []
+    requirements = prefs.get("requirements") or []
+    if not (boosters or veto or requirements):
+        return ""
+    parts = []
+    if boosters:
+        parts.append("加分点（符合则提升评级）：\n" + "\n".join(f"- {b}" for b in boosters))
+    if veto:
+        parts.append("一票否决点（命中任一直接 1 星）：\n" + "\n".join(f"- {v}" for v in veto))
+    if requirements:
+        parts.append("其他要求：\n" + "\n".join(f"- {r}" for r in requirements))
+    return "评分偏好：\n" + "\n".join(parts)
+
+
 def score(
-    client: OpenAI, jd_text: str, resume: MinimalResume, model: str
+    client: OpenAI,
+    jd_text: str,
+    resume: MinimalResume,
+    model: str,
+    scoring_prefs: dict | None = None,
 ) -> tuple[int, str]:
-    """调用 LLM 评分，返回 (score, reason)；失败抛 LLMScoreError。"""
+    """调用 LLM 评分，返回 (stars, reason)；失败抛 LLMScoreError。"""
+    prefs_block = _scoring_prefs_block(scoring_prefs or {})
     user_prompt = (
         f"岗位 JD：\n{jd_text}\n\n"
+        f"{prefs_block}\n"
         "候选人简历（最小字段快照）：\n"
         f"姓名：{resume.name}\n"
         f"学历：{resume.education}\n"
@@ -78,4 +102,4 @@ def score(
     except ValidationError as exc:
         raise LLMSchemaError(f"LLM 输出不符合 schema: {exc}") from exc
 
-    return result.score, result.reason
+    return result.stars, result.reason

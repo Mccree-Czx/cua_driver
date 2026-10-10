@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { Select, Input, Checkbox, Table, Drawer, Descriptions, Tabs, Tag, Button, Space, Rate, message } from "antd";
+import type { ColumnsType } from "antd/es/table";
 
 type CandidateRow = {
   jc_id: number;
@@ -17,41 +19,54 @@ type CandidateRow = {
 
 type Detail = {
   jc: { id: number; status: string; match_score: number | null; judge_reason: string | null };
-  candidate: { name: string; liepin_user_id: string; online_resume_minimal: Record<string, string> | null };
+  candidate: { name: string; liepin_user_id: string; online_resume_minimal: Record<string, string> | null; resume_ocr_text: string | null };
   snapshot_url: string | null;
   resume_url: string | null;
   interactions: { direction: string; msg_type: string; content: string | null; sent_at: string | null }[];
 };
 
 const STATUS_OPTIONS = [
-  "",
-  "new",
-  "screened_pass",
-  "resume_requested",
-  "awaiting_resume",
-  "resume_received",
-  "hr_reviewed",
-  "no_response",
-  "closed",
-  "rejected_hard",
-  "rejected_llm",
+  { value: "", label: "全部状态" },
+  { value: "new", label: "new" },
+  { value: "screened_pass", label: "screened_pass" },
+  { value: "resume_requested", label: "resume_requested" },
+  { value: "awaiting_resume", label: "awaiting_resume" },
+  { value: "resume_received", label: "resume_received" },
+  { value: "hr_reviewed", label: "hr_reviewed" },
+  { value: "no_response", label: "no_response" },
+  { value: "closed", label: "closed" },
+  { value: "rejected_hard", label: "rejected_hard" },
+  { value: "rejected_llm", label: "rejected_llm" },
 ];
+
+const STATUS_COLOR: Record<string, string> = {
+  rejected_hard: "red",
+  rejected_llm: "volcano",
+  resume_received: "green",
+  hr_reviewed: "cyan",
+  closed: "default",
+  new: "blue",
+  screened_pass: "geekblue",
+  awaiting_resume: "gold",
+  resume_requested: "orange",
+  no_response: "default",
+};
 
 export default function Candidates() {
   const [rows, setRows] = useState<CandidateRow[]>([]);
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
   const [minScoreOnly, setMinScoreOnly] = useState(false);
-  const [threshold, setThreshold] = useState(55);
+  const [minStars, setMinStars] = useState(3);
   const [detail, setDetail] = useState<Detail | null>(null);
-  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    // 达标分档阈值 = 岗位 llm_threshold（2026-10-07 策略：评分退为参考分档）
     fetch("/api/hr/overview")
       .then((r) => r.json())
       .then((body) => {
-        if (body?.job?.llm_threshold) setThreshold(body.job.llm_threshold);
+        const prefs = body?.job?.scoring_prefs || {};
+        if (prefs.min_stars) setMinStars(prefs.min_stars);
       })
       .catch(() => {});
   }, []);
@@ -60,17 +75,18 @@ export default function Candidates() {
     const params = new URLSearchParams();
     if (status) params.set("status", status);
     if (q) params.set("q", q);
-    if (minScoreOnly) params.set("min_score", String(threshold));
+    if (minScoreOnly) params.set("min_score", String(minStars));
+    setLoading(true);
     fetch(`/api/hr/candidates?${params}`)
       .then((r) => r.json())
       .then((body) => setRows(body.items ?? []))
-      .catch(() => setRows([]));
-  }, [status, q, minScoreOnly, threshold]);
+      .catch(() => setRows([]))
+      .finally(() => setLoading(false));
+  }, [status, q, minScoreOnly, minStars]);
 
   useEffect(load, [load]);
 
   async function openDetail(jcId: number) {
-    setMessage("");
     const resp = await fetch(`/api/hr/candidates/${jcId}`);
     if (resp.ok) setDetail(await resp.json());
   }
@@ -83,7 +99,8 @@ export default function Candidates() {
       body: JSON.stringify({ decision, note: decision === "approve" ? "复核确认" : "复核推翻" }),
     });
     const body = await resp.json().catch(() => ({}));
-    setMessage(resp.ok ? `复核完成：${body.status}` : `复核失败（HTTP ${resp.status}）`);
+    if (resp.ok) message.success(`复核完成：${body.status}`);
+    else message.error(`复核失败（HTTP ${resp.status}）`);
     load();
     openDetail(detail.jc.id);
   }
@@ -92,152 +109,175 @@ export default function Candidates() {
     if (!detail) return;
     const resp = await fetch(`/api/hr/candidates/${detail.jc.id}/rerun`, { method: "POST" });
     const body = await resp.json().catch(() => ({}));
-    setMessage(resp.ok ? `已派发重跑：${body.type}` : `重跑失败（HTTP ${resp.status}：${body.detail ?? ""}）`);
+    if (resp.ok) message.success(`已派发重跑：${body.type}`);
+    else message.error(`重跑失败（HTTP ${resp.status}：${body.detail ?? ""}）`);
   }
 
+  const columns: ColumnsType<CandidateRow> = [
+    { title: "jc", dataIndex: "jc_id", key: "jc_id", width: 60 },
+    { title: "姓名", dataIndex: "name", key: "name" },
+    {
+      title: "状态",
+      dataIndex: "status",
+      key: "status",
+      render: (s: string) => <Tag color={STATUS_COLOR[s]}>{s}</Tag>,
+    },
+    {
+      title: "评分",
+      dataIndex: "match_score",
+      key: "match_score",
+      width: 120,
+      render: (v: number | null) => (v ? <Rate disabled value={v} /> : "—"),
+    },
+    {
+      title: "截图",
+      dataIndex: "has_snapshot",
+      key: "has_snapshot",
+      width: 70,
+      render: (v: boolean) => (v ? "有" : "—"),
+    },
+    {
+      title: "PDF",
+      dataIndex: "has_pdf",
+      key: "has_pdf",
+      width: 70,
+      render: (v: boolean) => (v ? "有" : "—"),
+    },
+    { title: "最近触达", dataIndex: "last_touch_at", key: "last_touch_at", render: (v: string | null) => v ?? "—" },
+  ];
+
+  const detailTabs = detail
+    ? [
+        {
+          key: "basic",
+          label: "基本信息",
+          children: (
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="状态">
+                <Tag color={STATUS_COLOR[detail.jc.status]}>{detail.jc.status}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="评分">
+                {detail.jc.match_score ? <Rate disabled value={detail.jc.match_score} /> : "—"}
+              </Descriptions.Item>
+              <Descriptions.Item label="judge_reason">{detail.jc.judge_reason ?? "—"}</Descriptions.Item>
+              <Descriptions.Item label="liepin_user_id">{detail.candidate.liepin_user_id}</Descriptions.Item>
+            </Descriptions>
+          ),
+        },
+        {
+          key: "resume",
+          label: "简历资料",
+          children: (
+            <Space direction="vertical" style={{ width: "100%" }}>
+              {detail.snapshot_url ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={detail.snapshot_url} alt="snapshot" style={{ width: "100%", borderRadius: 6, border: "1px solid #f0f0f0" }} />
+              ) : (
+                <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>无快照</span>
+              )}
+              {detail.resume_url ? (
+                <a href={detail.resume_url} target="_blank">
+                  打开简历 PDF（预签名）
+                </a>
+              ) : (
+                <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>未收到附件</span>
+              )}
+              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginTop: 8 }}>在线简历 7 字段</div>
+              <pre style={{ background: "#fafafa", padding: 12, borderRadius: 6, fontSize: 12 }}>
+                {JSON.stringify(detail.candidate.online_resume_minimal ?? {}, null, 2)}
+              </pre>
+              {detail.candidate.resume_ocr_text && (
+                <>
+                  <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginTop: 8 }}>简历文本（OCR）</div>
+                  <pre
+                    style={{
+                      background: "#fafafa",
+                      padding: 12,
+                      borderRadius: 6,
+                      fontSize: 12,
+                      whiteSpace: "pre-wrap",
+                      maxHeight: 400,
+                      overflowY: "auto",
+                    }}
+                  >
+                    {detail.candidate.resume_ocr_text}
+                  </pre>
+                </>
+              )}
+            </Space>
+          ),
+        },
+        {
+          key: "timeline",
+          label: "互动时间线",
+          children: (
+            <Space direction="vertical" style={{ width: "100%" }}>
+              {detail.interactions.map((row, i) => (
+                <div key={i} style={{ background: "#fafafa", padding: "6px 10px", borderRadius: 6, fontSize: 12 }}>
+                  [{row.sent_at}] {row.direction}/{row.msg_type}：{row.content}
+                </div>
+              ))}
+              {detail.interactions.length === 0 && <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>无互动</span>}
+            </Space>
+          ),
+        },
+      ]
+    : [];
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-3">
-        <h1 className="text-xl font-semibold">候选人</h1>
-        <select
-          className="rounded border border-gray-300 px-2 py-1 text-sm"
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Space wrap>
+        <Select
+          style={{ width: 160 }}
           value={status}
-          onChange={(e) => setStatus(e.target.value)}
-        >
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s} value={s}>
-              {s || "全部状态"}
-            </option>
-          ))}
-        </select>
-        <input
-          className="w-56 rounded border border-gray-300 px-2 py-1 text-sm"
+          options={STATUS_OPTIONS}
+          onChange={(v) => setStatus(v)}
+        />
+        <Input.Search
           placeholder="搜姓名 / liepin id"
+          allowClear
+          style={{ width: 240 }}
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          onSearch={(v) => setQ(v)}
         />
-        <label className="flex items-center gap-1 text-xs text-gray-600">
-          <input
-            type="checkbox"
-            checked={minScoreOnly}
-            onChange={(e) => setMinScoreOnly(e.target.checked)}
-          />
-          仅达标分档（≥{threshold}）
-        </label>
-        <span className="text-xs text-gray-500">{rows.length} 行</span>
-        {message && <span className="text-xs text-blue-700">{message}</span>}
-      </div>
+        <Checkbox checked={minScoreOnly} onChange={(e) => setMinScoreOnly(e.target.checked)}>
+          仅达标分档（≥{minStars} 星）
+        </Checkbox>
+        <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>{rows.length} 行</span>
+      </Space>
 
-      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 text-left text-xs text-gray-500">
-            <tr>
-              <th className="px-3 py-2">jc</th>
-              <th className="px-3 py-2">姓名</th>
-              <th className="px-3 py-2">状态</th>
-              <th className="px-3 py-2">评分</th>
-              <th className="px-3 py-2">截图</th>
-              <th className="px-3 py-2">PDF</th>
-              <th className="px-3 py-2">最近触达</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr
-                key={row.jc_id}
-                className="cursor-pointer border-t border-gray-100 hover:bg-blue-50"
-                onClick={() => openDetail(row.jc_id)}
-              >
-                <td className="px-3 py-2">{row.jc_id}</td>
-                <td className="px-3 py-2">{row.name}</td>
-                <td className="px-3 py-2">{row.status}</td>
-                <td className="px-3 py-2">{row.match_score ?? "—"}</td>
-                <td className="px-3 py-2">{row.has_snapshot ? "有" : "—"}</td>
-                <td className="px-3 py-2">{row.has_pdf ? "有" : "—"}</td>
-                <td className="px-3 py-2">{row.last_touch_at ?? "—"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table
+        rowKey="jc_id"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={rows}
+        onRow={(row) => ({ onClick: () => openDetail(row.jc_id), style: { cursor: "pointer" } })}
+        pagination={{ pageSize: 50, showSizeChanger: false }}
+      />
 
-      {detail && (
-        <div className="fixed inset-y-0 right-0 z-10 w-[560px] overflow-y-auto border-l border-gray-200 bg-white p-5 shadow-xl">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">
-              #{detail.jc.id} {detail.candidate.name}
-            </h2>
-            <button className="text-sm text-gray-500" onClick={() => setDetail(null)}>
-              关闭
-            </button>
-          </div>
-          <div className="mb-3 text-sm text-gray-600">
-            状态：<b>{detail.jc.status}</b> ｜ 评分：{detail.jc.match_score ?? "—"} ｜{" "}
-            {detail.candidate.liepin_user_id}
-          </div>
-          <p className="mb-4 text-xs text-gray-500">{detail.jc.judge_reason}</p>
-
-          <div className="mb-4">
-            <div className="mb-1 text-xs text-gray-500">初筛截图（预签名 ≤15min）</div>
-            {detail.snapshot_url ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={detail.snapshot_url} alt="snapshot" className="w-full rounded border" />
-            ) : (
-              <p className="text-xs text-gray-400">无快照</p>
-            )}
-          </div>
-
-          <div className="mb-4">
-            <div className="mb-1 text-xs text-gray-500">二筛简历 PDF</div>
-            {detail.resume_url ? (
-              <a href={detail.resume_url} target="_blank" className="text-sm text-blue-600 underline">
-                打开 PDF（预签名 ≤15min）
-              </a>
-            ) : (
-              <p className="text-xs text-gray-400">未收到附件</p>
-            )}
-          </div>
-
-          <div className="mb-4">
-            <div className="mb-1 text-xs text-gray-500">在线简历 7 字段</div>
-            <pre className="rounded bg-gray-50 p-2 text-xs">
-              {JSON.stringify(detail.candidate.online_resume_minimal ?? {}, null, 2)}
-            </pre>
-          </div>
-
-          <div className="mb-4">
-            <div className="mb-1 text-xs text-gray-500">互动时间线</div>
-            <ul className="space-y-1 text-xs">
-              {detail.interactions.map((row, i) => (
-                <li key={i} className="rounded bg-gray-50 px-2 py-1">
-                  [{row.sent_at}] {row.direction}/{row.msg_type}：{row.content}
-                </li>
-              ))}
-            </ul>
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={() => review("approve")}
-              className="rounded bg-green-600 px-3 py-1.5 text-sm text-white hover:bg-green-700"
-            >
-              复核通过
-            </button>
-            <button
-              onClick={() => review("reject")}
-              className="rounded bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
-            >
-              复核推翻
-            </button>
-            <button
-              onClick={rerun}
-              className="rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50"
-            >
-              手动重跑
-            </button>
-          </div>
-        </div>
-      )}
+      <Drawer
+        width={600}
+        open={!!detail}
+        onClose={() => setDetail(null)}
+        title={detail ? `#${detail.jc.id} ${detail.candidate.name}` : ""}
+      >
+        {detail && (
+          <>
+            <Tabs defaultActiveKey="basic" items={detailTabs} />
+            <Space style={{ marginTop: 16 }}>
+              <Button type="primary" onClick={() => review("approve")}>
+                复核通过
+              </Button>
+              <Button danger onClick={() => review("reject")}>
+                复核推翻
+              </Button>
+              <Button onClick={rerun}>手动重跑</Button>
+            </Space>
+          </>
+        )}
+      </Drawer>
     </div>
   );
 }

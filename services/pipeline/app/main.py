@@ -1,7 +1,9 @@
 """pipeline 入口：配置加载 + 启动前执行迁移（D4）+ FastAPI 装配。
 
 D4：Alembic 只在 pipeline（schema 唯一 owner），应用启动前 `alembic upgrade head`。
-端点：T7 装配——管理端点（api）与内部回调（task_results）；状态机 T4、存储 T6。
+端点：管理端点（api）与 HR 面（hr_api）；状态机 T4、存储 T6。
+B 方案（2026-10-09）：内部回调端点（/internal/*）已随旧编排层删除——执行由
+Pi 内核经 hr-tools 直写。
 script_location 显式指到绝对路径：进程 cwd 无关（测试从仓库根启动同理可跑）。
 """
 
@@ -31,8 +33,6 @@ app = FastAPI(title="hr-workbuddy pipeline")
 
 from app.api import router as jobs_router  # noqa: E402  （路由装配在迁移之后）
 from app.hr_api import router as hr_router  # noqa: E402
-from app.task_results import router as internal_router  # noqa: E402
 
 app.include_router(jobs_router)
-app.include_router(internal_router)
 app.include_router(hr_router)

@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     minio_bucket: str = "hr-workbuddy"  # E2E 用独立 bucket（hr-workbuddy-e2e）隔离生产归档
     screening_url: str = "http://127.0.0.1:8001"
     daily_resume_target: int = 50  # 日回收目标（回收端 KPI；未达标日低分简历照常入库）
+    baidu_ocr_api_key: str = ""  # 百度 OCR（简历截图 → 文本）
+    baidu_ocr_secret_key: str = ""
 
 
 @lru_cache

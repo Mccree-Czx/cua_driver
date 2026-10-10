@@ -116,9 +116,9 @@ def test_overview_counts_buckets_and_today(client, session):
     _add_interaction(session, jc_b.id, "in", "attachment")
 
     body = client.get(f"/api/hr/overview?job_id={job_id}").json()
-    assert body["job"]["llm_threshold"] == 70
+    assert body["job"]["llm_threshold"] == 40
     assert body["status_counts"] == {"new": 1, "resume_received": 1, "closed": 1}
-    assert body["score_buckets"] == {"<40": 0, "40-59": 1, "60-69": 0, ">=70": 1, "未评分": 1}
+    assert body["score_buckets"] == {"1星": 0, "2星": 1, "3星": 0, "4星": 1, "5星": 0, "未评分": 1}
     assert body["today"]["touches_out"] == 1  # 岗位维度计数
     assert body["today"]["received"] == 1
     assert body["today"]["manual"] >= 0  # 全局口径（其他用例可能已产生转人工落账）
@@ -228,23 +228,6 @@ def test_review_approve_reject_and_guards(client, session):
         ).status_code
         == 404
     )
-
-
-def test_rerun_task_mapping_and_guards(client, fake_queue, session):
-    job_id = _new_job(client)
-    jc_new = _seed_jc(session, job_id, status="new")
-    jc_wait = _seed_jc(session, job_id, status="awaiting_resume")
-    jc_closed = _seed_jc(session, job_id, status="closed")
-
-    resp = client.post(f"/api/hr/candidates/{jc_new.id}/rerun")
-    assert resp.status_code == 200 and resp.json()["type"] == "read_resume"
-    resp = client.post(f"/api/hr/candidates/{jc_wait.id}/rerun")
-    assert resp.status_code == 200 and resp.json()["type"] == "check_attachment"
-    assert [t.type for t in fake_queue.enqueued] == [
-        AtomicTaskType.READ_RESUME,
-        AtomicTaskType.CHECK_ATTACHMENT,
-    ]
-    assert client.post(f"/api/hr/candidates/{jc_closed.id}/rerun").status_code == 409
 
 
 def test_patch_job_threshold_reflow(client, session):

@@ -35,7 +35,7 @@ def _no_llm_client():
 
 def _post(**overrides):
     payload = dict(
-        job_id=1, resume=RESUME, jd_text="产品经理 JD", hard_rules=HARD_RULES, threshold=70
+        job_id=1, resume=RESUME, jd_text="产品经理 JD", hard_rules=HARD_RULES, min_stars=3
     )
     payload.update(overrides)
     return client.post("/screen", json=payload)

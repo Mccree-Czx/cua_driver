@@ -1,9 +1,8 @@
 """硬规则过滤（spec v1.6 §3 步骤 3）：学历 / 年限 / 城市 / 排除词。
 
-规则键集（controller 裁定）：
+规则键集（controller 裁定；2026-10-09 剔除城市匹配——cities 键存在时被忽略）：
 - min_education:   最低学历（按级别比较）
 - min_years:       最低工作年限（整数；简历 years_of_experience 解析首个数字）
-- cities:          允许城市列表（精确匹配）
 - exclude_keywords: 排除词列表（命中任一 → 不通过；扫描简历全部文本字段）
 
 缺键 / 值为 None / 空列表 = 无该约束。判定保守：学历无法识别、年限无法
@@ -72,11 +71,6 @@ def evaluate(rules: dict, resume: MinimalResume) -> tuple[bool, list[str]]:
                 reasons.append(
                     f"工作年限{resume.years_of_experience}低于要求{min_years}年"
                 )
-
-    cities = rules.get("cities")
-    if cities:
-        if resume.city not in cities:
-            reasons.append(f"城市{resume.city}不在允许列表{'/'.join(map(str, cities))}")
 
     exclude_keywords = rules.get("exclude_keywords")
     if exclude_keywords:

@@ -17,7 +17,6 @@ def rules() -> dict:
     return {
         "min_education": "本科",
         "min_years": 3,
-        "cities": ["深圳", "广州"],
         "exclude_keywords": ["外包", "劳务派遣"],
     }
 
@@ -69,10 +68,10 @@ class TestFail:
         assert any("年限" in r for r in reasons)
 
     def test_city_not_allowed(self, rules, make_resume):
+        # 2026-10-09：城市匹配已从硬规则剔除——城市不在旧列表也应通过（向后兼容）
         passed, reasons = evaluate(rules, make_resume(city="北京"))
-        assert passed is False
-        assert reasons and all(r for r in reasons)
-        assert any("城市" in r for r in reasons)
+        assert passed is True
+        assert reasons == []
 
     def test_exclude_keyword_hit(self, rules, make_resume):
         passed, reasons = evaluate(
@@ -84,10 +83,10 @@ class TestFail:
 
     def test_multiple_violations_collect_all_reasons(self, rules, make_resume):
         passed, reasons = evaluate(
-            rules, make_resume(education="大专", years_of_experience="1", city="北京")
+            rules, make_resume(education="大专", years_of_experience="1")
         )
         assert passed is False
-        assert len(reasons) == 3
+        assert len(reasons) == 2
 
 
 class TestEducationSynonyms:
@@ -165,7 +164,7 @@ class TestRuleKeys:
 
     def test_empty_values_mean_no_constraint(self, make_resume):
         passed, reasons = evaluate(
-            {"min_education": None, "cities": [], "exclude_keywords": []},
+            {"min_education": None, "exclude_keywords": []},
             make_resume(education="大专", city="北京"),
         )
         assert passed is True

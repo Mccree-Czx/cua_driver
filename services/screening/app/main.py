@@ -90,11 +90,12 @@ def screen(
             request.jd_text,
             request.resume,
             get_settings().screening_llm_model,
+            request.scoring_prefs,
         )
     except LLMScoreError:
         return _degraded()
 
-    if llm_score >= request.threshold:
+    if llm_score >= request.min_stars:
         return ScreeningResult(
             hard_pass=True,
             hard_reasons=[],

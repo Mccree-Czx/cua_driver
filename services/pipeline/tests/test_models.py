@@ -38,21 +38,21 @@ def _make_job_and_candidate(session) -> tuple[models.Job, models.Candidate]:
 
 
 def test_job_defaults_and_json_roundtrip(session):
-    """llm_threshold 默认 70；hard_rules/template_msgs JSON 往返；created_at 落库。"""
+    """llm_threshold 默认 40；hard_rules/template_msgs JSON 往返；created_at 落库。"""
     job = models.Job(
         title=_unique("产品经理"),
         jd_text="负责产品规划",
         hard_rules={"min_education": "本科", "min_years": 3},
         template_msgs={"greet_request": "您好 {name}，看到您在看{title}岗位"},
     )
-    assert job.llm_threshold == 70  # flush 前即取 Python 侧默认
+    assert job.llm_threshold == 40  # flush 前即取 Python 侧默认
     assert job.status == "active"
 
     session.add(job)
     session.commit()
 
     loaded = session.execute(select(models.Job).where(models.Job.id == job.id)).scalar_one()
-    assert loaded.llm_threshold == 70
+    assert loaded.llm_threshold == 40
     assert loaded.hard_rules == {"min_education": "本科", "min_years": 3}
     assert loaded.template_msgs == {"greet_request": "您好 {name}，看到您在看{title}岗位"}
     assert loaded.created_at is not None

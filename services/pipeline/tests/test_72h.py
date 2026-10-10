@@ -1,24 +1,19 @@
-"""72h 关闭（R3）：close_stale_awaiting 边界 + 巡检端点。真实 MySQL。
+"""72h 关闭（R3）：close_stale_awaiting 边界。真实 MySQL。
 
 - +72h1s → awaiting_resume 关为 closed，out 消息总数保持 1（零追发）
 - 恰好 72h 不关【Review Focus 3】（严格 >，`resume_requested_at < now-72h`）
-- 窗口内与终态行不受影响；POST /internal/sweeps/stale-awaiting 端点烟雾
+- 窗口内与终态行不受影响
 
-函数级用例传显式 now（时钟注入），边界语义精确可测；端点用例用真实时钟
-（73h 前锚点，确定性过期）。
+函数级用例传显式 now（时钟注入），边界语义精确可测。
 """
 
 import uuid
 from datetime import datetime, timedelta
 
-import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app import models
-from app.db import SessionLocal
-from app.main import app
-from app.orchestrator import RESUME_TIMEOUT, close_stale_awaiting
+from app.sweep import RESUME_TIMEOUT, close_stale_awaiting
 from hr_workbuddy import CandidateStatus
 
 FIXED_NOW = datetime(2026, 10, 5, 12, 0, 0)
@@ -97,24 +92,3 @@ def test_close_only_touches_stale_awaiting_rows(session):
     assert session.get(models.JobCandidate, fresh.id).status == CandidateStatus.AWAITING_RESUME.value
     assert session.get(models.JobCandidate, stale.id).status == CandidateStatus.CLOSED.value
     assert _out_count(session, stale.id) == 1  # 关闭零追发
-
-
-@pytest.fixture()
-def client():
-    with TestClient(app) as c:
-        yield c
-
-
-def test_sweep_endpoint_closes_stale(client):
-    """R3 端点：POST /internal/sweeps/stale-awaiting 包装 close_stale_awaiting(真实时钟)。"""
-    with SessionLocal() as s:
-        jc = _make_awaiting(s, datetime.now() - RESUME_TIMEOUT - timedelta(minutes=1))
-        s.commit()
-        jc_id = jc.id
-
-    resp = client.post("/internal/sweeps/stale-awaiting")
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["closed"] >= 1
-
-    with SessionLocal() as s:
-        assert s.get(models.JobCandidate, jc_id).status == CandidateStatus.CLOSED.value

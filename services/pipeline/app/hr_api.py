@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import redis as redis_lib
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,7 +23,7 @@ from app import models
 from app.config import get_settings
 from app.deps import get_login_state, get_queue, get_session, get_store
 from app.state_machine import InvalidTransition, StateEvent, TransitionContext, transition
-from hr_workbuddy import AtomicTask, AtomicTaskType, CandidateStatus
+from hr_workbuddy import CandidateStatus
 
 router = APIRouter(prefix="/api/hr", tags=["hr"])
 
@@ -35,6 +35,21 @@ REVIEW_FROM = {CandidateStatus.RESUME_RECEIVED.value, CandidateStatus.HR_REVIEWE
 
 def _today_start() -> datetime:
     return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _score_to_stars(score: int) -> int:
+    """1-5 星直取；旧 0-100 数据映射折算（<40→1,40-59→2,60-79→3,80-89→4,≥90→5）。"""
+    if 1 <= score <= 5:
+        return score
+    if score < 40:
+        return 1
+    if score < 60:
+        return 2
+    if score < 80:
+        return 3
+    if score < 90:
+        return 4
+    return 5
 
 
 def _presign(store: Any, key: str | None) -> str | None:
@@ -66,16 +81,9 @@ def hr_overview(
         score_stmt = score_stmt.where(models.JobCandidate.job_id == job_id)
     status_counts = {s: n for s, n in session.execute(status_stmt).all()}
     scores = [s for (s,) in session.execute(score_stmt).all() if s is not None]
-    buckets = {"<40": 0, "40-59": 0, "60-69": 0, ">=70": 0, "未评分": 0}
+    buckets = {"1星": 0, "2星": 0, "3星": 0, "4星": 0, "5星": 0, "未评分": 0}
     for score in scores:
-        if score < 40:
-            buckets["<40"] += 1
-        elif score < 60:
-            buckets["40-59"] += 1
-        elif score < 70:
-            buckets["60-69"] += 1
-        else:
-            buckets[">=70"] += 1
+        buckets[f"{_score_to_stars(score)}星"] += 1
     buckets["未评分"] = sum(status_counts.values()) - len(scores)
     start = _today_start()
     touches_stmt = (
@@ -107,7 +115,7 @@ def hr_overview(
     )
     job = session.get(models.Job, job_id) if job_id is not None else None
     return {
-        "job": {"id": job.id, "title": job.title, "llm_threshold": job.llm_threshold} if job else None,
+        "job": {"id": job.id, "title": job.title, "llm_threshold": job.llm_threshold, "scoring_prefs": job.scoring_prefs} if job else None,
         "status_counts": status_counts,
         "score_buckets": buckets,
         "today": {
@@ -209,6 +217,7 @@ def hr_candidate_detail(
             "name": candidate.name if candidate else None,
             "liepin_user_id": candidate.liepin_user_id if candidate else None,
             "online_resume_minimal": candidate.online_resume_minimal if candidate else None,
+            "resume_ocr_text": candidate.resume_ocr_text if candidate else None,
         },
         "snapshot_url": _presign(store, candidate.snapshot_object_key if candidate else None),
         "resume_url": _presign(store, jc.minio_object_key),
@@ -432,6 +441,32 @@ def hr_alerts(
     }
 
 
+@router.get("/tasklogs")
+def hr_tasklogs(
+    limit: int = Query(200, ge=1, le=1000), session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """最近的运行日志（Pi 经 hr-tools tasklog_add 落账，倒序）。"""
+    rows = session.execute(
+        select(models.TaskLog).order_by(models.TaskLog.id.desc()).limit(limit)
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": t.id,
+                "task_id": t.task_id,
+                "outcome": t.outcome,
+                "attempt": t.attempt,
+                "tokens": t.tokens,
+                "cost": t.cost,
+                "duration": t.duration,
+                "note": t.note,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in rows
+        ]
+    }
+
+
 # —— 动作端点 ——
 
 
@@ -474,49 +509,17 @@ def hr_review(
     return {"ok": True, "status": jc.status}
 
 
-RERUN_TASK_MAP = {
-    CandidateStatus.NEW.value: AtomicTaskType.READ_RESUME,
-    CandidateStatus.SCREENED_PASS.value: AtomicTaskType.CHECK_ATTACHMENT,
-    CandidateStatus.RESUME_REQUESTED.value: AtomicTaskType.CHECK_ATTACHMENT,
-    CandidateStatus.AWAITING_RESUME.value: AtomicTaskType.CHECK_ATTACHMENT,
-}
-
-
-@router.post("/candidates/{jc_id}/rerun")
-def hr_rerun(
-    jc_id: int,
-    session: Session = Depends(get_session),
-    queue: Any = Depends(get_queue),
-) -> dict[str, Any]:
-    """手动重跑：按状态派发对应任务（new→读简历；请求/等待→附件探测）。"""
-    jc = session.get(models.JobCandidate, jc_id)
-    if jc is None:
-        raise HTTPException(status_code=404, detail=f"job_candidate {jc_id} 不存在")
-    candidate = session.get(models.Candidate, jc.candidate_id)
-    task_type = RERUN_TASK_MAP.get(jc.status)
-    if task_type is None or candidate is None:
-        raise HTTPException(status_code=409, detail=f"状态 {jc.status} 不支持手动重跑")
-    task = AtomicTask(
-        task_id=uuid4(),
-        type=task_type,
-        job_id=jc.job_id,
-        job_candidate_id=jc.id,
-        candidate_liepin_id=candidate.liepin_user_id,
-        context={},
-    )
-    queue.enqueue(task)
-    return {"ok": True, "task_id": str(task.task_id), "type": task_type.value}
-
-
 class JobPatch(BaseModel):
     llm_threshold: int | None = None
+    min_stars: int | None = None
+    scoring_prefs: dict[str, Any] | None = None
 
 
 @router.patch("/jobs/{job_id}")
 def hr_patch_job(
     job_id: int, body: JobPatch, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
-    """阈值回流（最小形态）：调整 LLM 阈值（0-100）。"""
+    """岗位配置回流：LLM 阈值（遗留 0-100）/ 评分卡（min_stars + scoring_prefs）。"""
     job = session.get(models.Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"岗位 {job_id} 不存在")
@@ -524,5 +527,18 @@ def hr_patch_job(
         if not 0 <= body.llm_threshold <= 100:
             raise HTTPException(status_code=422, detail="llm_threshold 须在 0-100")
         job.llm_threshold = body.llm_threshold
+    if body.scoring_prefs is not None:
+        job.scoring_prefs = body.scoring_prefs
+    elif body.min_stars is not None:
+        if not 1 <= body.min_stars <= 5:
+            raise HTTPException(status_code=422, detail="min_stars 须在 1-5")
+        prefs = dict(job.scoring_prefs or {})
+        prefs["min_stars"] = body.min_stars
+        job.scoring_prefs = prefs
     session.commit()
-    return {"ok": True, "id": job.id, "llm_threshold": job.llm_threshold}
+    return {
+        "ok": True,
+        "id": job.id,
+        "llm_threshold": job.llm_threshold,
+        "scoring_prefs": job.scoring_prefs,
+    }

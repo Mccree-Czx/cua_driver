@@ -22,7 +22,8 @@ class JobCreate(BaseModel):
     jd_text: str
     hard_rules: dict[str, Any] = Field(default_factory=dict)
     template_msgs: dict[str, Any] = Field(default_factory=dict)
-    llm_threshold: int = 70
+    llm_threshold: int = 40
+    scoring_prefs: dict[str, Any] = Field(default_factory=dict)
     status: str = JOB_STATUS_ACTIVE
 
 
@@ -35,6 +36,7 @@ class JobOut(BaseModel):
     hard_rules: dict[str, Any]
     template_msgs: dict[str, Any]
     llm_threshold: int
+    scoring_prefs: dict[str, Any]
     status: str
     created_at: datetime
 

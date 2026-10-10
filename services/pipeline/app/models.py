@@ -48,8 +48,9 @@ class Job(Base):
     jd_text: Mapped[str] = mapped_column(Text, nullable=False)
     hard_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     template_msgs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    scoring_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     llm_threshold: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=70, server_default=text("70")
+        Integer, nullable=False, default=40, server_default=text("70")
     )
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=JOB_STATUS_ACTIVE,
@@ -63,7 +64,8 @@ class Job(Base):
         """构造期默认值：列 default 只在 INSERT 时生效，构造期读不到。"""
         kwargs.setdefault("hard_rules", {})
         kwargs.setdefault("template_msgs", {})
-        kwargs.setdefault("llm_threshold", 70)
+        kwargs.setdefault("scoring_prefs", {})
+        kwargs.setdefault("llm_threshold", 40)
         kwargs.setdefault("status", JOB_STATUS_ACTIVE)
         super().__init__(**kwargs)
 
@@ -78,6 +80,7 @@ class Candidate(Base):
         JSON, nullable=False, default=dict
     )
     snapshot_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    resume_ocr_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(
         Enum(*CANDIDATE_SOURCES, name="candidate_source"), nullable=False
     )
@@ -181,12 +184,11 @@ class ReviewOverride(Base):
 
 
 class TaskLog(Base):
-    """任务 token 成本落账（spec §5 成本失控；M1 只落账，M4 按日/轮聚合）。
+    """任务成本落账（spec §5 成本失控；M1 只落账，M4 按日/轮聚合）。
 
-    tokens/cost 单位与 TaskResult.evidence 的 brain_tokens/cost_est 一致
-    （cost 为浮点元、保留 6 位微元精度，故列取 Float）；duration 为任务
-    耗时秒数（evidence.duration_s）；note 为事件注记（如「迟到附件，只存
-    不推进」），可空。
+    tokens/cost 单位为整数 token 数与浮点元（保留 6 位微元精度，列取
+    Float）；duration 为任务耗时秒数；note 为事件注记（如「迟到附件，只存
+    不推进」），可空。B 方案：由 hr-tools 的 tasklog_add 工具落账。
     """
 
     __tablename__ = "task_logs"

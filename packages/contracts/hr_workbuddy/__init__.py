@@ -1,26 +1,19 @@
-"""hr_workbuddy 共享契约包：数据模型 + 驱动/大脑协议（spec v1.6 §任务契约）。"""
+"""hr_workbuddy 共享契约包：数据模型（B 方案 2026-10-09 清理死契约后）。"""
 
 from hr_workbuddy.models import (
     AtomicTask,
     AtomicTaskType,
     CandidateStatus,
-    FallbackSuggestion,
     MinimalResume,
     ScreenRequest,
     ScreeningResult,
-    TaskResult,
 )
-from hr_workbuddy.protocols import BrainClient, LiepinDriver
 
 __all__ = [
     "AtomicTask",
     "AtomicTaskType",
-    "TaskResult",
     "MinimalResume",
     "ScreenRequest",
     "ScreeningResult",
     "CandidateStatus",
-    "FallbackSuggestion",
-    "LiepinDriver",
-    "BrainClient",
 ]

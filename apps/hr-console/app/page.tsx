@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Row, Col, Card, Statistic, Table, Tag, InputNumber, Button, message } from "antd";
 
 type Overview = {
   job?: { id: number; title: string; llm_threshold: number } | null;
@@ -24,12 +25,20 @@ type DailyDay = {
 
 type Job = { id: number; title: string; llm_threshold: number; status: string };
 
+const STATUS_COLOR: Record<string, string> = {
+  rejected_hard: "red",
+  rejected_llm: "volcano",
+  resume_received: "green",
+  hr_reviewed: "cyan",
+  closed: "default",
+  new: "blue",
+};
+
 export default function Home() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [daily, setDaily] = useState<{ days: DailyDay[]; totals: Record<string, number | null> } | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [thresholdDraft, setThresholdDraft] = useState<Record<number, number>>({});
-  const [message, setMessage] = useState("");
 
   function load() {
     fetch("/api/hr/overview").then((r) => r.json()).then(setOverview).catch(() => {});
@@ -50,157 +59,129 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ llm_threshold: value }),
     });
-    setMessage(resp.ok ? `岗位 ${jobId} 阈值已更新为 ${value}` : `更新失败（HTTP ${resp.status}）`);
+    if (resp.ok) message.success(`岗位 ${jobId} 阈值已更新为 ${value}`);
+    else message.error(`更新失败（HTTP ${resp.status}）`);
     load();
   }
 
+  const totalCandidates = overview
+    ? Object.values(overview.status_counts).reduce((a, b) => a + b, 0)
+    : 0;
+
+  const dailyColumns = [
+    { title: "日期", dataIndex: "date", key: "date" },
+    { title: "新增", dataIndex: "new_jc", key: "new_jc" },
+    { title: "直索要", dataIndex: "direct_request", key: "direct_request" },
+    { title: "打招呼", dataIndex: "greet_request", key: "greet_request" },
+    { title: "回执", dataIndex: "reply", key: "reply" },
+    { title: "收到简历", dataIndex: "received", key: "received" },
+    {
+      title: "转化率",
+      dataIndex: "conversion",
+      key: "conversion",
+      render: (v: number | null) => (v === null ? "—" : `${v}%`),
+    },
+    { title: "tokens", dataIndex: "tokens", key: "tokens" },
+    { title: "转人工", dataIndex: "manual", key: "manual" },
+  ];
+
+  const jobColumns = [
+    { title: "岗位", dataIndex: "title", key: "title", render: (_: string, r: Job) => `#${r.id} ${r.title}（${r.status}）` },
+    {
+      title: "LLM 阈值",
+      dataIndex: "llm_threshold",
+      key: "llm_threshold",
+      render: (_: number, r: Job) => (
+        <InputNumber
+          min={0}
+          max={100}
+          value={thresholdDraft[r.id] ?? r.llm_threshold}
+          onChange={(v) => setThresholdDraft({ ...thresholdDraft, [r.id]: v ?? 0 })}
+        />
+      ),
+    },
+    {
+      title: "操作",
+      key: "action",
+      render: (_: unknown, r: Job) => (
+        <Button type="primary" size="small" onClick={() => saveThreshold(r.id)}>
+          保存
+        </Button>
+      ),
+    },
+  ];
+
   return (
-    <div className="space-y-8">
-      <section>
-        <h1 className="mb-4 text-xl font-semibold">漏斗总览</h1>
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <Card title="漏斗总览">
         {overview ? (
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-            <div className="rounded-lg border border-gray-200 bg-white p-4">
-              <div className="text-xs text-gray-500">今日触达（out）</div>
-              <div className="text-2xl font-semibold">{overview.today.touches_out}</div>
-            </div>
-            <div className="rounded-lg border border-gray-200 bg-white p-4">
-              <div className="text-xs text-gray-500">今日收到简历</div>
-              <div className="text-2xl font-semibold">{overview.today.received}</div>
-              <div className="mt-1 text-xs text-gray-400">
-                目标 {overview.today.received_target ?? 50} / 天
-              </div>
-              <div className="mt-1 h-1.5 w-full rounded bg-gray-100">
-                <div
-                  className="h-1.5 rounded bg-blue-500"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.round(
-                        (overview.today.received / (overview.today.received_target ?? 50)) * 100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
-            <div className="rounded-lg border border-gray-200 bg-white p-4">
-              <div className="text-xs text-gray-500">今日转人工</div>
-              <div className="text-2xl font-semibold">{overview.today.manual}</div>
-            </div>
-            <div className="rounded-lg border border-gray-200 bg-white p-4">
-              <div className="text-xs text-gray-500">候选人总数</div>
-              <div className="text-2xl font-semibold">
-                {Object.values(overview.status_counts).reduce((a, b) => a + b, 0)}
-              </div>
-            </div>
-            <div className="col-span-full rounded-lg border border-gray-200 bg-white p-4">
-              <div className="mb-2 text-xs text-gray-500">状态分布</div>
-              <div className="flex flex-wrap gap-3 text-sm">
+          <>
+            <Row gutter={16}>
+              <Col span={6}>
+                <Statistic title="今日触达（out）" value={overview.today.touches_out} />
+              </Col>
+              <Col span={6}>
+                <Statistic title="今日收到简历" value={overview.today.received} suffix={`/ ${overview.today.received_target ?? 50}`} />
+              </Col>
+              <Col span={6}>
+                <Statistic title="今日转人工" value={overview.today.manual} />
+              </Col>
+              <Col span={6}>
+                <Statistic title="候选人总数" value={totalCandidates} />
+              </Col>
+            </Row>
+            <div style={{ marginTop: 16 }}>
+              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginBottom: 8 }}>状态分布</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                 {Object.entries(overview.status_counts).map(([k, v]) => (
-                  <span key={k} className="rounded bg-gray-100 px-2 py-1">
-                    {k}: <b>{v}</b>
-                  </span>
+                  <Tag key={k} color={STATUS_COLOR[k]}>
+                    {k}: {v}
+                  </Tag>
                 ))}
               </div>
-              <div className="mt-3 mb-2 text-xs text-gray-500">评分分布</div>
-              <div className="flex flex-wrap gap-3 text-sm">
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginBottom: 8 }}>评分分布</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                 {Object.entries(overview.score_buckets).map(([k, v]) => (
-                  <span key={k} className="rounded bg-gray-100 px-2 py-1">
-                    {k}: <b>{v}</b>
-                  </span>
+                  <Tag key={k}>
+                    {k}: {v}
+                  </Tag>
                 ))}
               </div>
             </div>
-          </div>
+          </>
         ) : (
-          <p className="text-sm text-gray-500">加载中…（需 pipeline 在 127.0.0.1:8000 运行）</p>
+          <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 13 }}>
+            加载中…（需 pipeline 在 127.0.0.1:8000 运行）
+          </span>
         )}
-      </section>
+      </Card>
 
-      <section>
-        <h2 className="mb-3 text-lg font-semibold">每日漏斗（近 14 天）</h2>
-        <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-left text-xs text-gray-500">
-              <tr>
-                <th className="px-3 py-2">日期</th>
-                <th className="px-3 py-2">新增</th>
-                <th className="px-3 py-2">直索要</th>
-                <th className="px-3 py-2">打招呼</th>
-                <th className="px-3 py-2">回执</th>
-                <th className="px-3 py-2">收到简历</th>
-                <th className="px-3 py-2">转化率</th>
-                <th className="px-3 py-2">tokens</th>
-                <th className="px-3 py-2">转人工</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(daily?.days ?? []).map((d) => (
-                <tr key={d.date} className="border-t border-gray-100">
-                  <td className="px-3 py-2">{d.date}</td>
-                  <td className="px-3 py-2">{d.new_jc}</td>
-                  <td className="px-3 py-2">{d.direct_request}</td>
-                  <td className="px-3 py-2">{d.greet_request}</td>
-                  <td className="px-3 py-2">{d.reply}</td>
-                  <td className="px-3 py-2">{d.received}</td>
-                  <td className="px-3 py-2">{d.conversion === null ? "—" : `${d.conversion}%`}</td>
-                  <td className="px-3 py-2">{d.tokens}</td>
-                  <td className="px-3 py-2">{d.manual}</td>
-                </tr>
-              ))}
-            </tbody>
-            {daily && (
-              <tfoot className="bg-gray-50 text-xs">
-                <tr>
-                  <td className="px-3 py-2 font-medium">合计</td>
-                  <td className="px-3 py-2">{daily.totals.new_jc}</td>
-                  <td className="px-3 py-2">—</td>
-                  <td className="px-3 py-2">—</td>
-                  <td className="px-3 py-2">—</td>
-                  <td className="px-3 py-2">{daily.totals.received}</td>
-                  <td className="px-3 py-2">
-                    {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`}
-                  </td>
-                  <td className="px-3 py-2">{daily.totals.tokens}</td>
-                  <td className="px-3 py-2">{daily.totals.manual}</td>
-                </tr>
-              </tfoot>
-            )}
-          </table>
-        </div>
-      </section>
+      <Card title="每日漏斗（近 14 天）">
+        <Table
+          rowKey="date"
+          size="small"
+          columns={dailyColumns}
+          dataSource={daily?.days ?? []}
+          pagination={false}
+          footer={
+            daily
+              ? () => (
+                  <span style={{ fontSize: 12 }}>
+                    合计：新增 {daily.totals.new_jc} · 收到简历 {daily.totals.received} · 转化率{" "}
+                    {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`} · tokens{" "}
+                    {daily.totals.tokens} · 转人工 {daily.totals.manual}
+                  </span>
+                )
+              : undefined
+          }
+        />
+      </Card>
 
-      <section>
-        <h2 className="mb-3 text-lg font-semibold">岗位阈值调整（阈值回流）</h2>
-        <div className="space-y-2 rounded-lg border border-gray-200 bg-white p-4">
-          {jobs.length === 0 && <p className="text-sm text-gray-500">暂无岗位</p>}
-          {jobs.map((job) => (
-            <div key={job.id} className="flex items-center gap-3 text-sm">
-              <span className="w-64 truncate">
-                #{job.id} {job.title}（{job.status}）
-              </span>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                className="w-20 rounded border border-gray-300 px-2 py-1"
-                value={thresholdDraft[job.id] ?? job.llm_threshold}
-                onChange={(e) =>
-                  setThresholdDraft({ ...thresholdDraft, [job.id]: Number(e.target.value) })
-                }
-              />
-              <button
-                onClick={() => saveThreshold(job.id)}
-                className="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-700"
-              >
-                保存
-              </button>
-            </div>
-          ))}
-          {message && <p className="text-xs text-gray-600">{message}</p>}
-        </div>
-      </section>
+      <Card title="岗位阈值调整（阈值回流）">
+        <Table rowKey="id" size="small" columns={jobColumns} dataSource={jobs} pagination={false} />
+      </Card>
     </div>
   );
 }

@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { Table, Button, Space, message } from "antd";
+import type { ColumnsType } from "antd/es/table";
 
 type QueueItem = {
   task_id: string;
@@ -15,7 +17,6 @@ type QueueItem = {
 
 export default function ManualQueue() {
   const [items, setItems] = useState<QueueItem[]>([]);
-  const [message, setMessage] = useState("");
 
   const load = useCallback(() => {
     fetch("/api/hr/manual-queue")
@@ -32,7 +33,8 @@ export default function ManualQueue() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note: "工作台已确认" }),
     });
-    setMessage(resp.ok ? "已注记（acked）" : `注记失败（HTTP ${resp.status}）`);
+    if (resp.ok) message.success("已注记（acked）");
+    else message.error(`注记失败（HTTP ${resp.status}）`);
     load();
   }
 
@@ -40,67 +42,45 @@ export default function ManualQueue() {
     if (jcId === null) return;
     const resp = await fetch(`/api/hr/candidates/${jcId}/rerun`, { method: "POST" });
     const body = await resp.json().catch(() => ({}));
-    setMessage(resp.ok ? `已派发重跑：${body.type}` : `重跑失败（HTTP ${resp.status}）`);
+    if (resp.ok) message.success(`已派发重跑：${body.type}`);
+    else message.error(`重跑失败（HTTP ${resp.status}）`);
   }
 
+  const columns: ColumnsType<QueueItem> = [
+    { title: "时间", dataIndex: "created_at", key: "created_at", width: 160, render: (v: string | null) => v ?? "—" },
+    { title: "任务类型", dataIndex: "task_type", key: "task_type", render: (v: string | null) => v ?? "（登记过期）" },
+    {
+      title: "候选人",
+      key: "candidate",
+      render: (_: unknown, r: QueueItem) =>
+        `${r.candidate_name ?? "—"}${r.job_candidate_id !== null ? `（jc=${r.job_candidate_id}）` : ""}`,
+    },
+    { title: "状态", dataIndex: "jc_status", key: "jc_status", render: (v: string | null) => v ?? "—" },
+    { title: "注记", dataIndex: "note", key: "note", render: (v: string | null) => v ?? "—" },
+    {
+      title: "操作",
+      key: "action",
+      render: (_: unknown, r: QueueItem) => (
+        <Space>
+          {r.job_candidate_id !== null && (
+            <Button size="small" onClick={() => rerun(r.job_candidate_id)}>
+              重跑
+            </Button>
+          )}
+          <Button size="small" onClick={() => ack(r.task_id)}>
+            忽略
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-3">
-        <h1 className="text-xl font-semibold">人工队列</h1>
-        <span className="text-xs text-gray-500">{items.length} 项（failed_needs_manual 落账）</span>
-        {message && <span className="text-xs text-blue-700">{message}</span>}
-      </div>
-      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 text-left text-xs text-gray-500">
-            <tr>
-              <th className="px-3 py-2">时间</th>
-              <th className="px-3 py-2">任务类型</th>
-              <th className="px-3 py-2">候选人</th>
-              <th className="px-3 py-2">状态</th>
-              <th className="px-3 py-2">注记</th>
-              <th className="px-3 py-2">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((item) => (
-              <tr key={item.task_id} className="border-t border-gray-100">
-                <td className="px-3 py-2 text-xs">{item.created_at}</td>
-                <td className="px-3 py-2">{item.task_type ?? "（登记过期）"}</td>
-                <td className="px-3 py-2">
-                  {item.candidate_name ?? "—"}
-                  {item.job_candidate_id !== null ? `（jc=${item.job_candidate_id}）` : ""}
-                </td>
-                <td className="px-3 py-2">{item.jc_status ?? "—"}</td>
-                <td className="px-3 py-2 text-xs">{item.note ?? "—"}</td>
-                <td className="space-x-2 px-3 py-2">
-                  {item.job_candidate_id !== null && (
-                    <button
-                      onClick={() => rerun(item.job_candidate_id)}
-                      className="rounded border border-gray-300 px-2 py-1 text-xs hover:bg-gray-50"
-                    >
-                      重跑
-                    </button>
-                  )}
-                  <button
-                    onClick={() => ack(item.task_id)}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs hover:bg-gray-50"
-                  >
-                    忽略
-                  </button>
-                </td>
-              </tr>
-            ))}
-            {items.length === 0 && (
-              <tr>
-                <td colSpan={6} className="px-3 py-6 text-center text-xs text-gray-400">
-                  队列为空
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>
+        {items.length} 项（failed_needs_manual 落账）
+      </span>
+      <Table rowKey="task_id" size="small" columns={columns} dataSource={items} pagination={{ pageSize: 50, showSizeChanger: false }} />
     </div>
   );
 }
