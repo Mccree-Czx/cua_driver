@@ -16,7 +16,6 @@ type DailyDay = {
   new_jc: number;
   direct_request: number;
   greet_request: number;
-  reply: number;
   received: number;
   conversion: number | null;
   tokens: number;
@@ -65,7 +64,6 @@ export default function Home() {
     { title: "新增", dataIndex: "new_jc", key: "new_jc" },
     { title: "直索要", dataIndex: "direct_request", key: "direct_request" },
     { title: "打招呼", dataIndex: "greet_request", key: "greet_request" },
-    { title: "回执", dataIndex: "reply", key: "reply" },
     { title: "收到简历", dataIndex: "received", key: "received" },
     {
       title: "转化率",
@@ -73,7 +71,6 @@ export default function Home() {
       key: "conversion",
       render: (v: number | null) => (v === null ? "—" : `${v}%`),
     },
-    { title: "tokens", dataIndex: "tokens", key: "tokens" },
     { title: "转人工", dataIndex: "manual", key: "manual" },
   ];
 
@@ -162,8 +159,7 @@ export default function Home() {
               ? () => (
                   <span style={{ fontSize: 12 }}>
                     合计：新增 {daily.totals.new_jc} · 收到简历 {daily.totals.received} · 转化率{" "}
-                    {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`} · tokens{" "}
-                    {daily.totals.tokens} · 转人工 {daily.totals.manual}
+                    {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`} · 转人工 {daily.totals.manual}
                   </span>
                 )
               : undefined

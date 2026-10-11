@@ -313,14 +313,14 @@ def hr_daily(
     }
     day_map: dict[str, dict[str, int]] = {}
     for d, msg_type, n in out_rows:
-        day = day_map.setdefault(str(d), {"direct_request": 0, "greet_request": 0, "reply": 0})
+        day = day_map.setdefault(str(d), {"direct_request": 0, "greet_request": 0})
         if msg_type in day:
             day[msg_type] = n
     all_days = sorted(set(new_jc) | set(received) | set(costs) | set(day_map) | set(manual))
     totals = {"new_jc": 0, "requests": 0, "received": 0, "tokens": 0, "cost": 0.0, "manual": 0}
     days_out = []
     for d in all_days:
-        day = day_map.get(d, {"direct_request": 0, "greet_request": 0, "reply": 0})
+        day = day_map.get(d, {"direct_request": 0, "greet_request": 0})
         requests = day["direct_request"] + day["greet_request"]
         recv = received.get(d, 0)
         tokens, cost = costs.get(d, (0, 0.0))
@@ -330,7 +330,6 @@ def hr_daily(
                 "new_jc": new_jc.get(d, 0),
                 "direct_request": day["direct_request"],
                 "greet_request": day["greet_request"],
-                "reply": day["reply"],
                 "received": recv,
                 "conversion": round(recv / requests * 100, 1) if requests else None,
                 "tokens": tokens,

@@ -16,6 +16,11 @@ type QueueItem = {
   created_at: string | null;
 };
 
+function fmtTime(v: string | null): string {
+  if (!v) return "—";
+  return v.replace("T", " ").slice(0, 16);
+}
+
 export default function ManualQueue() {
   const [items, setItems] = useState<QueueItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -56,7 +61,7 @@ export default function ManualQueue() {
   }
 
   const columns: ColumnsType<QueueItem> = [
-    { title: "时间", dataIndex: "created_at", key: "created_at", width: 160, render: (v: string | null) => v ?? "—" },
+    { title: "时间", dataIndex: "created_at", key: "created_at", width: 160, render: (v: string | null) => fmtTime(v) },
     { title: "任务类型", dataIndex: "task_type", key: "task_type", render: (v: string | null) => v ?? "（登记过期）" },
     {
       title: "候选人",

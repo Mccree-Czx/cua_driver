@@ -33,6 +33,11 @@ const STATUS_OPTIONS = [
   ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value, label })),
 ];
 
+function fmtTime(v: string | null): string {
+  if (!v) return "—";
+  return v.replace("T", " ").slice(0, 16);
+}
+
 export default function Candidates() {
   const [rows, setRows] = useState<CandidateRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -131,7 +136,7 @@ export default function Candidates() {
       width: 70,
       render: (v: boolean) => (v ? "有" : "—"),
     },
-    { title: "最近互动", dataIndex: "last_touch_at", key: "last_touch_at", render: (v: string | null) => v ?? "—" },
+    { title: "最近互动", dataIndex: "last_touch_at", key: "last_touch_at", render: (v: string | null) => fmtTime(v) },
   ];
 
   const detailTabs = detail
@@ -203,7 +208,7 @@ export default function Candidates() {
             <Space direction="vertical" style={{ width: "100%" }}>
               {detail.interactions.map((row, i) => (
                 <div key={i} style={{ background: "#fafafa", padding: "6px 10px", borderRadius: 6, fontSize: 12 }}>
-                  [{row.sent_at}] {row.direction}/{row.msg_type}：{row.content}
+                  [{fmtTime(row.sent_at)}] {row.direction}/{row.msg_type}：{row.content}
                 </div>
               ))}
               {detail.interactions.length === 0 && <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>无互动</span>}
