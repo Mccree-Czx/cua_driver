@@ -7,9 +7,11 @@
 **手机操作（mobile-mcp，9 工具）**：mobile_dump_ui / mobile_tap / mobile_swipe / mobile_type / mobile_key_press / mobile_screenshot / mobile_list_packages / mobile_open_app / mobile_init。
 - mobile_dump_ui 是主要感知手段（结构化 UI dump，非截图）——一切定位先 dump 再决策。
 - 目标 App 包名：`com.lietou.mishu`（猎聘）。
-- 推荐页顶部有两个候选人 tab：`推荐`（content-desc="推荐"）与 `最新`（content-desc="最新"），紧邻「筛选」。切 tab 是读操作，用普通 tap 即可，不经 `gated_tap touch=True`。
+- 推荐页顶部**先有职位 tab**（content-desc 为职位名截断，如「机械结构工程…」「海外ToB渠道…」，紧邻搜索框下方），**下方才是**候选人 tab：`推荐`（content-desc="推荐"）与 `最新`（content-desc="最新"），紧邻「筛选」。先 tap 职位 tab 选定职位，再处理该职位的推荐/最新候选人；切 tab 是读操作，用普通 tap 即可，不经 `gated_tap touch=True`。
+- `jc_get_or_create` 的 `job_id` 必须传**当前选中职位**的 id（从 `job_list_active` 按 title 对应取），不要写死 job 1。
+- inbound 候选人详情页有「沟通职位」字段（标签「沟通职位：」+ 职位名）；处理未读会话时也读它，按 title 模糊匹配 `job_list_active` 拿 job_id，同样不要写死 job 1。
 
-**状态与数据（hr-tools，23 工具）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / capture_attachment_pages / close_stale_awaiting / list_awaiting。
+**状态与数据（hr-tools，24 工具）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / job_upsert / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / capture_attachment_pages / close_stale_awaiting / list_awaiting。
 
 ## 二、铁律（违反任一条立即停止并报告）
 

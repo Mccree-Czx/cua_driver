@@ -366,6 +366,32 @@ def job_list_active() -> dict:
 
 
 @mcp.tool()
+def job_upsert(
+    title: str,
+    jd_text: str = "",
+    hard_rules: dict | None = None,
+    scoring_prefs: dict | None = None,
+    status: str = "active",
+) -> dict:
+    """按 title 幂等建岗位：已存在返回 {created: false}，不存在则创建返回 {created: true}。"""
+    with SessionLocal() as session:
+        job = session.execute(select(Job).where(Job.title == title)).scalar_one_or_none()
+        if job is not None:
+            return {"id": job.id, "created": False}
+        job = Job(
+            title=title,
+            jd_text=jd_text,
+            hard_rules=hard_rules or {},
+            scoring_prefs=scoring_prefs or {},
+            status=status,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return {"id": job.id, "created": True}
+
+
+@mcp.tool()
 def rate_acquire(key: str, rate_per_window: int, window_seconds: int) -> dict:
     """固定窗口令牌桶：成功 {allowed: true} 并占 1 令牌；超限 {allowed: false} 不占。"""
     allowed = _bucket().acquire(key, rate_per_window, window_seconds)

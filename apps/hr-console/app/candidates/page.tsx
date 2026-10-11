@@ -7,6 +7,8 @@ import { STATUS_LABEL, STATUS_COLOR, statusLabel } from "../status";
 
 type CandidateRow = {
   jc_id: number;
+  job_id: number;
+  job_title: string;
   name: string;
   liepin_user_id: string;
   source: string;
@@ -46,8 +48,17 @@ export default function Candidates() {
   const [q, setQ] = useState("");
   const [minScoreOnly, setMinScoreOnly] = useState(false);
   const [minStars, setMinStars] = useState(3);
+  const [jobId, setJobId] = useState("");
+  const [jobs, setJobs] = useState<{ id: number; title: string }[]>([]);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/jobs")
+      .then((r) => r.json())
+      .then((body) => setJobs(body ?? []))
+      .catch(() => setJobs([]));
+  }, []);
 
   useEffect(() => {
     fetch("/api/hr/overview")
@@ -63,6 +74,7 @@ export default function Candidates() {
     const params = new URLSearchParams();
     if (status) params.set("status", status);
     if (q) params.set("q", q);
+    if (jobId) params.set("job_id", jobId);
     if (minScoreOnly) params.set("min_score", String(minStars));
     params.set("limit", "50");
     params.set("offset", String((page - 1) * 50));
@@ -78,11 +90,11 @@ export default function Candidates() {
         setTotal(0);
       })
       .finally(() => setLoading(false));
-  }, [status, q, minScoreOnly, minStars, page]);
+  }, [status, q, jobId, minScoreOnly, minStars, page]);
 
   useEffect(() => {
     setPage(1);
-  }, [status, q, minScoreOnly, minStars]);
+  }, [status, q, jobId, minScoreOnly, minStars]);
 
   useEffect(load, [load]);
 
@@ -116,6 +128,7 @@ export default function Candidates() {
   const columns: ColumnsType<CandidateRow> = [
     { title: "jc", dataIndex: "jc_id", key: "jc_id", width: 60 },
     { title: "姓名", dataIndex: "name", key: "name" },
+    { title: "职位", dataIndex: "job_title", key: "job_title", render: (v: string) => v || "—" },
     {
       title: "状态",
       dataIndex: "status",
@@ -221,6 +234,14 @@ export default function Candidates() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Space wrap>
+        <Select
+          style={{ width: 200 }}
+          value={jobId || undefined}
+          placeholder="全部职位"
+          allowClear
+          options={jobs.map((j) => ({ value: String(j.id), label: j.title }))}
+          onChange={(v) => setJobId(v ?? "")}
+        />
         <Select
           style={{ width: 160 }}
           value={status}

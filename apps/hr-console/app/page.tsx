@@ -1,8 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Row, Col, Card, Statistic, Table, Tag, InputNumber, Button, message } from "antd";
+import { Row, Col, Card, Statistic, Table, Tag, Collapse, Form, Rate, Input, Button, message } from "antd";
 import { STATUS_COLOR, statusLabel } from "./status";
+
+type ScoringPrefs = {
+  min_stars?: number;
+  boosters?: string[];
+  veto?: string[];
+  requirements?: string[];
+};
 
 type Overview = {
   job?: { id: number; title: string; llm_threshold: number } | null;
@@ -23,13 +30,81 @@ type DailyDay = {
   manual: number;
 };
 
-type Job = { id: number; title: string; llm_threshold: number; status: string };
+type Job = {
+  id: number;
+  title: string;
+  jd_text: string;
+  llm_threshold: number;
+  status: string;
+  scoring_prefs: ScoringPrefs | null;
+};
+
+function JobScoringForm({ job, onSaved }: { job: Job; onSaved: () => void }) {
+  const [form] = Form.useForm();
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const prefs = job.scoring_prefs || {};
+    form.setFieldsValue({
+      min_stars: prefs.min_stars ?? 3,
+      boosters: (prefs.boosters || []).join("\n"),
+      veto: (prefs.veto || []).join("\n"),
+      requirements: (prefs.requirements || []).join("\n"),
+    });
+  }, [job, form]);
+
+  async function onSave(values: { min_stars: number; boosters?: string; veto?: string; requirements?: string }) {
+    const splitLines = (s?: string) => (s || "").split("\n").map((x) => x.trim()).filter(Boolean);
+    const scoring_prefs = {
+      min_stars: values.min_stars,
+      boosters: splitLines(values.boosters),
+      veto: splitLines(values.veto),
+      requirements: splitLines(values.requirements),
+    };
+    setSaving(true);
+    const resp = await fetch(`/api/hr/jobs/${job.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scoring_prefs }),
+    });
+    setSaving(false);
+    if (resp.ok) {
+      message.success(`岗位 ${job.id} 评分偏好已保存`);
+      onSaved();
+    } else {
+      message.error(`保存失败（HTTP ${resp.status}）`);
+    }
+  }
+
+  return (
+    <Form form={form} layout="vertical" onFinish={onSave}>
+      <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 13, marginBottom: 8 }}>招聘信息 / JD</div>
+      <div style={{ whiteSpace: "pre-line", fontSize: 13, marginBottom: 16, background: "#fafafa", padding: 12, borderRadius: 6 }}>
+        {job.jd_text || "（暂无 JD）"}
+      </div>
+      <Form.Item name="min_stars" label="最低主动沟通星级">
+        <Rate />
+      </Form.Item>
+      <Form.Item name="boosters" label="加分点（每行一项）">
+        <Input.TextArea rows={2} placeholder="符合则提升评级，如：海外销售经验、英语流利" />
+      </Form.Item>
+      <Form.Item name="veto" label="一票否决点（每行一项）">
+        <Input.TextArea rows={2} placeholder="命中任一直接 1 星，如：无 ToB 经验" />
+      </Form.Item>
+      <Form.Item name="requirements" label="其他要求（每行一项）">
+        <Input.TextArea rows={2} placeholder="如：可接受出差" />
+      </Form.Item>
+      <Button type="primary" htmlType="submit" loading={saving}>
+        保存评分偏好
+      </Button>
+    </Form>
+  );
+}
 
 export default function Home() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [daily, setDaily] = useState<{ days: DailyDay[]; totals: Record<string, number | null> } | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [thresholdDraft, setThresholdDraft] = useState<Record<number, number>>({});
 
   function load() {
     fetch("/api/hr/overview").then((r) => r.json()).then(setOverview).catch(() => {});
@@ -41,19 +116,6 @@ export default function Home() {
   }
 
   useEffect(load, []);
-
-  async function saveThreshold(jobId: number) {
-    const value = thresholdDraft[jobId];
-    if (value === undefined) return;
-    const resp = await fetch(`/api/hr/jobs/${jobId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ llm_threshold: value }),
-    });
-    if (resp.ok) message.success(`岗位 ${jobId} 阈值已更新为 ${value}`);
-    else message.error(`更新失败（HTTP ${resp.status}）`);
-    load();
-  }
 
   const totalCandidates = overview
     ? Object.values(overview.status_counts).reduce((a, b) => a + b, 0)
@@ -74,34 +136,24 @@ export default function Home() {
     { title: "转人工", dataIndex: "manual", key: "manual" },
   ];
 
-  const jobColumns = [
-    { title: "岗位", dataIndex: "title", key: "title", render: (_: string, r: Job) => `#${r.id} ${r.title}（${r.status}）` },
-    {
-      title: "LLM 阈值",
-      dataIndex: "llm_threshold",
-      key: "llm_threshold",
-      render: (_: number, r: Job) => (
-        <InputNumber
-          min={0}
-          max={100}
-          value={thresholdDraft[r.id] ?? r.llm_threshold}
-          onChange={(v) => setThresholdDraft({ ...thresholdDraft, [r.id]: v ?? 0 })}
-        />
-      ),
-    },
-    {
-      title: "操作",
-      key: "action",
-      render: (_: unknown, r: Job) => (
-        <Button type="primary" size="small" onClick={() => saveThreshold(r.id)}>
-          保存
-        </Button>
-      ),
-    },
-  ];
+  const activeJobs = jobs.filter((j) => j.status === "active");
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <Card title="在招职位">
+        {activeJobs.length > 0 ? (
+          <Collapse
+            items={activeJobs.map((job) => ({
+              key: String(job.id),
+              label: job.title,
+              children: <JobScoringForm job={job} onSaved={load} />,
+            }))}
+          />
+        ) : (
+          <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 13 }}>暂无在招职位</span>
+        )}
+      </Card>
+
       <Card title="漏斗总览">
         {overview ? (
           <>
@@ -167,9 +219,6 @@ export default function Home() {
         />
       </Card>
 
-      <Card title="岗位阈值调整（阈值回流）">
-        <Table rowKey="id" size="small" columns={jobColumns} dataSource={jobs} pagination={false} />
-      </Card>
     </div>
   );
 }

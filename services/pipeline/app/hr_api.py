@@ -139,8 +139,9 @@ def hr_candidates(
 ) -> dict[str, Any]:
     """候选人列表（筛选 + 分页；新到在前）。min_score：达标分档视图（回收目标口径）。"""
     stmt = (
-        select(models.JobCandidate, models.Candidate)
+        select(models.JobCandidate, models.Candidate, models.Job)
         .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .join(models.Job, models.Job.id == models.JobCandidate.job_id)
         .order_by(models.JobCandidate.id.desc())
     )
     count_stmt = select(func.count()).select_from(models.JobCandidate).join(
@@ -162,7 +163,7 @@ def hr_candidates(
         count_stmt = count_stmt.where(models.JobCandidate.match_score >= min_score)
     total = session.scalar(count_stmt) or 0
     rows = session.execute(stmt.limit(limit).offset(offset)).all()
-    jc_ids = [jc.id for jc, _ in rows]
+    jc_ids = [jc.id for jc, _, _ in rows]
     latest_map = (
         dict(
             session.execute(
@@ -178,6 +179,7 @@ def hr_candidates(
         {
             "jc_id": jc.id,
             "job_id": jc.job_id,
+            "job_title": job.title,
             "name": candidate.name,
             "liepin_user_id": candidate.liepin_user_id,
             "source": candidate.source,
@@ -188,7 +190,7 @@ def hr_candidates(
             "has_pdf": bool(jc.minio_object_key),
             "last_touch_at": latest_map[jc.id].isoformat() if jc.id in latest_map else None,
         }
-        for jc, candidate in rows
+        for jc, candidate, job in rows
     ]
     return {"total": total, "items": items}
 

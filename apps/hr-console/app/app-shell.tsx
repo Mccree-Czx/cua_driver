@@ -21,7 +21,6 @@ const NAV = [
   { key: "/candidates", icon: <TeamOutlined />, label: <Link href="/candidates">候选人</Link> },
   { key: "/manual", icon: <InboxOutlined />, label: <Link href="/manual">人工队列</Link> },
   { key: "/logs", icon: <FileTextOutlined />, label: <Link href="/logs">运行日志</Link> },
-  { key: "/scoring", icon: <SettingOutlined />, label: <Link href="/scoring">评分偏好</Link> },
 ];
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
