@@ -80,7 +80,7 @@ class Candidate(Base):
         JSON, nullable=False, default=dict
     )
     snapshot_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    resume_ocr_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resume_html_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     source: Mapped[str] = mapped_column(
         Enum(*CANDIDATE_SOURCES, name="candidate_source"), nullable=False
     )

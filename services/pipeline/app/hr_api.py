@@ -162,6 +162,18 @@ def hr_candidates(
         count_stmt = count_stmt.where(models.JobCandidate.match_score >= min_score)
     total = session.scalar(count_stmt) or 0
     rows = session.execute(stmt.limit(limit).offset(offset)).all()
+    jc_ids = [jc.id for jc, _ in rows]
+    latest_map = (
+        dict(
+            session.execute(
+                select(models.Interaction.job_candidate_id, func.max(models.Interaction.sent_at))
+                .where(models.Interaction.job_candidate_id.in_(jc_ids))
+                .group_by(models.Interaction.job_candidate_id)
+            ).all()
+        )
+        if jc_ids
+        else {}
+    )
     items = [
         {
             "jc_id": jc.id,
@@ -174,7 +186,7 @@ def hr_candidates(
             "judge_reason": jc.judge_reason,
             "has_snapshot": bool(candidate.snapshot_object_key),
             "has_pdf": bool(jc.minio_object_key),
-            "last_touch_at": jc.last_touch_at.isoformat() if jc.last_touch_at else None,
+            "last_touch_at": latest_map[jc.id].isoformat() if jc.id in latest_map else None,
         }
         for jc, candidate in rows
     ]
@@ -202,6 +214,16 @@ def hr_candidate_detail(
         .scalars()
         .all()
     )
+    snapshot_urls: list[str] = []
+    if candidate is not None and candidate.liepin_user_id:
+        try:
+            objs = store.client.list_objects(
+                store.bucket, prefix=f"snapshots/{candidate.liepin_user_id}/", recursive=True
+            )
+            snap_keys = sorted(o.object_name for o in objs)
+            snapshot_urls = [_presign(store, k) for k in snap_keys]
+        except Exception:  # noqa: BLE001  # 列出失败不阻塞详情
+            snapshot_urls = []
     return {
         "job": {"id": job.id, "title": job.title} if job else None,
         "jc": {
@@ -217,10 +239,11 @@ def hr_candidate_detail(
             "name": candidate.name if candidate else None,
             "liepin_user_id": candidate.liepin_user_id if candidate else None,
             "online_resume_minimal": candidate.online_resume_minimal if candidate else None,
-            "resume_ocr_text": candidate.resume_ocr_text if candidate else None,
         },
         "snapshot_url": _presign(store, candidate.snapshot_object_key if candidate else None),
+        "snapshot_urls": snapshot_urls,
         "resume_url": _presign(store, jc.minio_object_key),
+        "resume_html_url": _presign(store, candidate.resume_html_key if candidate else None),
         "interactions": [
             {
                 "direction": row.direction,
@@ -333,6 +356,7 @@ def hr_daily(
 @router.get("/manual-queue")
 def hr_manual_queue(
     limit: int = Query(50, ge=1, le=MANUAL_QUEUE_MAX),
+    offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
     queue: Any = Depends(get_queue),
 ) -> dict[str, Any]:
@@ -348,6 +372,7 @@ def hr_manual_queue(
             .where(models.TaskLog.outcome == "failed_needs_manual")
             .order_by(models.TaskLog.id.desc())
             .limit(limit)
+            .offset(offset)
         )
         .scalars()
         .all()

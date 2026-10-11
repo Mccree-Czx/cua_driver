@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Table, Button, Space, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import { statusLabel } from "../status";
 
 type QueueItem = {
   task_id: string;
@@ -17,13 +18,21 @@ type QueueItem = {
 
 export default function ManualQueue() {
   const [items, setItems] = useState<QueueItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
 
   const load = useCallback(() => {
-    fetch("/api/hr/manual-queue")
+    fetch(`/api/hr/manual-queue?limit=50&offset=${(page - 1) * 50}`)
       .then((r) => r.json())
-      .then((body) => setItems(body.items ?? []))
-      .catch(() => setItems([]));
-  }, []);
+      .then((body) => {
+        setItems(body.items ?? []);
+        setTotal(body.total ?? 0);
+      })
+      .catch(() => {
+        setItems([]);
+        setTotal(0);
+      });
+  }, [page]);
 
   useEffect(load, [load]);
 
@@ -55,7 +64,7 @@ export default function ManualQueue() {
       render: (_: unknown, r: QueueItem) =>
         `${r.candidate_name ?? "—"}${r.job_candidate_id !== null ? `（jc=${r.job_candidate_id}）` : ""}`,
     },
-    { title: "状态", dataIndex: "jc_status", key: "jc_status", render: (v: string | null) => v ?? "—" },
+    { title: "状态", dataIndex: "jc_status", key: "jc_status", render: (v: string | null) => (v ? statusLabel(v) : "—") },
     { title: "注记", dataIndex: "note", key: "note", render: (v: string | null) => v ?? "—" },
     {
       title: "操作",
@@ -80,7 +89,13 @@ export default function ManualQueue() {
       <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>
         {items.length} 项（failed_needs_manual 落账）
       </span>
-      <Table rowKey="task_id" size="small" columns={columns} dataSource={items} pagination={{ pageSize: 50, showSizeChanger: false }} />
+      <Table
+        rowKey="task_id"
+        size="small"
+        columns={columns}
+        dataSource={items}
+        pagination={{ current: page, pageSize: 50, total, showSizeChanger: false, onChange: (p) => setPage(p) }}
+      />
     </div>
   );
 }

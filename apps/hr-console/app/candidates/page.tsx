@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Select, Input, Checkbox, Table, Drawer, Descriptions, Tabs, Tag, Button, Space, Rate, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import { STATUS_LABEL, STATUS_COLOR, statusLabel } from "../status";
 
 type CandidateRow = {
   jc_id: number;
@@ -19,41 +20,23 @@ type CandidateRow = {
 
 type Detail = {
   jc: { id: number; status: string; match_score: number | null; judge_reason: string | null };
-  candidate: { name: string; liepin_user_id: string; online_resume_minimal: Record<string, string> | null; resume_ocr_text: string | null };
+  candidate: { name: string; liepin_user_id: string; online_resume_minimal: Record<string, string> | null };
   snapshot_url: string | null;
+  snapshot_urls: string[];
   resume_url: string | null;
+  resume_html_url: string | null;
   interactions: { direction: string; msg_type: string; content: string | null; sent_at: string | null }[];
 };
 
 const STATUS_OPTIONS = [
   { value: "", label: "全部状态" },
-  { value: "new", label: "new" },
-  { value: "screened_pass", label: "screened_pass" },
-  { value: "resume_requested", label: "resume_requested" },
-  { value: "awaiting_resume", label: "awaiting_resume" },
-  { value: "resume_received", label: "resume_received" },
-  { value: "hr_reviewed", label: "hr_reviewed" },
-  { value: "no_response", label: "no_response" },
-  { value: "closed", label: "closed" },
-  { value: "rejected_hard", label: "rejected_hard" },
-  { value: "rejected_llm", label: "rejected_llm" },
+  ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value, label })),
 ];
-
-const STATUS_COLOR: Record<string, string> = {
-  rejected_hard: "red",
-  rejected_llm: "volcano",
-  resume_received: "green",
-  hr_reviewed: "cyan",
-  closed: "default",
-  new: "blue",
-  screened_pass: "geekblue",
-  awaiting_resume: "gold",
-  resume_requested: "orange",
-  no_response: "default",
-};
 
 export default function Candidates() {
   const [rows, setRows] = useState<CandidateRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
   const [minScoreOnly, setMinScoreOnly] = useState(false);
@@ -76,12 +59,24 @@ export default function Candidates() {
     if (status) params.set("status", status);
     if (q) params.set("q", q);
     if (minScoreOnly) params.set("min_score", String(minStars));
+    params.set("limit", "50");
+    params.set("offset", String((page - 1) * 50));
     setLoading(true);
     fetch(`/api/hr/candidates?${params}`)
       .then((r) => r.json())
-      .then((body) => setRows(body.items ?? []))
-      .catch(() => setRows([]))
+      .then((body) => {
+        setRows(body.items ?? []);
+        setTotal(body.total ?? 0);
+      })
+      .catch(() => {
+        setRows([]);
+        setTotal(0);
+      })
       .finally(() => setLoading(false));
+  }, [status, q, minScoreOnly, minStars, page]);
+
+  useEffect(() => {
+    setPage(1);
   }, [status, q, minScoreOnly, minStars]);
 
   useEffect(load, [load]);
@@ -120,14 +115,14 @@ export default function Candidates() {
       title: "状态",
       dataIndex: "status",
       key: "status",
-      render: (s: string) => <Tag color={STATUS_COLOR[s]}>{s}</Tag>,
+      render: (s: string) => <Tag color={STATUS_COLOR[s]}>{statusLabel(s)}</Tag>,
     },
     {
       title: "评分",
       dataIndex: "match_score",
       key: "match_score",
       width: 120,
-      render: (v: number | null) => (v ? <Rate disabled value={v} /> : "—"),
+      render: (v: number | null) => (v ? <Rate disabled value={v} style={{ fontSize: 14 }} /> : "—"),
     },
     {
       title: "截图",
@@ -136,14 +131,7 @@ export default function Candidates() {
       width: 70,
       render: (v: boolean) => (v ? "有" : "—"),
     },
-    {
-      title: "PDF",
-      dataIndex: "has_pdf",
-      key: "has_pdf",
-      width: 70,
-      render: (v: boolean) => (v ? "有" : "—"),
-    },
-    { title: "最近触达", dataIndex: "last_touch_at", key: "last_touch_at", render: (v: string | null) => v ?? "—" },
+    { title: "最近互动", dataIndex: "last_touch_at", key: "last_touch_at", render: (v: string | null) => v ?? "—" },
   ];
 
   const detailTabs = detail
@@ -154,10 +142,10 @@ export default function Candidates() {
           children: (
             <Descriptions column={1} size="small">
               <Descriptions.Item label="状态">
-                <Tag color={STATUS_COLOR[detail.jc.status]}>{detail.jc.status}</Tag>
+                <Tag color={STATUS_COLOR[detail.jc.status]}>{statusLabel(detail.jc.status)}</Tag>
               </Descriptions.Item>
               <Descriptions.Item label="评分">
-                {detail.jc.match_score ? <Rate disabled value={detail.jc.match_score} /> : "—"}
+                {detail.jc.match_score ? <Rate disabled value={detail.jc.match_score} style={{ fontSize: 14 }} /> : "—"}
               </Descriptions.Item>
               <Descriptions.Item label="judge_reason">{detail.jc.judge_reason ?? "—"}</Descriptions.Item>
               <Descriptions.Item label="liepin_user_id">{detail.candidate.liepin_user_id}</Descriptions.Item>
@@ -169,7 +157,26 @@ export default function Candidates() {
           label: "简历资料",
           children: (
             <Space direction="vertical" style={{ width: "100%" }}>
-              {detail.snapshot_url ? (
+              {detail.resume_html_url && (
+                <a
+                  href={detail.resume_html_url}
+                  target="_blank"
+                  style={{ display: "inline-block", marginBottom: 8, color: "#1677ff" }}
+                >
+                  打开简历网页
+                </a>
+              )}
+              {(detail.snapshot_urls?.length ?? 0) > 0 ? (
+                detail.snapshot_urls.map((url, i) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={i}
+                    src={url}
+                    alt={`简历截图 ${i + 1}`}
+                    style={{ width: "100%", borderRadius: 6, border: "1px solid #f0f0f0" }}
+                  />
+                ))
+              ) : detail.snapshot_url ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={detail.snapshot_url} alt="snapshot" style={{ width: "100%", borderRadius: 6, border: "1px solid #f0f0f0" }} />
               ) : (
@@ -186,24 +193,6 @@ export default function Candidates() {
               <pre style={{ background: "#fafafa", padding: 12, borderRadius: 6, fontSize: 12 }}>
                 {JSON.stringify(detail.candidate.online_resume_minimal ?? {}, null, 2)}
               </pre>
-              {detail.candidate.resume_ocr_text && (
-                <>
-                  <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginTop: 8 }}>简历文本（OCR）</div>
-                  <pre
-                    style={{
-                      background: "#fafafa",
-                      padding: 12,
-                      borderRadius: 6,
-                      fontSize: 12,
-                      whiteSpace: "pre-wrap",
-                      maxHeight: 400,
-                      overflowY: "auto",
-                    }}
-                  >
-                    {detail.candidate.resume_ocr_text}
-                  </pre>
-                </>
-              )}
             </Space>
           ),
         },
@@ -254,7 +243,13 @@ export default function Candidates() {
         columns={columns}
         dataSource={rows}
         onRow={(row) => ({ onClick: () => openDetail(row.jc_id), style: { cursor: "pointer" } })}
-        pagination={{ pageSize: 50, showSizeChanger: false }}
+        pagination={{
+          current: page,
+          pageSize: 50,
+          total,
+          showSizeChanger: false,
+          onChange: (p) => setPage(p),
+        }}
       />
 
       <Drawer

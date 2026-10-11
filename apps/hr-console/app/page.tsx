@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Row, Col, Card, Statistic, Table, Tag, InputNumber, Button, message } from "antd";
+import { STATUS_COLOR, statusLabel } from "./status";
 
 type Overview = {
   job?: { id: number; title: string; llm_threshold: number } | null;
@@ -24,15 +25,6 @@ type DailyDay = {
 };
 
 type Job = { id: number; title: string; llm_threshold: number; status: string };
-
-const STATUS_COLOR: Record<string, string> = {
-  rejected_hard: "red",
-  rejected_llm: "volcano",
-  resume_received: "green",
-  hr_reviewed: "cyan",
-  closed: "default",
-  new: "blue",
-};
 
 export default function Home() {
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -121,7 +113,7 @@ export default function Home() {
                 <Statistic title="今日触达（out）" value={overview.today.touches_out} />
               </Col>
               <Col span={6}>
-                <Statistic title="今日收到简历" value={overview.today.received} suffix={`/ ${overview.today.received_target ?? 50}`} />
+                <Statistic title="今日收到简历" value={overview.today.received} />
               </Col>
               <Col span={6}>
                 <Statistic title="今日转人工" value={overview.today.manual} />
@@ -135,7 +127,7 @@ export default function Home() {
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                 {Object.entries(overview.status_counts).map(([k, v]) => (
                   <Tag key={k} color={STATUS_COLOR[k]}>
-                    {k}: {v}
+                    {statusLabel(k)}: {v}
                   </Tag>
                 ))}
               </div>
