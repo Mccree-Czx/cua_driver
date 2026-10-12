@@ -25,7 +25,7 @@ ROUNDS_FILE = AGENT_DIR / "rounds.md"
 # 全局轮次锁：所有轮次共用一部手机，必须串行——同一时刻只允许一个轮次在跑。
 # 锁为文件 + 陈旧检测。锁有效需同时满足：持有进程存活 且 mtime 新鲜。
 LOCK_FILE = AGENT_DIR / ".round.lock"
-LOCK_STALE_SECONDS = 1200  # 一轮最长 900s + 300s 余量，兜底防 PID 复用
+LOCK_STALE_SECONDS = 3900  # 一轮最长 3600s + 300s 余量，兜底防 PID 复用
 
 # 空未读退避：连续空轮数达阈值后，30 分钟内跳过 main_round（不启动 Pi）
 INBOUND_STATE_FILE = AGENT_DIR / ".inbound_state.json"
@@ -114,9 +114,9 @@ def _session_dir() -> Path | None:
 
 
 def _summarize_tokens(session_file: Path) -> tuple[int, float]:
-    """汇总 session jsonl 里最后一条 usage.totalTokens / cost.total（累积值）。"""
-    last_tokens = 0
-    last_cost = 0.0
+    """逐条累加 session jsonl 所有 usage 的 input/output/cacheRead/reasoning 与 cost.total。"""
+    total_tokens = 0
+    total_cost = 0.0
     try:
         text = session_file.read_text(encoding="utf-8")
     except OSError:
@@ -134,16 +134,21 @@ def _summarize_tokens(session_file: Path) -> tuple[int, float]:
             obj = stack.pop()
             if isinstance(obj, dict):
                 u = obj.get("usage")
-                if isinstance(u, dict) and "totalTokens" in u:
-                    last_tokens = int(u.get("totalTokens", 0) or 0)
+                if isinstance(u, dict):
+                    total_tokens += (
+                        int(u.get("input", 0) or 0)
+                        + int(u.get("output", 0) or 0)
+                        + int(u.get("cacheRead", 0) or 0)
+                        + int(u.get("reasoning", 0) or 0)
+                    )
                     c = u.get("cost", {})
                     if isinstance(c, dict):
-                        last_cost = float(c.get("total", 0) or 0)
-                    break
+                        total_cost += float(c.get("total", 0) or 0)
+                    continue
                 stack.extend(obj.values())
             elif isinstance(obj, list):
                 stack.extend(obj)
-    return last_tokens, last_cost
+    return total_tokens, total_cost
 
 
 def _write_token_summary(name: str, tokens: int, cost: float) -> None:
@@ -269,10 +274,10 @@ def main() -> int:
                     stderr=subprocess.STDOUT,
                     text=True,
                     cwd=str(AGENT_DIR),
-                    timeout=900,
+                    timeout=3600,
                 )
         except subprocess.TimeoutExpired:
-            print(f"[{name}] 超时（900s）强制结束，释放锁")
+            print(f"[{name}] 超时（3600s）强制结束，释放锁")
             return 124
         output = log_path.read_text(encoding="utf-8")
         if output:

@@ -7,14 +7,11 @@
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
-import re
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -25,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redis as redis_lib
 from mcp.server.mcpserver import MCPServer
 from PIL import Image, ImageChops
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import SessionLocal
@@ -467,6 +464,37 @@ def quota_status() -> dict:
 
 
 @mcp.tool()
+def job_quota_status() -> dict:
+    """按职位均分当日打招呼额度：quota = floor(100/N)，used_today 从互动流水按职位统计今日 out。"""
+    with SessionLocal() as session:
+        jobs = session.execute(select(Job).where(Job.status == "active")).scalars().all()
+        n = len(jobs)
+        if n == 0:
+            return {"quota_each": 0, "jobs": []}
+        quota_each = DAILY_TOUCH_CAP // n
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = session.execute(
+            select(JobCandidate.job_id, func.count(Interaction.id))
+            .join(Interaction, Interaction.job_candidate_id == JobCandidate.id)
+            .where(Interaction.direction == "out", Interaction.sent_at >= today_start)
+            .group_by(JobCandidate.job_id)
+        ).all()
+        used_by_job = {job_id: cnt for job_id, cnt in rows}
+        return {
+            "quota_each": quota_each,
+            "jobs": [
+                {
+                    "job_id": j.id,
+                    "title": j.title,
+                    "used_today": used_by_job.get(j.id, 0),
+                    "quota": quota_each,
+                }
+                for j in jobs
+            ],
+        }
+
+
+@mcp.tool()
 def gated_tap(x: int, y: int, touch: bool = False, daily_cap: int = DAILY_TOUCH_CAP, counts_daily: bool = True) -> dict:
     """闸门 + 原子 tap（硬化：触达类点击的强制前置检查）。
 
@@ -570,16 +598,14 @@ def list_awaiting() -> dict:
 
 @mcp.tool()
 def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
-    """把当前屏幕（附件 PDF 查看器）逐页截图归档，并异步生成 HTML 简历网页。
+    """把当前屏幕（附件 PDF 查看器）逐页截图归档到 MinIO。
 
     前提：Pi 已导航到附件 PDF 查看器。循环 screencap → 上滑 → screencap，
     连续两张几乎相同判定「到底」即停；max_pages 兜底。每页 PNG 归档到
-    MinIO；首页截图喂 flash 视觉提取结构化 JSON、渲染 HTML、存 MinIO 的
-    慢步骤放后台线程异步执行（不阻塞 Pi），最终写回 resume_html_key。
+    MinIO，首页键回写 candidate.snapshot_object_key（HR 直接看截图）。
     """
     keys: list[str] = []
     prev: bytes | None = None
-    first_png: bytes | None = None
     # 回到顶部：向下滑 max_pages 次，确保从 PDF 顶部开始截
     for _ in range(max_pages):
         _swipe_down()
@@ -596,8 +622,6 @@ def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
         _store().put_object(_store().bucket, key, png, "image/png")
         keys.append(key)
         prev = png
-        if first_png is None:
-            first_png = png
         if i < max_pages - 1:
             _swipe_up()
             time.sleep(1.0)
@@ -609,156 +633,11 @@ def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
             if cand is not None:
                 cand.snapshot_object_key = keys[0]  # 首页键回写（前端 snapshot_url 依赖）
                 session.commit()
-    # flash → HTML → MinIO 放后台线程异步执行，Pi 立即返回继续处理下一个
-    if first_png is not None:
-        threading.Thread(
-            target=_resume_html_async, args=(liepin_user_id, first_png), daemon=True
-        ).start()
     return {
         "object_keys": keys,
         "page_count": len(keys),
         "snapshot_object_key": keys[0] if keys else None,
     }
-
-
-def _resume_html_async(liepin_user_id: str, png: bytes) -> None:
-    """后台线程：flash 视觉 → 结构化 JSON → HTML → MinIO → 写回 resume_html_key。"""
-    try:
-        resume = _flash_vision_extract(png)
-        if not resume:
-            return
-        html = _render_resume_html(resume)
-        key = f"resumes/{liepin_user_id}/resume.html"
-        _store().put_object(_store().bucket, key, html.encode("utf-8"), "text/html")
-        with SessionLocal() as session:
-            cand = session.execute(
-                select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
-            ).scalar_one_or_none()
-            if cand is not None:
-                cand.resume_html_key = key
-                session.commit()
-    except Exception:  # noqa: BLE001  # 异步失败不影响主流程
-        pass
-
-
-def _llm_env(name: str, default: str = "") -> str:
-    """读环境变量或向上遍历找到的 .env（flash 视觉用，不硬编码 key）。"""
-    v = os.environ.get(name, "")
-    if v:
-        return v
-    d = Path(__file__).resolve().parent
-    for _ in range(5):
-        env_file = d / ".env"
-        if env_file.exists():
-            try:
-                for line in env_file.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith(name + "="):
-                        return line.split("=", 1)[1].strip()
-            except OSError:
-                pass
-            break
-        d = d.parent
-    return default
-
-
-def _flash_vision_extract(png: bytes) -> dict:
-    """deepseek-flash 视觉：简历截图 → 结构化 JSON（逐字忠实提取）。"""
-    import openai
-
-    api_key = _llm_env("SCREENING_LLM_API_KEY")
-    if not api_key:
-        return {}
-    client = openai.OpenAI(
-        base_url=_llm_env("SCREENING_LLM_BASE_URL", "https://api.deepseek.com"),
-        api_key=api_key,
-    )
-    prompt = (
-        "你是简历解析助手。把这张简历截图中的文字**逐字完整**提取成结构化 JSON。"
-        "铁律：不要概括、不要省略、不要改写，原图每个字段都保留。"
-        '键用中文，结构：{"姓名":..,"求职意向":..,"所在地":..,'
-        '"联系方式":{"电话":..,"邮箱":..,"微信":..},'
-        '"职业简介":..,"核心能力":[..],'
-        '"工作经历":[{"公司":..,"职位":..,"时间":..,"地点":..,"描述":..}],'
-        '"教育":..,"语言":..}。只输出 JSON，不要多余解释。'
-    )
-    resp = client.chat.completions.create(
-        model=_llm_env("SCREENING_LLM_MODEL", "deepseek-flash"),
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(png).decode()}"}},
-        ]}],
-        timeout=120,
-    )
-    content = resp.choices[0].message.content
-    try:
-        return json.loads(content)
-    except (json.JSONDecodeError, TypeError):
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return {}
-        return {}
-
-
-_RESUME_HTML_TEMPLATE = """<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>简历</title>
-<style>
-:root{--bg:#f4f5f7;--fg:#1f2937;--muted:#64748b;--card:#fff;--line:#e5e7eb;--accent:#2c5f8a;--accent-soft:#e8eff5}
-@media(prefers-color-scheme:dark){:root{--bg:#10151c;--fg:#e5e7eb;--muted:#9ca3af;--card:#1a212b;--line:#2a333f;--accent:#7aa7cc;--accent-soft:#1c2c3d}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;padding:24px 16px}
-.page{max-width:760px;margin:0 auto}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:14px}
-.name{font-size:26px;font-weight:700;margin:0 0 4px}
-.role{font-size:16px;font-weight:500;color:var(--accent);margin:0 0 10px}
-.meta{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:13px}
-.meta b{color:var(--fg);font-weight:500}
-h2{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
-.summary{font-size:14px;margin:0;white-space:pre-line}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{background:var(--accent-soft);color:var(--accent);font-size:13px;padding:5px 12px;border-radius:999px}
-.timeline{position:relative;padding-left:20px}
-.timeline:before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:var(--line)}
-.job{position:relative;padding-bottom:18px}
-.job:last-child{padding-bottom:0}
-.job:before{content:"";position:absolute;left:-20px;top:7px;width:12px;height:12px;border-radius:50%;background:var(--card);border:3px solid var(--accent)}
-.job-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
-.company{font-weight:700;font-size:15px}
-.position{color:var(--accent);font-size:14px;font-weight:500}
-.period{color:var(--muted);font-size:12px}
-.location{color:var(--muted);font-size:12px;margin:2px 0 6px}
-.desc{font-size:13.5px;margin:0;white-space:pre-line}
-.edu{font-size:14px}
-.lang{display:inline-block;font-size:13px;padding:4px 10px;border:1px solid var(--line);border-radius:8px;margin:0 8px 8px 0}
-</style>
-</head>
-<body><div class="page" id="app"></div>
-<script>
-var R=__DATA__;
-function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-var app=document.getElementById("app");
-var h=el("header","card");h.appendChild(el("h1","name",R.姓名||""));h.appendChild(el("p","role",R.求职意向||""));
-var m=el("div","meta");if(R.所在地){var l=el("span");l.appendChild(el("b",null,"所在地 "));l.appendChild(document.createTextNode(R.所在地));m.appendChild(l)}
-var c=R.联系方式||{};for(var k in c){var s=el("span");s.appendChild(el("b",null,k+" "));s.appendChild(document.createTextNode(c[k]));m.appendChild(s)}h.appendChild(m);app.appendChild(h);
-if(R.职业简介){var su=el("section","card");su.appendChild(el("h2",null,"职业简介"));su.appendChild(el("p","summary",R.职业简介));app.appendChild(su)}
-if(R.核心能力){var sk=el("section","card");sk.appendChild(el("h2",null,"核心能力"));var cs=el("div","chips");(Array.isArray(R.核心能力)?R.核心能力:[R.核心能力]).forEach(function(x){cs.appendChild(el("span","chip",x))});sk.appendChild(cs);app.appendChild(sk)}
-if(R.工作经历&&R.工作经历.length){var ex=el("section","card");ex.appendChild(el("h2",null,"工作经历"));var tl=el("div","timeline");R.工作经历.forEach(function(j){var b=el("div","job");var hd=el("div","job-head");hd.appendChild(el("span","company",j.公司||""));hd.appendChild(el("span","position",j.职位||""));hd.appendChild(el("span","period",j.时间||""));b.appendChild(hd);if(j.地点)b.appendChild(el("div","location",j.地点));b.appendChild(el("p","desc",j.描述||""));tl.appendChild(b)});ex.appendChild(tl);app.appendChild(ex)}
-if(R.教育){var ed=el("section","card");ed.appendChild(el("h2",null,"教育背景"));var eduList=Array.isArray(R.教育)?R.教育:[R.教育];eduList.forEach(function(e){var t;if(typeof e==="string"){t=e}else if(e&&typeof e==="object"){t=[e.学校||e.school||"",e.专业||e.major||"",e.时间||e.period||""].filter(Boolean).join(" · ")}else{t=String(e)}if(t)ed.appendChild(el("div","edu",t))});app.appendChild(ed)}
-if(R.语言){var lg=el("section","card");lg.appendChild(el("h2",null,"语言能力"));var lw=el("div");(Array.isArray(R.语言)?R.语言:[R.语言]).forEach(function(x){lw.appendChild(el("span","lang",x))});lg.appendChild(lw);app.appendChild(lg)}
-</script>
-</body></html>"""
-
-
-def _render_resume_html(resume: dict) -> str:
-    """结构化简历 JSON → 自包含 HTML 简历页（卡片式排版）。"""
-    return _RESUME_HTML_TEMPLATE.replace("__DATA__", json.dumps(resume, ensure_ascii=False))
 
 
 def _screencap() -> bytes:
