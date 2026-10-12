@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Table, Tag } from "antd";
+import { Table } from "antd";
 import type { ColumnsType } from "antd/es/table";
 
 type TaskLogRow = {
@@ -16,12 +16,21 @@ type TaskLogRow = {
   created_at: string | null;
 };
 
-const OUTCOME_COLOR: Record<string, string> = {
-  success: "green",
-  failed_needs_manual: "orange",
-  failed: "red",
-  degraded: "gold",
+const OUTCOME_CAPSULE: Record<string, string> = {
+  success: "status-capsule-qualified",
+  failed_needs_manual: "status-capsule-pending",
+  failed: "status-capsule-rejected",
+  degraded: "status-capsule-running",
 };
+
+function OutcomeCapsule({ outcome }: { outcome: string }) {
+  return (
+    <span className={`capsule-pill ${OUTCOME_CAPSULE[outcome] ?? "status-capsule-rejected"}`}>
+      <span className="capsule-pill-dot" />
+      {outcome}
+    </span>
+  );
+}
 
 export default function Logs() {
   const [items, setItems] = useState<TaskLogRow[]>([]);
@@ -50,7 +59,7 @@ export default function Logs() {
       dataIndex: "outcome",
       key: "outcome",
       width: 150,
-      render: (v: string) => <Tag color={OUTCOME_COLOR[v]}>{v}</Tag>,
+      render: (v: string) => <OutcomeCapsule outcome={v} />,
     },
     { title: "尝试", dataIndex: "attempt", key: "attempt", width: 60 },
     { title: "tokens", dataIndex: "tokens", key: "tokens", width: 80 },
@@ -65,13 +74,23 @@ export default function Logs() {
   ];
 
   return (
-    <Table
-      rowKey="id"
-      size="small"
-      loading={loading}
-      columns={columns}
-      dataSource={items}
-      pagination={{ pageSize: 50, showSizeChanger: false }}
-    />
+    <div className="page talent-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Logs</p>
+          <h2>运行日志</h2>
+          <p>任务执行与成本记录</p>
+        </div>
+      </div>
+
+      <Table
+        rowKey="id"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={items}
+        pagination={{ pageSize: 50, showSizeChanger: false }}
+      />
+    </div>
   );
 }

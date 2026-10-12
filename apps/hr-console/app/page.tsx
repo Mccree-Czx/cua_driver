@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Row, Col, Card, Statistic, Table, Tag, Collapse, Form, Rate, Input, Button, message } from "antd";
-import { STATUS_COLOR, statusLabel } from "./status";
+import { Table, Collapse, Form, Rate, Input, Button, message } from "antd";
+import { statusLabel, statusCapsuleClass } from "./status";
 
 type ScoringPrefs = {
   min_stars?: number;
@@ -78,8 +78,10 @@ function JobScoringForm({ job, onSaved }: { job: Job; onSaved: () => void }) {
 
   return (
     <Form form={form} layout="vertical" onFinish={onSave}>
-      <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 13, marginBottom: 8 }}>招聘信息 / JD</div>
-      <div style={{ whiteSpace: "pre-line", fontSize: 13, marginBottom: 16, background: "#fafafa", padding: 12, borderRadius: 6 }}>
+      <div style={{ color: "var(--text-secondary)", fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+        招聘信息 / JD
+      </div>
+      <div className="multiline-box" style={{ marginBottom: 16 }}>
         {job.jd_text || "（暂无 JD）"}
       </div>
       <Form.Item name="min_stars" label="最低主动沟通星级">
@@ -98,6 +100,16 @@ function JobScoringForm({ job, onSaved }: { job: Job; onSaved: () => void }) {
         保存评分偏好
       </Button>
     </Form>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="stat-card">
+      <div className="stat-card-accent-bar" />
+      <div className="ant-typography-secondary">{label}</div>
+      <b>{value}</b>
+    </div>
   );
 }
 
@@ -139,86 +151,121 @@ export default function Home() {
   const activeJobs = jobs.filter((j) => j.status === "active");
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <Card title="在招职位">
-        {activeJobs.length > 0 ? (
-          <Collapse
-            items={activeJobs.map((job) => ({
-              key: String(job.id),
-              label: job.title,
-              children: <JobScoringForm job={job} onSaved={load} />,
-            }))}
+    <div className="page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Dashboard</p>
+          <h2>驾驶舱</h2>
+          <p>招聘漏斗总览与在招职位管理</p>
+        </div>
+      </div>
+
+      <div className="outin-card">
+        <div className="outin-card-header">
+          <div className="outin-card-header-left">
+            <span className="outin-card-icon">💼</span>
+            <div>
+              <div className="outin-card-title">在招职位</div>
+              <div className="outin-card-subtitle">评分偏好按岗位独立配置</div>
+            </div>
+          </div>
+        </div>
+        <div className="outin-card-body">
+          {activeJobs.length > 0 ? (
+            <Collapse
+              ghost
+              items={activeJobs.map((job) => ({
+                key: String(job.id),
+                label: job.title,
+                children: <JobScoringForm job={job} onSaved={load} />,
+              }))}
+            />
+          ) : (
+            <span style={{ color: "var(--text-muted)", fontSize: 13 }}>暂无在招职位</span>
+          )}
+        </div>
+      </div>
+
+      <div className="outin-card">
+        <div className="outin-card-header">
+          <div className="outin-card-header-left">
+            <span className="outin-card-icon">📊</span>
+            <div className="outin-card-title">漏斗总览</div>
+          </div>
+        </div>
+        <div className="outin-card-body">
+          {overview ? (
+            <>
+              <div className="dashboard-grid">
+                <StatCard label="今日触达（out）" value={overview.today.touches_out} />
+                <StatCard label="今日收到简历" value={overview.today.received} />
+                <StatCard label="今日转人工" value={overview.today.manual} />
+                <StatCard label="候选人总数" value={totalCandidates} />
+              </div>
+              <div className="dashboard-status-grid">
+                <div>
+                  <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>
+                    状态分布
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {Object.entries(overview.status_counts).map(([k, v]) => (
+                      <span key={k} className={`capsule-pill ${statusCapsuleClass(k)}`}>
+                        <span className="capsule-pill-dot" />
+                        {statusLabel(k)}: {v}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>
+                    评分分布
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {Object.entries(overview.score_buckets).map(([k, v]) => (
+                      <span key={k} className="capsule-pill status-capsule-queued">
+                        <span className="capsule-pill-dot" />
+                        {k}: {v}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+              加载中…（需 pipeline 在 127.0.0.1:8000 运行）
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="outin-card">
+        <div className="outin-card-header">
+          <div className="outin-card-header-left">
+            <span className="outin-card-icon">📅</span>
+            <div className="outin-card-title">每日漏斗（近 14 天）</div>
+          </div>
+        </div>
+        <div className="outin-card-body">
+          <Table
+            rowKey="date"
+            size="small"
+            columns={dailyColumns}
+            dataSource={daily?.days ?? []}
+            pagination={false}
+            footer={
+              daily
+                ? () => (
+                    <span style={{ fontSize: 12 }}>
+                      合计：新增 {daily.totals.new_jc} · 收到简历 {daily.totals.received} · 转化率{" "}
+                      {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`} · 转人工 {daily.totals.manual}
+                    </span>
+                  )
+                : undefined
+            }
           />
-        ) : (
-          <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 13 }}>暂无在招职位</span>
-        )}
-      </Card>
-
-      <Card title="漏斗总览">
-        {overview ? (
-          <>
-            <Row gutter={16}>
-              <Col span={6}>
-                <Statistic title="今日触达（out）" value={overview.today.touches_out} />
-              </Col>
-              <Col span={6}>
-                <Statistic title="今日收到简历" value={overview.today.received} />
-              </Col>
-              <Col span={6}>
-                <Statistic title="今日转人工" value={overview.today.manual} />
-              </Col>
-              <Col span={6}>
-                <Statistic title="候选人总数" value={totalCandidates} />
-              </Col>
-            </Row>
-            <div style={{ marginTop: 16 }}>
-              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginBottom: 8 }}>状态分布</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {Object.entries(overview.status_counts).map(([k, v]) => (
-                  <Tag key={k} color={STATUS_COLOR[k]}>
-                    {statusLabel(k)}: {v}
-                  </Tag>
-                ))}
-              </div>
-            </div>
-            <div style={{ marginTop: 12 }}>
-              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginBottom: 8 }}>评分分布</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {Object.entries(overview.score_buckets).map(([k, v]) => (
-                  <Tag key={k}>
-                    {k}: {v}
-                  </Tag>
-                ))}
-              </div>
-            </div>
-          </>
-        ) : (
-          <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 13 }}>
-            加载中…（需 pipeline 在 127.0.0.1:8000 运行）
-          </span>
-        )}
-      </Card>
-
-      <Card title="每日漏斗（近 14 天）">
-        <Table
-          rowKey="date"
-          size="small"
-          columns={dailyColumns}
-          dataSource={daily?.days ?? []}
-          pagination={false}
-          footer={
-            daily
-              ? () => (
-                  <span style={{ fontSize: 12 }}>
-                    合计：新增 {daily.totals.new_jc} · 收到简历 {daily.totals.received} · 转化率{" "}
-                    {daily.totals.conversion === null ? "—" : `${daily.totals.conversion}%`} · 转人工 {daily.totals.manual}
-                  </span>
-                )
-              : undefined
-          }
-        />
-      </Card>
-
+        </div>
+      </div>
     </div>
   );
 }

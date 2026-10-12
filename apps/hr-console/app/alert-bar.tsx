@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Tag } from "antd";
 
 type Alerts = {
   login?: { is_login?: boolean | null; checked_at?: string | null } | null;
@@ -22,20 +21,21 @@ export default function AlertBar() {
 
   if (!alerts) return null;
 
-  const flags: { text: string; color: string }[] = [];
-  if (alerts.risk_paused) flags.push({ text: "全局熔断中", color: "red" });
+  const flags: { text: string; cls: string }[] = [];
+  if (alerts.risk_paused) flags.push({ text: "全局熔断中", cls: "status-capsule-danger" });
   if (alerts.login && alerts.login.is_login === false)
-    flags.push({ text: "登录失效", color: "orange" });
-  flags.push({ text: `今日触达 ${alerts.quota_used_today ?? 0}`, color: "default" });
+    flags.push({ text: "登录失效", cls: "status-capsule-pending" });
+  flags.push({ text: `今日触达 ${alerts.quota_used_today ?? 0}`, cls: "status-capsule-contacting" });
   if ((alerts.manual_today ?? 0) > 0)
-    flags.push({ text: `转人工 ${alerts.manual_today}`, color: "orange" });
+    flags.push({ text: `转人工 ${alerts.manual_today}`, cls: "status-capsule-running" });
 
   return (
-    <div style={{ display: "flex", gap: 8 }}>
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
       {flags.map((f) => (
-        <Tag key={f.text} color={f.color}>
+        <span key={f.text} className={`capsule-pill ${f.cls}`}>
+          <span className="capsule-pill-dot" />
           {f.text}
-        </Tag>
+        </span>
       ))}
     </div>
   );

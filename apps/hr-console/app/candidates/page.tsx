@@ -1,9 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Select, Input, Checkbox, Table, Drawer, Descriptions, Tabs, Tag, Button, Space, Rate, message } from "antd";
+import { Select, Input, Checkbox, Table, Drawer, Tabs, Button, Space, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { STATUS_LABEL, STATUS_COLOR, statusLabel } from "../status";
+import { STATUS_LABEL, statusLabel, statusCapsuleClass } from "../status";
 
 type CandidateRow = {
   jc_id: number;
@@ -26,7 +26,6 @@ type Detail = {
   snapshot_url: string | null;
   snapshot_urls: string[];
   resume_url: string | null;
-  resume_html_url: string | null;
   interactions: { direction: string; msg_type: string; content: string | null; sent_at: string | null }[];
 };
 
@@ -38,6 +37,24 @@ const STATUS_OPTIONS = [
 function fmtTime(v: string | null): string {
   if (!v) return "—";
   return v.replace("T", " ").slice(0, 16);
+}
+
+function StatusCapsule({ status }: { status: string }) {
+  return (
+    <span className={`capsule-pill ${statusCapsuleClass(status)}`}>
+      <span className="capsule-pill-dot" />
+      {statusLabel(status)}
+    </span>
+  );
+}
+
+function StarRating({ score }: { score: number | null }) {
+  if (score == null || score === 0) return <span className="muted">—</span>;
+  return (
+    <span className="stars" style={{ fontSize: 13 }}>
+      {[1, 2, 3, 4, 5].map((i) => (i <= score ? <span key={i}>★</span> : <i key={i}>★</i>))}
+    </span>
+  );
 }
 
 export default function Candidates() {
@@ -126,21 +143,29 @@ export default function Candidates() {
   }
 
   const columns: ColumnsType<CandidateRow> = [
-    { title: "jc", dataIndex: "jc_id", key: "jc_id", width: 60 },
-    { title: "姓名", dataIndex: "name", key: "name" },
+    {
+      title: "候选人",
+      key: "name",
+      render: (_: unknown, r: CandidateRow) => (
+        <span className="candidate-name">
+          {r.name}
+          <small>{r.liepin_user_id}</small>
+        </span>
+      ),
+    },
     { title: "职位", dataIndex: "job_title", key: "job_title", render: (v: string) => v || "—" },
     {
       title: "状态",
       dataIndex: "status",
       key: "status",
-      render: (s: string) => <Tag color={STATUS_COLOR[s]}>{statusLabel(s)}</Tag>,
+      render: (s: string) => <StatusCapsule status={s} />,
     },
     {
       title: "评分",
       dataIndex: "match_score",
       key: "match_score",
-      width: 120,
-      render: (v: number | null) => (v ? <Rate disabled value={v} style={{ fontSize: 14 }} /> : "—"),
+      width: 110,
+      render: (v: number | null) => <StarRating score={v} />,
     },
     {
       title: "截图",
@@ -158,16 +183,28 @@ export default function Candidates() {
           key: "basic",
           label: "基本信息",
           children: (
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="状态">
-                <Tag color={STATUS_COLOR[detail.jc.status]}>{statusLabel(detail.jc.status)}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="评分">
-                {detail.jc.match_score ? <Rate disabled value={detail.jc.match_score} style={{ fontSize: 14 }} /> : "—"}
-              </Descriptions.Item>
-              <Descriptions.Item label="judge_reason">{detail.jc.judge_reason ?? "—"}</Descriptions.Item>
-              <Descriptions.Item label="liepin_user_id">{detail.candidate.liepin_user_id}</Descriptions.Item>
-            </Descriptions>
+            <div className="detail-grid">
+              <div className="detail-item-box">
+                <label>状态</label>
+                <p>
+                  <StatusCapsule status={detail.jc.status} />
+                </p>
+              </div>
+              <div className="detail-item-box">
+                <label>评分</label>
+                <p>
+                  <StarRating score={detail.jc.match_score} />
+                </p>
+              </div>
+              <div className="detail-item-box" style={{ gridColumn: "1 / -1" }}>
+                <label>judge_reason</label>
+                <p>{detail.jc.judge_reason ?? "—"}</p>
+              </div>
+              <div className="detail-item-box" style={{ gridColumn: "1 / -1" }}>
+                <label>liepin_user_id</label>
+                <p>{detail.candidate.liepin_user_id}</p>
+              </div>
+            </div>
           ),
         },
         {
@@ -175,15 +212,6 @@ export default function Candidates() {
           label: "简历资料",
           children: (
             <Space direction="vertical" style={{ width: "100%" }}>
-              {detail.resume_html_url && (
-                <a
-                  href={detail.resume_html_url}
-                  target="_blank"
-                  style={{ display: "inline-block", marginBottom: 8, color: "#1677ff" }}
-                >
-                  打开简历网页
-                </a>
-              )}
               {(detail.snapshot_urls?.length ?? 0) > 0 ? (
                 detail.snapshot_urls.map((url, i) => (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -191,24 +219,28 @@ export default function Candidates() {
                     key={i}
                     src={url}
                     alt={`简历截图 ${i + 1}`}
-                    style={{ width: "100%", borderRadius: 6, border: "1px solid #f0f0f0" }}
+                    style={{ width: "100%", borderRadius: 8, border: "1px solid var(--subtle-border)" }}
                   />
                 ))
               ) : detail.snapshot_url ? (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={detail.snapshot_url} alt="snapshot" style={{ width: "100%", borderRadius: 6, border: "1px solid #f0f0f0" }} />
+                <img
+                  src={detail.snapshot_url}
+                  alt="snapshot"
+                  style={{ width: "100%", borderRadius: 8, border: "1px solid var(--subtle-border)" }}
+                />
               ) : (
-                <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>无快照</span>
+                <span style={{ color: "var(--text-muted)", fontSize: 12 }}>无快照</span>
               )}
               {detail.resume_url ? (
-                <a href={detail.resume_url} target="_blank">
+                <a href={detail.resume_url} target="_blank" style={{ color: "var(--brand-orange)" }}>
                   打开简历 PDF（预签名）
                 </a>
               ) : (
-                <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>未收到附件</span>
+                <span style={{ color: "var(--text-muted)", fontSize: 12 }}>未收到附件</span>
               )}
-              <div style={{ color: "rgba(0,0,0,0.45)", fontSize: 12, marginTop: 8 }}>在线简历 7 字段</div>
-              <pre style={{ background: "#fafafa", padding: 12, borderRadius: 6, fontSize: 12 }}>
+              <div style={{ color: "var(--text-secondary)", fontSize: 12, marginTop: 8 }}>在线简历 7 字段</div>
+              <pre className="multiline-box" style={{ margin: 0 }}>
                 {JSON.stringify(detail.candidate.online_resume_minimal ?? {}, null, 2)}
               </pre>
             </Space>
@@ -220,11 +252,16 @@ export default function Candidates() {
           children: (
             <Space direction="vertical" style={{ width: "100%" }}>
               {detail.interactions.map((row, i) => (
-                <div key={i} style={{ background: "#fafafa", padding: "6px 10px", borderRadius: 6, fontSize: 12 }}>
-                  [{fmtTime(row.sent_at)}] {row.direction}/{row.msg_type}：{row.content}
+                <div key={i} className="detail-item-box">
+                  <label>
+                    {fmtTime(row.sent_at)} · {row.direction}/{row.msg_type}
+                  </label>
+                  <p>{row.content}</p>
                 </div>
               ))}
-              {detail.interactions.length === 0 && <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>无互动</span>}
+              {detail.interactions.length === 0 && (
+                <span style={{ color: "var(--text-muted)", fontSize: 12 }}>无互动</span>
+              )}
             </Space>
           ),
         },
@@ -232,35 +269,53 @@ export default function Candidates() {
     : [];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <Space wrap>
-        <Select
-          style={{ width: 200 }}
-          value={jobId || undefined}
-          placeholder="全部职位"
-          allowClear
-          options={jobs.map((j) => ({ value: String(j.id), label: j.title }))}
-          onChange={(v) => setJobId(v ?? "")}
-        />
-        <Select
-          style={{ width: 160 }}
-          value={status}
-          options={STATUS_OPTIONS}
-          onChange={(v) => setStatus(v)}
-        />
-        <Input.Search
-          placeholder="搜姓名 / liepin id"
-          allowClear
-          style={{ width: 240 }}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onSearch={(v) => setQ(v)}
-        />
-        <Checkbox checked={minScoreOnly} onChange={(e) => setMinScoreOnly(e.target.checked)}>
-          仅达标分档（≥{minStars} 星）
-        </Checkbox>
-        <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>{rows.length} 行</span>
-      </Space>
+    <div className="page talent-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Talent</p>
+          <h2>候选人</h2>
+          <p>候选人库、筛选与复核</p>
+        </div>
+      </div>
+
+      <div className="filters">
+        <div className="ant-form-item">
+          <label className="ant-form-item-label">
+            <label>职位</label>
+          </label>
+          <Select
+            style={{ width: "100%" }}
+            value={jobId || undefined}
+            placeholder="全部职位"
+            allowClear
+            options={jobs.map((j) => ({ value: String(j.id), label: j.title }))}
+            onChange={(v) => setJobId(v ?? "")}
+          />
+        </div>
+        <div className="ant-form-item">
+          <label className="ant-form-item-label">
+            <label>状态</label>
+          </label>
+          <Select style={{ width: "100%" }} value={status} options={STATUS_OPTIONS} onChange={(v) => setStatus(v)} />
+        </div>
+        <div className="ant-form-item">
+          <label className="ant-form-item-label">
+            <label>搜索</label>
+          </label>
+          <Input.Search
+            placeholder="搜姓名 / liepin id"
+            allowClear
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onSearch={(v) => setQ(v)}
+          />
+        </div>
+        <div className="ant-form-item" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Checkbox checked={minScoreOnly} onChange={(e) => setMinScoreOnly(e.target.checked)}>
+            仅达标分档（≥{minStars} 星）
+          </Checkbox>
+        </div>
+      </div>
 
       <Table
         rowKey="jc_id"
@@ -268,7 +323,7 @@ export default function Candidates() {
         loading={loading}
         columns={columns}
         dataSource={rows}
-        onRow={(row) => ({ onClick: () => openDetail(row.jc_id), style: { cursor: "pointer" } })}
+        onRow={(row) => ({ onClick: () => openDetail(row.jc_id) })}
         pagination={{
           current: page,
           pageSize: 50,
@@ -279,6 +334,7 @@ export default function Candidates() {
       />
 
       <Drawer
+        className="talent-drawer"
         width={600}
         open={!!detail}
         onClose={() => setDetail(null)}
@@ -286,16 +342,29 @@ export default function Candidates() {
       >
         {detail && (
           <>
+            <div className="drawer-hero">
+              <div className="drawer-hero-avatar">{detail.candidate.name?.[0] ?? "?"}</div>
+              <div className="drawer-hero-content">
+                <h3>{detail.candidate.name}</h3>
+                <p>{detail.candidate.liepin_user_id}</p>
+                <div className="drawer-hero-tags">
+                  <span className="drawer-hero-tag">jc #{detail.jc.id}</span>
+                  <StatusCapsule status={detail.jc.status} />
+                </div>
+              </div>
+            </div>
             <Tabs defaultActiveKey="basic" items={detailTabs} />
-            <Space style={{ marginTop: 16 }}>
-              <Button type="primary" onClick={() => review("approve")}>
-                复核通过
-              </Button>
-              <Button danger onClick={() => review("reject")}>
-                复核推翻
-              </Button>
+            <div className="drawer-actions-card">
+              <Space>
+                <Button type="primary" onClick={() => review("approve")}>
+                  复核通过
+                </Button>
+                <Button danger onClick={() => review("reject")}>
+                  复核推翻
+                </Button>
+              </Space>
               <Button onClick={rerun}>手动重跑</Button>
-            </Space>
+            </div>
           </>
         )}
       </Drawer>

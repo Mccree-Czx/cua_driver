@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Table, Button, Space, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { statusLabel } from "../status";
+import { statusLabel, statusCapsuleClass } from "../status";
 
 type QueueItem = {
   task_id: string;
@@ -19,6 +19,15 @@ type QueueItem = {
 function fmtTime(v: string | null): string {
   if (!v) return "—";
   return v.replace("T", " ").slice(0, 16);
+}
+
+function StatusCapsule({ status }: { status: string }) {
+  return (
+    <span className={`capsule-pill ${statusCapsuleClass(status)}`}>
+      <span className="capsule-pill-dot" />
+      {statusLabel(status)}
+    </span>
+  );
 }
 
 export default function ManualQueue() {
@@ -69,7 +78,7 @@ export default function ManualQueue() {
       render: (_: unknown, r: QueueItem) =>
         `${r.candidate_name ?? "—"}${r.job_candidate_id !== null ? `（jc=${r.job_candidate_id}）` : ""}`,
     },
-    { title: "状态", dataIndex: "jc_status", key: "jc_status", render: (v: string | null) => (v ? statusLabel(v) : "—") },
+    { title: "状态", dataIndex: "jc_status", key: "jc_status", render: (v: string | null) => (v ? <StatusCapsule status={v} /> : "—") },
     { title: "注记", dataIndex: "note", key: "note", render: (v: string | null) => v ?? "—" },
     {
       title: "操作",
@@ -90,10 +99,19 @@ export default function ManualQueue() {
   ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <span style={{ color: "rgba(0,0,0,0.45)", fontSize: 12 }}>
+    <div className="page talent-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Manual Queue</p>
+          <h2>人工队列</h2>
+          <p>需要人工介入处理的任务</p>
+        </div>
+      </div>
+
+      <div style={{ color: "var(--text-secondary)", fontSize: 12, marginBottom: 12 }}>
         {items.length} 项（failed_needs_manual 落账）
-      </span>
+      </div>
+
       <Table
         rowKey="task_id"
         size="small"

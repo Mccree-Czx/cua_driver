@@ -31,3 +31,23 @@ export const STATUS_COLOR: Record<string, string> = {
 export function statusLabel(status: string): string {
   return STATUS_LABEL[status] ?? status;
 }
+
+// 状态 → HR Portal 胶囊配色类（迁移自 ta.hr.outin 的 status-capsule-*）
+export const STATUS_CAPSULE: Record<string, string> = {
+  new: "status-capsule-queued",
+  screened_pass: "status-capsule-qualified",
+  rejected_hard: "status-capsule-rejected",
+  rejected_llm: "status-capsule-rejected",
+  greeted: "status-capsule-contacting",
+  resume_requested: "status-capsule-running",
+  awaiting_resume: "status-capsule-pending",
+  resume_received: "status-capsule-hired",
+  no_response: "status-capsule-rejected",
+  hr_reviewed: "status-capsule-interview",
+  closed: "status-capsule-rejected",
+};
+
+export function statusCapsuleClass(status: string): string {
+  return STATUS_CAPSULE[status] ?? "status-capsule-rejected";
+}
+
