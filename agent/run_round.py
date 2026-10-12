@@ -23,9 +23,9 @@ SYSTEM_PROMPT = AGENT_DIR / "system-prompt.md"
 ROUNDS_FILE = AGENT_DIR / "rounds.md"
 
 # 全局轮次锁：所有轮次共用一部手机，必须串行——同一时刻只允许一个轮次在跑。
-# 锁为文件 + 陈旧检测（轮次最长约 5 分钟，10 分钟未动的锁视为陈旧可接管）。
+# 锁为文件 + 陈旧检测。锁有效需同时满足：持有进程存活 且 mtime 新鲜。
 LOCK_FILE = AGENT_DIR / ".round.lock"
-LOCK_STALE_SECONDS = 3600
+LOCK_STALE_SECONDS = 1200  # 一轮最长 900s + 300s 余量，兜底防 PID 复用
 
 # 空未读退避：连续空轮数达阈值后，30 分钟内跳过 main_round（不启动 Pi）
 INBOUND_STATE_FILE = AGENT_DIR / ".inbound_state.json"
@@ -33,11 +33,29 @@ BACKOFF_EMPTY_STREAK = 2
 BACKOFF_INTERVAL_SECONDS = 1800
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def acquire_round_lock() -> bool:
     try:
         if LOCK_FILE.exists():
             age = time.time() - LOCK_FILE.stat().st_mtime
-            if age < LOCK_STALE_SECONDS:
+            try:
+                pid = int(LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                pid = 0
+            if _pid_alive(pid) and age < LOCK_STALE_SECONDS:
                 return False
             LOCK_FILE.unlink()
         LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
