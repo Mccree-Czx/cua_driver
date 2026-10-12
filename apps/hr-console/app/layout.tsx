@@ -4,7 +4,7 @@ import "./globals.css";
 import AppShell from "./app-shell";
 
 export const metadata: Metadata = {
-  title: "hr-workbuddy 工作台",
+  title: "OutIn HR Portal",
   description: "HR 候选人工作台",
 };
 

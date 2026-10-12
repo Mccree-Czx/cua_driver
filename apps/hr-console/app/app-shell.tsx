@@ -28,7 +28,7 @@ function BrandMark() {
       <span className="brand-icon-box">
         <RobotOutlined style={{ fontSize: 18, color: "var(--cold-brew-dark)" }} />
       </span>
-      <span>hr-workbuddy</span>
+      <span>OutIn HR Portal</span>
     </div>
   );
 }
@@ -66,7 +66,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <span className="brand-icon-box">
               <RobotOutlined style={{ fontSize: 18, color: "var(--cold-brew-dark)" }} />
             </span>
-            <span className="mobile-brand-title">hr-workbuddy</span>
+            <span className="mobile-brand-title">OutIn HR Portal</span>
           </div>
           <button className="mobile-menu-btn" onClick={() => setDrawerOpen(true)} aria-label="菜单">
             <MenuOutlined />
