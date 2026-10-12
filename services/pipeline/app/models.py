@@ -81,6 +81,10 @@ class Candidate(Base):
     )
     snapshot_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     resume_html_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # 附件归档证据（capture_attachment_pages 写入的分页 MinIO 键列表）。
+    # 仅由 capture_attachment_pages 写；snapshot_put（在线简历截图）不写。
+    # 供 receive_resume 守卫区分「真附件」与「在线截图」。NULL = 尚无附件证据。
+    attachment_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     source: Mapped[str] = mapped_column(
         Enum(*CANDIDATE_SOURCES, name="candidate_source"), nullable=False
     )

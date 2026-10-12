@@ -28,8 +28,8 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 - 读候选人简历字段（tap 进详情，dump 提取 7 字段）
 - candidate_get_or_create（时间戳 ID，source='inbound'）→ candidate_update_snapshot → **读详情页「沟通职位」得到职位名 → job_list_active() 按 title 模糊匹配 → jc_get_or_create(job_id=匹配到的职位 id)；匹配不到则 job_upsert(title=沟通职位, jd_text="") 录入后拿新 id 再 jc_get_or_create**
 - risk_check 熔断则停；screen 评分
-- **已带附件简历（详情页有「附件简历」区 + 文件名）→ 直收：进 PDF 查看器（「去查看」→ 点 PDF 文件卡）→ 先 `mobile_dump_ui` 确认当前屏是 PDF 查看器（有「第 X 页/共 X 页」或 PDF 内容特征）→ 确认后再 capture_attachment_pages(liepin_user_id) 归档 → 拿到 object_keys 后再 state_transition(receive_resume) + interaction_log(in, attachment)；跳过触达（对方已发简历，无需再索要）。若 dump 确认不是 PDF 查看器（仍停在在线简历/详情页）→ 不截图，如实报告「未找到附件」，不推进 receive_resume**
-- 无附件简历且判定通过 → ensure_one_message + candidate_has_out_message 双查 → gated_tap(touch=True, counts_daily=False) 索要简历（响应性触达，不计入每日 100）→ 验证上屏 → **先 interaction_log(out) 再 state_transition**（顺序不可颠倒）
+- **已带附件简历（会话有附件气泡[文件名] 或 详情页有「附件简历」区 + 文件名；「看简历」打开的在线简历[带「在线」标签]不算）→ 直收：进 PDF 查看器（「去查看」→ 点 PDF 文件卡）→ 先 `mobile_dump_ui` 确认当前屏是 PDF 查看器（有「第 X 页/共 X 页」或 PDF 内容特征）→ 确认后再 capture_attachment_pages(liepin_user_id) 归档 → 拿到 object_keys 后再 interaction_log(in, attachment) + state_transition(receive_resume)；跳过触达（对方已发简历，无需再索要）。若 dump 确认不是 PDF 查看器（仍停在在线简历/详情页）→ 不截图，如实报告「未找到附件」，不推进 receive_resume**
+- 无附件简历且判定通过 → ensure_one_message + candidate_has_out_message 双查 → gated_tap(touch=True, counts_daily=False) 索要简历（响应性触达，不计入每日 100）→ 验证上屏 → **先 interaction_log(out) 再 state_transition**（顺序不可颠倒）。**无附件时严禁 receive_resume / interaction_log(msg_type='attachment')——在线简历截图不是附件，工具会因无附件证据拒绝**
 - 判定拒绝 → state_transition(reject_hard/reject_llm)
 - 落账 tasklog_add
 

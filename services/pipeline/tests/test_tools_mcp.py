@@ -37,6 +37,14 @@ class _FakeStore:
         self.keys.append(key)
 
 
+def _set_attachment_evidence(candidate_id: int) -> None:
+    """给候选人写入附件归档证据（模拟 capture_attachment_pages 已跑过）。"""
+    with SessionLocal() as session:
+        cand = session.get(models.Candidate, candidate_id)
+        cand.attachment_keys = ["snapshots/x/20261012_p0_120000.png"]
+        session.commit()
+
+
 @pytest.fixture()
 def jc_factory():
     """建 (job, candidate, jc) 三元组并提交，返回 jc（真实测试库，与既有测试同源）。"""
@@ -106,9 +114,42 @@ class TestAnchors:
 
     def test_receive_resume_sets_download_anchor(self, jc_factory):
         jc = jc_factory(status="awaiting_resume")
+        _set_attachment_evidence(jc.candidate_id)
         result = tools.state_transition(jc.id, "receive_resume")
         assert "error" not in result
         assert result["resume_downloaded_at"] is not None
+
+
+class TestAttachmentGuard:
+    """receive_resume / attachment 互动要求真实附件归档证据（防在线简历误判，2026-10-12）。"""
+
+    def test_receive_resume_without_evidence_refused(self, jc_factory):
+        jc = jc_factory(source="inbound", status="new")
+        result = tools.state_transition(jc.id, "receive_resume", source="inbound")
+        assert "error" in result
+        assert "附件" in result["error"]
+        with SessionLocal() as session:
+            reloaded = session.get(models.JobCandidate, jc.id)
+            assert reloaded.status == "new"  # 未被推进
+            assert reloaded.resume_downloaded_at is None
+
+    def test_receive_resume_with_evidence_allowed(self, jc_factory):
+        jc = jc_factory(source="inbound", status="new")
+        _set_attachment_evidence(jc.candidate_id)
+        result = tools.state_transition(jc.id, "receive_resume", source="inbound")
+        assert "error" not in result
+        assert result["new_status"] == "resume_received"
+
+    def test_attachment_interaction_without_evidence_refused(self, jc_factory):
+        jc = jc_factory()
+        result = tools.interaction_log(jc.id, "in", "attachment", "在线简历卡片")
+        assert "error" in result
+        assert "附件" in result["error"]
+
+    def test_attachment_interaction_with_evidence_allowed(self, jc_factory):
+        jc = jc_factory()
+        _set_attachment_evidence(jc.candidate_id)
+        assert "ok" in tools.interaction_log(jc.id, "in", "attachment", "附件简历")
 
 
 class TestOneMessage:
@@ -121,7 +162,7 @@ class TestOneMessage:
     def test_in_interaction_not_blocked(self, jc_factory):
         jc = jc_factory()
         assert "ok" in tools.interaction_log(jc.id, "out", "direct_request", "索要")
-        assert "ok" in tools.interaction_log(jc.id, "in", "attachment", "简历")
+        assert "ok" in tools.interaction_log(jc.id, "in", "reply", "回复")
 
 
 class TestCaptureAttachmentPages:
@@ -175,3 +216,4 @@ class TestCaptureAttachmentPages:
                 select(models.Candidate).where(models.Candidate.liepin_user_id == lid)
             ).scalar_one()
             assert cand.snapshot_object_key == result["snapshot_object_key"]
+            assert cand.attachment_keys == result["object_keys"]  # 附件证据落库（守卫依赖）

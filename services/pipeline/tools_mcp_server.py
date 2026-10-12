@@ -74,6 +74,16 @@ def _store() -> ObjectStore:
     return ObjectStore()
 
 
+def _has_attachment_evidence(jc: JobCandidate) -> bool:
+    """该 jc 的候选人是否已有真实附件归档证据（capture_attachment_pages 写入）。
+
+    receive_resume / interaction_log(attachment) 守卫用：在线简历截图
+    （snapshot_put）不写 attachment_keys，故不会被误判为「已收到附件简历」。
+    """
+    cand = jc.candidate
+    return bool(cand is not None and cand.attachment_keys)
+
+
 @mcp.tool()
 def candidate_get_or_create(
     liepin_user_id: str, name: str = "", source: str = "inbound"
@@ -174,6 +184,9 @@ def state_transition(
 
     守卫（先落账后推进）：触达类事件（greet/request_resume/await_resume）
     要求该 jc 已有 direction=out 的互动流水，否则拒绝推进。
+    守卫（附件证据）：receive_resume 要求该候选人已有真实附件归档证据
+    （capture_attachment_pages 写入的 attachment_keys），否则拒绝——在线简历
+    截图不得把候选人标成 resume_received。
     锚点自动落库：greet/request_resume → last_touch_at；await_resume →
     resume_requested_at（72h 关闭锚点）+ last_touch_at；receive_resume →
     resume_downloaded_at。
@@ -199,6 +212,14 @@ def state_transition(
                 return {
                     "error": f"触达类事件 {event} 要求先落 direction=out 互动流水（先落账后推进，拒绝）"
                 }
+        if ev is StateEvent.RECEIVE_RESUME and not _has_attachment_evidence(jc):
+            return {
+                "error": (
+                    f"receive_resume 拒绝：job_candidate {jc_id} 无附件归档证据"
+                    "（当前只有在线简历截图）。在线简历≠附件简历；无附件请走索要"
+                    "简历路径（interaction_log(out) → state_transition(request_resume/await_resume)）"
+                )
+            }
         try:
             ctx = TransitionContext(
                 source=source,
@@ -278,6 +299,8 @@ def interaction_log(
     """落互动流水。direction: out|in；msg_type: greet_request|reply|attachment|direct_request。
 
     direction=out 守卫：该 jc 已有 out 流水则拒绝（一人一消息，拒绝第二条）。
+    direction=in + msg_type=attachment 守卫：要求该候选人已有附件归档证据
+    （capture_attachment_pages 写入），否则拒绝——在线简历截图不得记为附件。
     """
     with SessionLocal() as session:
         jc = session.get(JobCandidate, jc_id)
@@ -288,6 +311,17 @@ def interaction_log(
                 ensure_no_out_message(session, jc)
             except OneMessagePerCandidateError as exc:
                 return {"error": str(exc)}
+        if (
+            direction == "in"
+            and msg_type == "attachment"
+            and not _has_attachment_evidence(jc)
+        ):
+            return {
+                "error": (
+                    f"attachment 互动拒绝：job_candidate {jc_id} 无附件归档证据"
+                    "（在线简历不得记为 attachment；无附件时不要落 attachment 流水）"
+                )
+            }
         session.add(
             Interaction(
                 job_candidate_id=jc_id,
@@ -632,6 +666,7 @@ def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
             ).scalar_one_or_none()
             if cand is not None:
                 cand.snapshot_object_key = keys[0]  # 首页键回写（前端 snapshot_url 依赖）
+                cand.attachment_keys = keys  # 附件归档证据（receive_resume 守依赖）
                 session.commit()
     return {
         "object_keys": keys,

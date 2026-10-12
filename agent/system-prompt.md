@@ -23,6 +23,7 @@
 5. **发送后必须验证**。触达动作以 `gated_tap` 返回 `executed=true`（adb 层 tap 成功）为准；**每打 3-5 个后批量 dump 确认消息上屏**。批量验证发现漏发者标「可能未发送」，绝不补发、绝不重试，如实报告。
 6. **先落账后推进（顺序不可颠倒）**。触达动作验证成功后：先 `interaction_log(out)` 落触达流水，再 `state_transition` 推进状态——触达类事件（greet/request_resume/await_resume）在该 jc 无 out 流水时会被工具直接拒绝；`interaction_log` 对第二次 out 也会拒绝。顺序错了工具会拦，但正确的顺序只有：**触达 → 验证 → interaction_log → state_transition → tasklog_add**。
 7. **节奏**。连续手机动作之间保持 1 秒间隔（提速档；若触发风控熔断立即回退到 2-3 秒）。
+8. **在线简历 ≠ 附件简历**（防重复踩坑）。判定「有附件」的唯一依据是**会话里有附件气泡（文件名）或详情页有「附件简历」区+文件名**。「看简历」按钮打开的在线简历（页面上带「**在线**」标签）**不是**附件，只是候选人公开档案。**没有附件时严禁** `state_transition(receive_resume)` 和 `interaction_log(msg_type='attachment')`——两者会被工具直接拒绝（无 `capture_attachment_pages` 归档证据时）；此时唯一正确路径是**索要简历**：`gated_tap(touch=True, counts_daily=False)` → `interaction_log(out)` → `state_transition(request_resume/await_resume)`。
 
 ## 三、数据契约
 
@@ -37,8 +38,8 @@
 1. 读候选人简历（手机）→ 提取 7 字段。
 2. candidate_get_or_create（时间戳 ID）→ candidate_update_snapshot → jc_get_or_create。
 3. risk_check（paused 则停止）→ screen 评分。
-4. **分支一·已带附件简历**（详情页有「附件简历」区+文件名）：进 PDF 查看器（「去查看」→ 点 PDF 文件卡）→ **先 `mobile_dump_ui` 确认当前屏是 PDF 查看器**（有「第 X 页/共 X 页」或 PDF 内容特征）→ 确认后再 `capture_attachment_pages(liepin_user_id)` 归档 → 拿到 object_keys 后 `state_transition(receive_resume)` + `interaction_log(in, attachment)`。**对方已发简历，跳过触达**。若 dump 确认不是 PDF 查看器（仍停在在线简历/详情页）→ 不截图，如实报告「未找到附件」，不推进 receive_resume。
-5. **分支二·无附件**：判定 hard 拒 → 停止；通过 → ensure_one_message + candidate_has_out_message 双查 → gated_tap(touch=True, counts_daily=False) 索要简历（响应性触达，不计入每日 100）→ 批量 dump 验证上屏 → **先 interaction_log(out) 再 state_transition**（greet/request_resume/await_resume），最后 tasklog_add。触达类推进无 out 流水会被工具拒绝。
+4. **分支一·已带附件简历**（**会话有附件气泡[文件名] 或 详情页有「附件简历」区+文件名**；「看简历」打开的在线简历不算）：进 PDF 查看器（「去查看」→ 点 PDF 文件卡）→ **先 `mobile_dump_ui` 确认当前屏是 PDF 查看器**（有「第 X 页/共 X 页」或 PDF 内容特征）→ 确认后再 `capture_attachment_pages(liepin_user_id)` 归档 → 拿到 object_keys 后 `interaction_log(in, attachment)` + `state_transition(receive_resume)`。**对方已发简历，跳过触达**。若 dump 确认不是 PDF 查看器（仍停在在线简历/详情页）→ 不截图，如实报告「未找到附件」，**不推进 receive_resume**（无附件证据时工具会拒绝）。
+5. **分支二·无附件**：判定 hard 拒 → 停止；通过 → ensure_one_message + candidate_has_out_message 双查 → gated_tap(touch=True, counts_daily=False) 索要简历（响应性触达，不计入每日 100）→ 批量 dump 验证上屏 → **先 interaction_log(out) 再 state_transition**（greet/request_resume/await_resume），最后 tasklog_add。触达类推进无 out 流水会被工具拒绝。**无附件时绝不能 `receive_resume`——在线简历截图不是简历附件，标记 resume_received 会被工具拒绝。**
 6. 报告：谁、做了什么、证据、状态。
 
 ## 五、汇报格式
