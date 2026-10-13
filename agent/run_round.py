@@ -204,6 +204,7 @@ WORK_WINDOW_END = (20, 0)
 ROUND_SECTIONS = [
     ("main_round", "## 1."),
     ("daily_round", "## 2."),
+    ("backfill_round", "## 3."),
 ]
 
 
@@ -236,7 +237,8 @@ def main() -> int:
         print(f"用法: python run_round.py <{'|'.join(n for n, _ in ROUND_SECTIONS)}>")
         return 2
     now = datetime.now()
-    if not within_window(now):
+    # backfill_round 只读下载（不触达、不发消息），可跨工作窗口运行
+    if name != "backfill_round" and not within_window(now):
         print(f"[skip] {name}: 工作窗口外（{now:%H:%M}）")
         return 0
     if name == "main_round" and should_backoff():

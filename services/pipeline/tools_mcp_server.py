@@ -10,8 +10,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -630,7 +632,8 @@ def list_awaiting() -> dict:
         return {"jc_ids": [r.id for r in rows]}
 
 
-@mcp.tool()
+# 已废弃：有附件一律走 download_attachment 下载真实 PDF，不再逐页截图。
+# 保留函数体仅供极端兜底/手动调用，不再注册为 MCP 工具（agent 不可见）。
 def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
     """把当前屏幕（附件 PDF 查看器）逐页截图归档到 MinIO。
 
@@ -704,6 +707,13 @@ def _swipe_down() -> None:
 PDF_PREV = (100, 2147)  # 上一页（左箭头）
 PDF_NEXT = (980, 2147)  # 下一页（右箭头）
 
+# 附件 PDF 查看器「转发」按钮（右上角）；仅「头像→资料页→划到底→附件简历→PDF」路径有。
+# 会话里直接点「附件简历」打开的 PDF 没有此按钮。
+PDF_FORWARD = (1008, 151)
+
+# UC 浏览器收到分享的 PDF 后，会把它缓存到外部可读目录（无 root 也能 adb pull）。
+UC_CACHE_DIR = "/sdcard/Android/data/com.UCMobile/cache"
+
 
 def _pdf_tap(x: int, y: int) -> None:
     subprocess.run(
@@ -711,6 +721,74 @@ def _pdf_tap(x: int, y: int) -> None:
         capture_output=True,
         timeout=20,
     )
+
+
+def _adb_shell(*args: str) -> str:
+    """跑 adb shell 命令，返回 stdout 文本（stderr 丢弃）。"""
+    result = subprocess.run([ADB, "shell", *args], capture_output=True, timeout=30)
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _ui_dump() -> str:
+    """dump 当前屏幕 UI 层级（uiautomator 会临时触发 Flutter 语义），返回 XML 文本。"""
+    _adb_shell("uiautomator", "dump", "/sdcard/hr_u.xml")
+    return _adb_shell("cat", "/sdcard/hr_u.xml")
+
+
+def _uc_cache_pdfs() -> list[str]:
+    """UC 外部缓存目录里现有的 .pdf 文件名列表（非递归）。"""
+    out = _adb_shell("ls", UC_CACHE_DIR)
+    names = []
+    for line in out.splitlines():
+        name = line.strip()
+        if name.lower().endswith(".pdf"):
+            names.append(name)
+    return names
+
+
+def _clear_uc_cache() -> None:
+    """清空 UC 缓存目录下所有 .pdf。
+
+    用 glob（`rm -f <dir>/*.pdf`）而非逐个 rm，避免含空格/中文文件名被
+    adb shell 按空格拆散导致删不掉。
+    """
+    _adb_shell("rm", "-f", f"{UC_CACHE_DIR}/*.pdf")
+
+
+def _share_target_center(xml: str, keyword: str) -> tuple[int, int] | None:
+    """在分享面板 XML 里找 text/content-desc 含 keyword 的目标，返回其标签中心坐标。
+
+    分享面板（Android ChooserActivity，系统 UI）目标结构 = [标签 TextView(有
+    bounds)] + [副标题 TextView(text 含 keyword, bounds=[0,0])]，副标题紧跟标签
+    之后。这里取「keyword 节点前面最近一个有真实 bounds 的兄弟节点」中心；找不到
+    返回 None。
+    """
+    nodes = re.findall(r"<node\b[^>]*>", xml)
+
+    def _attr(nd: str, a: str) -> str:
+        m = re.search(a + r'="([^"]*)"', nd)
+        return m.group(1) if m else ""
+
+    for i, nd in enumerate(nodes):
+        hay = _attr(nd, "text") + "\n" + _attr(nd, "content-desc")
+        if keyword in hay:
+            # 先看自身是否有真实 bounds（keyword 就在标签上）
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", _attr(nd, "bounds"))
+            if m and int(m.group(3)) > int(m.group(1)):
+                return (
+                    (int(m.group(1)) + int(m.group(3))) // 2,
+                    (int(m.group(2)) + int(m.group(4))) // 2,
+                )
+            # 否则（keyword 是 bounds=[0,0] 的副标题）向前找最近有 bounds 的标签
+            for j in range(i - 1, max(-1, i - 6), -1):
+                b = _attr(nodes[j], "bounds")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+                if m and int(m.group(3)) > int(m.group(1)):
+                    return (
+                        (int(m.group(1)) + int(m.group(3))) // 2,
+                        (int(m.group(2)) + int(m.group(4))) // 2,
+                    )
+    return None
 
 
 def _images_differ(a: bytes, b: bytes, threshold_ratio: float = 0.001) -> bool:
@@ -726,6 +804,118 @@ def _images_differ(a: bytes, b: bytes, threshold_ratio: float = 0.001) -> bool:
     changed = sum(hist[11:])  # 值 > 10 的像素数
     total = ia.size[0] * ia.size[1]
     return changed / total > threshold_ratio
+
+
+@mcp.tool()
+def download_attachment(
+    job_id: int,
+    liepin_user_id: str,
+    name: str,
+    job_title: str,
+) -> dict:
+    """从附件 PDF 查看器下载真实简历 PDF 并归档 MinIO（替代逐页截图）。
+
+    前置：Pi 已导航到附件 PDF 查看器（「头像→资料页→划到底→附件简历→PDF」路径，
+    右上角有「转发」按钮）。工具自动：点「转发」→ 分享面板选「UC浏览器/PDF阅读器」
+    → 轮询 UC 外部缓存拿到新 PDF → adb pull → 归档 resumes/ 键 → 回写
+    candidate.attachment_keys（receive_resume 守卫证据）→ 清理缓存。
+
+    返回 {"object_key", "name", "bytes"}；任一步失败抛 RuntimeError。
+    """
+    # 0. 先清空 UC 缓存，避免「该 PDF 已被缓存」导致后续轮询等不到新文件
+    _clear_uc_cache()
+    before = set(_uc_cache_pdfs())
+
+    # 1. 点「转发」弹系统分享面板
+    _pdf_tap(*PDF_FORWARD)
+    time.sleep(2.5)
+
+    # 2. 分享面板目标会按最近使用重排，必须现场 dump；只认「PDF阅读器」（UC 的推荐目标）
+    xml = _ui_dump()
+    center = _share_target_center(xml, "PDF阅读器")
+    if center is None:
+        raise RuntimeError("未在分享面板找到 UC/PDF阅读器 目标")
+    _pdf_tap(*center)
+
+    # 3. 轮询 UC 外部缓存，等新 PDF 落盘（UC 打开 PDF 阅读器后即缓存）
+    new_name = None
+    for _ in range(30):
+        time.sleep(1.0)
+        diff = set(_uc_cache_pdfs()) - before
+        if diff:
+            new_name = sorted(diff)[0]
+            break
+    if new_name is None:
+        raise RuntimeError(f"UC 缓存未出现新 PDF（原已有 {sorted(before)}）")
+
+    # 4. adb pull 到本地临时文件
+    local = Path(tempfile.gettempdir()) / new_name
+    pull = subprocess.run(
+        [ADB, "pull", f"{UC_CACHE_DIR}/{new_name}", str(local)],
+        capture_output=True,
+        timeout=60,
+    )
+    if pull.returncode != 0 or not local.exists():
+        raise RuntimeError(f"pull 失败：{pull.stderr[:200]!r}")
+    nbytes = local.stat().st_size
+
+    # 5. 归档真 PDF（resumes/ 键规范，重名自动加时间戳）
+    data = local.read_bytes()
+    key = _store().put_resume(
+        job_id, liepin_user_id, name, job_title, datetime.now().date(), data
+    )
+
+    # 6. 回写：candidate.attachment_keys（receive_resume 守卫证据）
+    #     + jc.minio_object_key（前端 has_pdf / resume_url 依赖）
+    with SessionLocal() as session:
+        cand = session.execute(
+            select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+        ).scalar_one_or_none()
+        if cand is not None:
+            cand.attachment_keys = [key]
+            jc = session.execute(
+                select(JobCandidate).where(
+                    JobCandidate.candidate_id == cand.id,
+                    JobCandidate.job_id == job_id,
+                )
+            ).scalar_one_or_none()
+            if jc is not None:
+                jc.minio_object_key = key
+                jc.resume_downloaded_at = datetime.now()
+            session.commit()
+
+    # 7. 清理本地临时文件 + UC 缓存（清空全部 .pdf，避免含空格文件名删不掉）
+    local.unlink(missing_ok=True)
+    _clear_uc_cache()
+
+    return {"object_key": key, "name": new_name, "bytes": nbytes}
+
+
+@mcp.tool()
+def list_backfill_candidates() -> dict:
+    """列出需回填真实 PDF 的候选人：有附件截图（attachment_keys 含 .png）但尚无 PDF（minio_object_key 为空）。
+
+    按 (姓名, 岗位) 去重，返回最新 liepin_user_id，供回填轮次逐个导航下载真 PDF。
+    """
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(JobCandidate).where(JobCandidate.minio_object_key.is_(None))
+        ).scalars().all()
+        best: dict[tuple[str, int], dict] = {}
+        for jc in rows:
+            cand = jc.candidate
+            ak = cand.attachment_keys or []
+            if not any(".png" in (k or "") for k in ak):
+                continue
+            key = (cand.name, jc.job_id)
+            if key not in best or cand.liepin_user_id > best[key]["uid"]:
+                job = session.get(Job, jc.job_id)
+                best[key] = {"uid": cand.liepin_user_id, "title": job.title if job else ""}
+        candidates = [
+            {"name": name, "liepin_user_id": v["uid"], "job_id": job_id, "job_title": v["title"]}
+            for (name, job_id), v in sorted(best.items(), key=lambda kv: kv[1]["uid"], reverse=True)
+        ]
+        return {"count": len(candidates), "candidates": candidates}
 
 
 if __name__ == "__main__":

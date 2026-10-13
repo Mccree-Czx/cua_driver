@@ -28,12 +28,12 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 - 读候选人简历字段（tap 进详情，dump 提取 7 字段）
 - candidate_get_or_create（时间戳 ID，source='inbound'）→ candidate_update_snapshot → **读详情页「沟通职位」得到职位名 → job_list_active() 按 title 模糊匹配 → jc_get_or_create(job_id=匹配到的职位 id)；匹配不到则 job_upsert(title=沟通职位, jd_text="") 录入后拿新 id 再 jc_get_or_create**
 - risk_check 熔断则停；screen 评分
-- **已带附件简历（会话有附件气泡[文件名] 或 详情页有「附件简历」区 + 文件名；「看简历」打开的在线简历[带「在线」标签]不算）→ 直收：进 PDF 查看器（「去查看」→ 点 PDF 文件卡）→ 先 `mobile_dump_ui` 确认当前屏是 PDF 查看器（有「第 X 页/共 X 页」或 PDF 内容特征）→ 确认后再 capture_attachment_pages(liepin_user_id) 归档 → 拿到 object_keys 后再 interaction_log(in, attachment) + state_transition(receive_resume)；跳过触达（对方已发简历，无需再索要）。若 dump 确认不是 PDF 查看器（仍停在在线简历/详情页）→ 不截图，如实报告「未找到附件」，不推进 receive_resume**
+- **已带附件简历（会话有附件气泡[文件名] 或 详情页有「附件简历」区 + 文件名；「看简历」打开的在线简历[带「在线」标签]不算）→ 直收：会话里点对方头像进资料页 → 划到底 → 点「附件简历」进 PDF 查看器（右上角有「转发」按钮）→ download_attachment(job_id, liepin_user_id, name, job_title) 下载真实 PDF 并归档 → 拿到 object_key 后再 interaction_log(in, attachment) + state_transition(receive_resume)；跳过触达（对方已发简历，无需再索要）。注意：只有「头像→资料页→附件简历」路径打开的 PDF 才有「转发」按钮；若进不了附件 PDF → 如实报告「未找到附件」，不推进 receive_resume**
 - 无附件简历且判定通过 → ensure_one_message + candidate_has_out_message 双查 → gated_tap(touch=True, counts_daily=False) 索要简历（响应性触达，不计入每日 100）→ 验证上屏 → **先 interaction_log(out) 再 state_transition**（顺序不可颠倒）。**无附件时严禁 receive_resume / interaction_log(msg_type='attachment')——在线简历截图不是附件，工具会因无附件证据拒绝**
 - 判定拒绝 → state_transition(reject_hard/reject_llm)
 - 落账 tasklog_add
 
-输出：本轮 outbound 打招呼几人、inbound 处理几个未读会话、每个的结果（含已收简历者的分页截图键）。
+输出：本轮 outbound 打招呼几人、inbound 处理几个未读会话、每个的结果（含已收简历者的 PDF 归档键）。
 
 **末尾必须单独输出一行机器可读结果**（供调度脚本判定空轮退避，格式固定、数字为整数）：
 `@@RESULT@@ inbound=<N> outbound=<M>`
@@ -44,8 +44,21 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 
 一次性收尾，顺序执行：
 
-1. **72h 关闭 + 追附件**：调用 close_stale_awaiting()（72h 关闭 awaiting_resume）；再 list_awaiting()，对每个 awaiting 的 jc：手机进对应会话查是否已收到附件简历；有 → 进 PDF 查看器后 capture_attachment_pages(liepin_user_id) 分页截图归档 + state_transition(receive_resume) + interaction_log(in, attachment)；无 → 不动。全程无触达。
+1. **72h 关闭 + 追附件**：调用 close_stale_awaiting()（72h 关闭 awaiting_resume）；再 list_awaiting()，对每个 awaiting 的 jc：手机进对应会话查是否已收到附件简历；有 → 点对方头像进资料页 → 划到底 → 点「附件简历」→ download_attachment(job_id, liepin_user_id, name, job_title) 归档真 PDF + state_transition(receive_resume) + interaction_log(in, attachment)；无 → 不动。全程无触达。
 2. **登录检查**：手机打开猎聘，dump 判断登录态：未登录（登录页锚点）→ risk_set() + 报告「请扫码登录」；已登录 → risk_clear()。
 3. **配额对账**：调 quota_status() 报当日已打招呼 used_today/100。触顶（remaining==0）→ 报告「当日 100 次打招呼已用完，明日 08:00 恢复」。本轮只报告，不操作手机。
 4. **延期重判**：查 jc_status 中 status=new 且 judge_reason 含 deferred 的 jc，用已存 online_resume_minimal 重新 screen；通过者按 inbound/outbound 路径补触达（同 §1 的闸门流程）。
 5. **职位检测**：手机打开猎聘 → tap 底部「职位」tab → tap「招聘中」tab → dump 职位列表（提取每个职位的职位名）→ `job_list_active()` 读 DB 已有职位名 → 对比，发现**新职位**（DB 无此 title）→ 点进该职位 → 找「编辑职位」入口 → dump「职位描述」字段得到 jd_text → `job_upsert(title=职位名, jd_text=JD)` 录入。无新职位则报告「无新职位」。全程无触达。
+
+## 3. backfill_round（一次性回填：历史截图 → 真实 PDF）
+
+把历史上用「截图方案/误判」处理的候选人，逐个补下载真实 PDF 附件。**全程无触达**（不打招呼、不发消息、不索要）。
+
+1. 调 `list_backfill_candidates()` 得待回填名单（name / liepin_user_id / job_id / job_title，已去重）。
+2. 手机进消息页「**全部**」tab（不是「未读」——这些是已读老会话）。逐个按**姓名 + 岗位**在列表里找对应会话（姓名模糊匹配、岗位辅助确认；同名者务必以岗位区分，避免挂错人）。
+3. 对每个候选：点进会话 → 确认有「**附件简历**」气泡/按钮：
+   - **有附件** → 点对方头像进资料页 → 划到底 → 点「附件简历」进 PDF 查看器（右上角有「转发」按钮）→ `download_attachment(job_id, liepin_user_id, name, job_title)` 下载真 PDF。
+   - **无附件**（只有在线简历/打招呼，没有附件气泡）→ 跳过，报告「误判：{name} 无附件」。
+4. 单轮上限 20 个，超出的留待下一轮（下一轮再调 `list_backfill_candidates()` 会只剩未完成的）。
+5. 输出：本轮回填几人、成功几人、误判几人（列出误判名单）。
+
