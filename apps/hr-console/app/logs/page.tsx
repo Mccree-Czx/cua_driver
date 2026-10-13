@@ -51,7 +51,7 @@ export default function Logs() {
       dataIndex: "created_at",
       key: "created_at",
       width: 170,
-      render: (v: string | null) => v ?? "—",
+      render: (v: string | null) => (v ? v.replace("T", " ").slice(0, 19) : "—"),
     },
     { title: "任务", dataIndex: "task_id", key: "task_id", width: 220, ellipsis: true },
     {
