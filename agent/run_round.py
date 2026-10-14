@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -103,7 +104,7 @@ def parse_round_result(output: str):
 
 def _session_dir() -> Path | None:
     """找 Pi 的 session 目录（agent 目录，排除 pi-agent/mobile_spike）。"""
-    root = Path.home() / ".pi" / "agent" / "sessions"
+    root = PI_AGENT_DIR / "sessions"
     try:
         for d in root.iterdir():
             if d.is_dir() and d.name.endswith("agent--") and "pi-agent" not in d.name:
@@ -169,14 +170,54 @@ def _write_token_summary(name: str, tokens: int, cost: float) -> None:
         cwd=str(cwd), capture_output=True, timeout=60,
     )
 
-# Windows 下 npm 的 pi.cmd shim 不能被 CreateProcess 直跑——用 node + JS 入口
-PI_CLI = (
-    Path(os.environ.get("APPDATA", ""))
-    / "npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
-)
+def _resolve_pi_cli() -> str:
+    """定位 pi 的 JS 入口，跨平台。
+
+    HR_PI_CLI 可显式指定入口（用于固定版本、与机器上其它 Pi 隔离）。
+
+    Windows 下 npm 的 pi.cmd shim 不能被 CreateProcess 直跑，必须用 node + JS 入口；
+    macOS/Linux 上 pi 是指向 cli.js 的符号链接，解出来即可。
+    """
+    candidates = [os.environ.get("HR_PI_CLI"), shutil.which("pi")]
+    # PATH 不可靠时（launchd / systemd / 非交互 ssh 常拿不到 Homebrew），
+    # 直接探测常见安装位置。
+    candidates += [
+        "/opt/homebrew/bin/pi",   # Apple Silicon Homebrew
+        "/usr/local/bin/pi",      # Intel Homebrew
+        str(Path.home() / ".npm-global/bin/pi"),
+    ]
+    for exe in candidates:
+        if not exe:
+            continue
+        real = Path(exe).resolve()
+        if real.suffix == ".js" and real.exists():
+            return str(real)
+    try:
+        root = subprocess.run(
+            ["npm", "root", "-g"], capture_output=True, text=True, timeout=30
+        ).stdout.strip()
+        if root:
+            cand = Path(root) / "@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+            if cand.exists():
+                return str(cand)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # 兜底：Windows 的 npm 全局目录
+    return str(
+        Path(os.environ.get("APPDATA", ""))
+        / "npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+    )
+
+
+PI_CLI = _resolve_pi_cli()
 
 PROVIDER = "deepseek"
 MODEL = "deepseek-flash"
+
+# Pi 配置目录。默认 ~/.pi/agent（保持既有行为）；设 HR_PI_AGENT_DIR 可切到独立目录。
+# 同一台机器上若有别的 Pi 实例，必须隔离——否则共享 mcp.json，本系统的 MCP
+# server 会被对方的 Pi 也拉起来（例如 adb 抢占）。
+PI_AGENT_DIR = Path(os.environ.get("HR_PI_AGENT_DIR") or (Path.home() / ".pi" / "agent"))
 
 
 def _load_api_key() -> str:
@@ -270,12 +311,14 @@ def main() -> int:
         log_path = AGENT_DIR / f".round_{name}.log"
         try:
             with open(log_path, "w", encoding="utf-8") as logf:
+                env = {**os.environ, "PI_CODING_AGENT_DIR": str(PI_AGENT_DIR)}
                 result = subprocess.run(
                     cmd,
                     stdout=logf,
                     stderr=subprocess.STDOUT,
                     text=True,
                     cwd=str(AGENT_DIR),
+                    env=env,
                     timeout=3600,
                 )
         except subprocess.TimeoutExpired:
