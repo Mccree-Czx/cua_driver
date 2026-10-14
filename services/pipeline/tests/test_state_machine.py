@@ -15,6 +15,7 @@ from app.state_machine import (
     TransitionContext,
     transition,
 )
+from conftest import DEFAULT_ACCOUNT_ID
 from hr_workbuddy import CandidateStatus as S
 
 INBOUND = "inbound"
@@ -24,12 +25,15 @@ OUTBOUND = "recommended"
 def _make_jc(source: str = INBOUND, status: S = S.NEW) -> models.JobCandidate:
     """detached JobCandidate + 挂 candidate（路径消歧读 jc.candidate.source）。"""
     candidate = models.Candidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         liepin_user_id=f"lp-{source}-{status.value}",
         name="张伟",
         online_resume_minimal={},
         source=source,
     )
-    jc = models.JobCandidate(job_id=1, candidate_id=1, status=status.value)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=1, candidate_id=1, status=status.value
+    )
     jc.candidate = candidate
     return jc
 
@@ -173,13 +177,17 @@ def test_ctx_source_takes_precedence_over_candidate_source():
 
 def test_path_agnostic_edge_needs_no_source():
     """与路径无关的边（如 new→screened_pass）无需 candidate/ctx.source。"""
-    jc = models.JobCandidate(job_id=1, candidate_id=1, status=S.NEW.value)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=1, candidate_id=1, status=S.NEW.value
+    )
     result = transition(jc, StateEvent.SCREEN_PASS)
     assert result.status == S.SCREENED_PASS.value
 
 
 def test_path_dependent_edge_without_source_raises():
-    jc = models.JobCandidate(job_id=1, candidate_id=1, status=S.SCREENED_PASS.value)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=1, candidate_id=1, status=S.SCREENED_PASS.value
+    )
     with pytest.raises(InvalidTransition, match="无法判定路径"):
         transition(jc, StateEvent.REQUEST_RESUME)
 
@@ -190,7 +198,9 @@ def test_unknown_event_raises():
 
 
 def test_unknown_status_raises():
-    jc = models.JobCandidate(job_id=1, candidate_id=1, status="weird")
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=1, candidate_id=1, status="weird"
+    )
     with pytest.raises(InvalidTransition, match="无法识别的当前状态"):
         transition(jc, StateEvent.SCREEN_PASS)
 

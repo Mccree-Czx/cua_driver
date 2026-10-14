@@ -15,6 +15,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from app import models
+from conftest import DEFAULT_ACCOUNT_ID
 from hr_workbuddy import CandidateStatus
 
 
@@ -25,8 +26,13 @@ def _unique(prefix: str) -> str:
 
 def _make_job_and_candidate(session) -> tuple[models.Job, models.Candidate]:
     suffix = _unique("t")
-    job = models.Job(title=f"产品经理-{suffix}", jd_text="负责产品规划与迭代")
+    job = models.Job(
+        account_id=DEFAULT_ACCOUNT_ID,
+        title=f"产品经理-{suffix}",
+        jd_text="负责产品规划与迭代",
+    )
     candidate = models.Candidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         liepin_user_id=f"LP-{suffix}",
         name="张伟",
         online_resume_minimal={},
@@ -40,6 +46,7 @@ def _make_job_and_candidate(session) -> tuple[models.Job, models.Candidate]:
 def test_job_defaults_and_json_roundtrip(session):
     """llm_threshold 默认 40；hard_rules/template_msgs JSON 往返；created_at 落库。"""
     job = models.Job(
+        account_id=DEFAULT_ACCOUNT_ID,
         title=_unique("产品经理"),
         jd_text="负责产品规划",
         hard_rules={"min_education": "本科", "min_years": 3},
@@ -58,8 +65,8 @@ def test_job_defaults_and_json_roundtrip(session):
     assert loaded.created_at is not None
 
 
-def test_candidate_roundtrip_and_unique_liepin_user_id(session):
-    """liepin_user_id 全局唯一（真实打库 IntegrityError）；JSON 快照与 source 往返。"""
+def test_candidate_roundtrip_and_unique_liepin_user_id_within_account(session):
+    """(account_id, liepin_user_id) 账号内唯一（真实打库 IntegrityError）；JSON 快照与 source 往返。"""
     liepin_id = _unique("LP")
     snapshot = {
         "name": "张伟",
@@ -71,6 +78,7 @@ def test_candidate_roundtrip_and_unique_liepin_user_id(session):
         "experience_summary": "三年产品经验",
     }
     candidate = models.Candidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         liepin_user_id=liepin_id,
         name="张伟",
         online_resume_minimal=snapshot,
@@ -88,7 +96,11 @@ def test_candidate_roundtrip_and_unique_liepin_user_id(session):
     assert loaded.source == "inbound"
 
     dup = models.Candidate(
-        liepin_user_id=liepin_id, name="重复", online_resume_minimal={}, source="inbound"
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=liepin_id,
+        name="重复",
+        online_resume_minimal={},
+        source="inbound",
     )
     session.add(dup)
     with pytest.raises(IntegrityError):
@@ -96,13 +108,63 @@ def test_candidate_roundtrip_and_unique_liepin_user_id(session):
     session.rollback()
 
 
+def test_same_liepin_user_id_across_accounts_builds_separate_records(session):
+    """多账号（2026-10-14）：同一 liepin_user_id 在两个账号下各自建档，互不冲突。
+
+    只 flush 不 commit：唯一性由 MySQL 在 INSERT 时即校验（flush 足够证明），
+    而落库的跨账号重复行会让下一次 `alembic downgrade base` 失败——0009 的
+    downgrade 要恢复全局唯一索引（见迁移 docstring 的已知限制）。会话级
+    fixture 结束时回滚，行不残留。
+    """
+    liepin_id = _unique("LP")
+    other_account = models.Account(name=_unique("第二账号"), is_active=False)
+    session.add(other_account)
+    session.flush()
+
+    first = models.Candidate(
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=liepin_id,
+        name="张伟",
+        online_resume_minimal={},
+        source="inbound",
+    )
+    second = models.Candidate(
+        account_id=other_account.id,
+        liepin_user_id=liepin_id,
+        name="张伟",
+        online_resume_minimal={},
+        source="inbound",
+    )
+    session.add_all([first, second])
+    session.flush()  # 不抛：唯一约束是 (account_id, liepin_user_id)
+
+    rows = (
+        session.execute(
+            select(models.Candidate).where(models.Candidate.liepin_user_id == liepin_id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert {row.account_id for row in rows} == {DEFAULT_ACCOUNT_ID, other_account.id}
+    assert len({row.id for row in rows}) == 2
+
+
 def test_job_candidate_unique_pair_raises_integrity_error(session):
     """UNIQUE(job_id, candidate_id)：同对第二行 flush 即 IntegrityError。"""
     job, candidate = _make_job_and_candidate(session)
 
-    session.add(models.JobCandidate(job_id=job.id, candidate_id=candidate.id))
+    session.add(
+        models.JobCandidate(
+            account_id=DEFAULT_ACCOUNT_ID, job_id=job.id, candidate_id=candidate.id
+        )
+    )
     session.flush()
-    session.add(models.JobCandidate(job_id=job.id, candidate_id=candidate.id))
+    session.add(
+        models.JobCandidate(
+            account_id=DEFAULT_ACCOUNT_ID, job_id=job.id, candidate_id=candidate.id
+        )
+    )
     with pytest.raises(IntegrityError):
         session.flush()
     session.rollback()
@@ -112,15 +174,22 @@ def test_job_candidate_status_stores_candidate_status_string(session):
     """status 为 VARCHAR(32)：库中存 CandidateStatus 字符串值；默认 new。"""
     job, candidate = _make_job_and_candidate(session)
 
-    default_jc = models.JobCandidate(job_id=job.id, candidate_id=candidate.id)
+    default_jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=job.id, candidate_id=candidate.id
+    )
     assert default_jc.status == CandidateStatus.NEW.value
 
     other = models.Candidate(
-        liepin_user_id=_unique("LP"), name="李娜", online_resume_minimal={}, source="inbound"
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=_unique("LP"),
+        name="李娜",
+        online_resume_minimal={},
+        source="inbound",
     )
     session.add(other)
     session.flush()
     jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         job_id=job.id,
         candidate_id=other.id,
         status=CandidateStatus.SCREENED_PASS.value,
@@ -145,7 +214,9 @@ def test_job_candidate_status_stores_candidate_status_string(session):
 def test_interaction_native_enum_roundtrip(session):
     """direction/msg_type 为 MySQL 原生 ENUM，out/greet_request 可持久化往返。"""
     job, candidate = _make_job_and_candidate(session)
-    jc = models.JobCandidate(job_id=job.id, candidate_id=candidate.id)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=job.id, candidate_id=candidate.id
+    )
     session.add(jc)
     session.flush()
 
@@ -172,6 +243,7 @@ def test_review_override_roundtrip(session):
     """人工复核流水：old/new status 用 CandidateStatus 字符串值。"""
     job, candidate = _make_job_and_candidate(session)
     jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         job_id=job.id,
         candidate_id=candidate.id,
         status=CandidateStatus.SCREENED_PASS.value,

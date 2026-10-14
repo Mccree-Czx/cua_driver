@@ -10,6 +10,7 @@ from app.db import engine
 from helpers import run_alembic
 
 EXPECTED_TABLES = {
+    "accounts",
     "jobs",
     "candidates",
     "job_candidate",

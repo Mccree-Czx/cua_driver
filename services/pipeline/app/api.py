@@ -11,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.deps import get_session
-from app.models import JOB_STATUS_ACTIVE, Job
+from app.deps import get_active_account, get_session
+from app.models import JOB_STATUS_ACTIVE, Account, Job
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -42,8 +42,13 @@ class JobOut(BaseModel):
 
 
 @router.post("/jobs", response_model=JobOut, status_code=201)
-def create_job(payload: JobCreate, session: Session = Depends(get_session)):
-    job = Job(**payload.model_dump())
+def create_job(
+    payload: JobCreate,
+    session: Session = Depends(get_session),
+    acct: Account = Depends(get_active_account),
+):
+    """建岗位。归属当前生效账号——职位是从那个号的 App 里读到的。"""
+    job = Job(account_id=acct.id, **payload.model_dump())
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -51,5 +56,15 @@ def create_job(payload: JobCreate, session: Session = Depends(get_session)):
 
 
 @router.get("/jobs", response_model=list[JobOut])
-def list_jobs(session: Session = Depends(get_session)):
-    return session.execute(select(Job).order_by(Job.id)).scalars().all()
+def list_jobs(
+    session: Session = Depends(get_session),
+    acct: Account = Depends(get_active_account),
+):
+    """列当前账号的岗位。"""
+    return (
+        session.execute(
+            select(Job).where(Job.account_id == acct.id).order_by(Job.id)
+        )
+        .scalars()
+        .all()
+    )

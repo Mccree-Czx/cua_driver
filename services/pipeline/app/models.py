@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -40,10 +41,43 @@ INTERACTION_DIRECTIONS = ("out", "in")
 INTERACTION_MSG_TYPES = ("greet_request", "reply", "attachment", "direct_request")
 
 
+class Account(Base):
+    """猎聘招聘账号（多账号支持，2026-10-14）。
+
+    系统的执行端是手机上的猎聘 App，同一时刻只登录一个招聘号。切号由人工在
+    手机上完成，系统只负责「知道当前是哪个号」并按账号隔离数据。
+
+    is_active 放数据库而不是 Redis：这是配置性状态，要持久、要进备份。
+    Redis 一刷就丢失当前账号，系统便不知道该按哪个号算配额。应用层保证
+    全局最多一个为 true（切换走 hr_api 的 activate 端点，事务内保证）。
+    """
+
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("is_active", False)
+        super().__init__(**kwargs)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 职位天然属于某个账号：daily_round 的「职位检测」读的就是当前登录号的职位列表
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", name="fk_jobs_account_id_accounts"),
+        nullable=False,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     jd_text: Mapped[str] = mapped_column(Text, nullable=False)
     hard_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -72,9 +106,22 @@ class Job(Base):
 
 class Candidate(Base):
     __tablename__ = "candidates"
+    __table_args__ = (
+        # 多账号支持（2026-10-14）：liepin_user_id 由「全局唯一」改为「账号内唯一」。
+        # 同一个候选人在两个招聘号下要被各自建档——否则第二个号会把第一个号的
+        # 记录当成自己的（或直接撞唯一键）。
+        UniqueConstraint(
+            "account_id", "liepin_user_id", name="uq_candidate_account_liepin"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    liepin_user_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", name="fk_candidates_account_id_accounts"),
+        nullable=False,
+        index=True,
+    )
+    liepin_user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     online_resume_minimal: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
@@ -114,6 +161,16 @@ class JobCandidate(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 冗余的账号维度（2026-10-14）：账号实际可由 job 推出，但系统里有 ~35 处
+    # 查询以 job_candidate 为枢纽（hr_api 十个端点 + 26 个 hr-tools）。留着冗余列
+    # 让每处过滤都是同一句 `.where(account_id == acct.id)`，不必逐个补 JOIN——
+    # 漏掉任何一处 JOIN 都会静默造成跨账号数据泄露，这个风险比冗余更大。
+    # 一致性由写入侧保证：建档时从 job 取一次，职位不会改账号。
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", name="fk_job_candidate_account_id_accounts"),
+        nullable=False,
+        index=True,
+    )
     job_id: Mapped[int] = mapped_column(
         ForeignKey("jobs.id", name="fk_job_candidate_job_id_jobs"), nullable=False
     )
@@ -199,6 +256,13 @@ class TaskLog(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # 可空：轮次期间落的账（含人工队列）带账号，系统级汇总（token 成本）留 NULL。
+    # /manual-queue 必须按它过滤——那些条目会带出候选人姓名，不过滤就是跨账号泄露。
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", name="fk_task_logs_account_id_accounts"),
+        nullable=True,
+        index=True,
+    )
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))

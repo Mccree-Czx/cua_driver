@@ -28,8 +28,9 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.keys import msg_touch_key, risk_pause_key
 from app.messaging import OneMessagePerCandidateError, ensure_no_out_message
-from app.models import Candidate, Interaction, Job, JobCandidate, TaskLog
+from app.models import Account, Candidate, Interaction, Job, JobCandidate, TaskLog
 from app.screening_client import ScreeningClient
 from app.state_machine import (
     InvalidTransition,
@@ -43,7 +44,6 @@ from hr_workbuddy.rate_limit import TokenBucket
 
 mcp = MCPServer("hr-tools")
 
-RISK_PAUSE_KEY = "cua:risk:paused"
 # 优先用 mobile-use 同款硬编码位置（已部署），否则回退 PATH
 _ADB_SDK = os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe")
 ADB = _ADB_SDK if os.path.exists(_ADB_SDK) else "adb"
@@ -76,6 +76,33 @@ def _store() -> ObjectStore:
     return ObjectStore()
 
 
+class NoActiveAccountError(RuntimeError):
+    """没有生效的猎聘账号。所有工具都会提前拒掉——见 _active_account。"""
+
+
+def _active_account_id(session) -> int:
+    """当前生效账号的 id（多账号隔离的锚点）。
+
+    每个工具进来先解析账号，再把它加进查询条件。**不修改任何工具的签名**：
+    `agent/system-prompt.md` 与 `agent/rounds.md` 里写死了工具名与参数，
+    改签名会连带改提示词、增加 Pi 跑偏的风险。
+
+    取不到账号时直接抛错而不是猜一个——猜错会把候选人档案与配额记到别的号头上。
+    """
+    acct = session.execute(
+        select(Account.id).where(Account.is_active.is_(True)).order_by(Account.id)
+    ).scalars().first()
+    if acct is None:
+        raise NoActiveAccountError("没有生效的猎聘账号，请先在前端账号页选择一个")
+    return acct
+
+
+def _current_account_id() -> int:
+    """纯 Redis 工具（风控/配额）用的账号解析——它们不进 DB，没有现成 session。"""
+    with SessionLocal() as session:
+        return _active_account_id(session)
+
+
 def _has_attachment_evidence(jc: JobCandidate) -> bool:
     """该 jc 的候选人是否已有真实附件归档证据（capture_attachment_pages 写入）。
 
@@ -90,13 +117,18 @@ def _has_attachment_evidence(jc: JobCandidate) -> bool:
 def candidate_get_or_create(
     liepin_user_id: str, name: str = "", source: str = "inbound"
 ) -> dict:
-    """按 liepin_user_id 幂等取/建候选人（source: inbound|recommended）。"""
+    """按 liepin_user_id 幂等取/建候选人（source: inbound|recommended）。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         cand = session.execute(
-            select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+            select(Candidate).where(
+                Candidate.account_id == acct,
+                Candidate.liepin_user_id == liepin_user_id,
+            )
         ).scalar_one_or_none()
         if cand is None:
             cand = Candidate(
+                account_id=acct,
                 liepin_user_id=liepin_user_id,
                 name=name or liepin_user_id,
                 online_resume_minimal={},
@@ -104,7 +136,23 @@ def candidate_get_or_create(
             )
             session.add(cand)
             session.commit()
-            return {"candidate_id": cand.id, "created": True}
+            # 安全网：完整隔离下每个号有独立的候选人库，同一人可能被两个号
+            # 各打一次招呼。此处不阻断（那是用户选定的语义），只把事实带回去，
+            # 让 Pi 在轮次汇报里带出来供人工判断。
+            other = session.execute(
+                select(Candidate.account_id)
+                .where(
+                    Candidate.liepin_user_id == liepin_user_id,
+                    Candidate.account_id != acct,
+                )
+                .limit(1)
+            ).scalars().first()
+            out = {"candidate_id": cand.id, "created": True}
+            if other is not None:
+                out["cross_account_warning"] = (
+                    f"该候选人在账号 {other} 下已有档案——两个号可能重复触达同一人"
+                )
+            return out
         return {"candidate_id": cand.id, "created": False}
 
 
@@ -112,10 +160,14 @@ def candidate_get_or_create(
 def candidate_update_snapshot(
     liepin_user_id: str, name: str, resume: dict, source: str | None = None
 ) -> dict:
-    """刷新候选人姓名/在线简历快照（resume 为 MinimalResume 7 字段 dict）。"""
+    """刷新候选人姓名/在线简历快照（resume 为 MinimalResume 7 字段 dict）。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         cand = session.execute(
-            select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+            select(Candidate).where(
+                Candidate.account_id == acct,
+                Candidate.liepin_user_id == liepin_user_id,
+            )
         ).scalar_one_or_none()
         if cand is None:
             return {"error": f"候选人 {liepin_user_id} 不存在"}
@@ -129,19 +181,26 @@ def candidate_update_snapshot(
 
 @mcp.tool()
 def jc_get_or_create(job_id: int, candidate_id: int) -> dict:
-    """幂等取/建 (job, candidate) 关系行。"""
+    """幂等取/建 (job, candidate) 关系行。仅当前账号——跨账号的 id 一律拒绝。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
+        cand = session.get(Candidate, candidate_id)
+        if cand is None or cand.account_id != acct:
+            return {"error": f"candidate {candidate_id} 不存在"}
+        job = session.get(Job, job_id)
+        if job is None or job.account_id != acct:
+            return {"error": f"job {job_id} 不存在"}
         jc = session.execute(
             select(JobCandidate).where(
+                JobCandidate.account_id == acct,
                 JobCandidate.job_id == job_id,
                 JobCandidate.candidate_id == candidate_id,
             )
         ).scalar_one_or_none()
         if jc is None:
-            cand = session.get(Candidate, candidate_id)
-            if cand is None:
-                return {"error": f"candidate {candidate_id} 不存在"}
-            jc = JobCandidate(job_id=job_id, candidate_id=candidate_id)
+            jc = JobCandidate(
+                account_id=acct, job_id=job_id, candidate_id=candidate_id
+            )
             jc.candidate = cand  # 状态机路径消歧读 jc.candidate.source
             session.add(jc)
             session.commit()
@@ -151,10 +210,11 @@ def jc_get_or_create(job_id: int, candidate_id: int) -> dict:
 
 @mcp.tool()
 def jc_status(jc_id: int) -> dict:
-    """读 jc 状态。"""
+    """读 jc 状态。仅当前账号——跨账号的 jc 按不存在处理。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         jc = session.get(JobCandidate, jc_id)
-        if jc is None:
+        if jc is None or jc.account_id != acct:
             return {"error": f"job_candidate {jc_id} 不存在"}
         return {
             "jc_id": jc.id,
@@ -194,8 +254,9 @@ def state_transition(
     resume_downloaded_at。
     """
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         jc = session.get(JobCandidate, jc_id)
-        if jc is None:
+        if jc is None or jc.account_id != acct:
             return {"error": f"job_candidate {jc_id} 不存在"}
         try:
             ev = StateEvent(event)
@@ -259,10 +320,11 @@ def state_transition(
 
 @mcp.tool()
 def ensure_one_message(jc_id: int) -> dict:
-    """一人一消息检查：jc 已有 out 消息则返回 error（拒绝二次发送）。"""
+    """一人一消息检查：jc 已有 out 消息则返回 error（拒绝二次发送）。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         jc = session.get(JobCandidate, jc_id)
-        if jc is None:
+        if jc is None or jc.account_id != acct:
             return {"error": f"job_candidate {jc_id} 不存在"}
         try:
             ensure_no_out_message(session, jc)
@@ -273,13 +335,15 @@ def ensure_one_message(jc_id: int) -> dict:
 
 @mcp.tool()
 def candidate_has_out_message(candidate_id: int) -> dict:
-    """候选人级一人一消息检查（跨岗位）：任意 jc 已有 out 即 has_out=true。"""
+    """候选人级一人一消息检查（跨岗位）：任意 jc 已有 out 即 has_out=true。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         exists = (
             session.execute(
                 select(Interaction.id)
                 .join(JobCandidate, JobCandidate.id == Interaction.job_candidate_id)
                 .where(
+                    JobCandidate.account_id == acct,
                     JobCandidate.candidate_id == candidate_id,
                     Interaction.direction == "out",
                 )
@@ -305,8 +369,9 @@ def interaction_log(
     （capture_attachment_pages 写入），否则拒绝——在线简历截图不得记为附件。
     """
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         jc = session.get(JobCandidate, jc_id)
-        if jc is None:
+        if jc is None or jc.account_id != acct:
             return {"error": f"job_candidate {jc_id} 不存在"}
         if direction == "out":
             try:
@@ -347,11 +412,20 @@ def tasklog_add(
     duration: float = 0.0,
     note: str | None = None,
 ) -> dict:
-    """任务成本落账。outcome: success|failed_retryable|failed_needs_manual。"""
+    """任务成本落账。outcome: success|failed_retryable|failed_needs_manual。
+
+    带上当前账号供归因（/manual-queue 会按它过滤）。取不到账号时记 NULL 而不是
+    报错——这是系统级的成本账，不该因为账号没选而丢失。
+    """
     with SessionLocal() as session:
+        try:
+            acct: int | None = _active_account_id(session)
+        except NoActiveAccountError:
+            acct = None
         session.add(
             TaskLog(
                 task_id=task_id,
+                account_id=acct,
                 outcome=outcome,
                 attempt=attempt,
                 tokens=tokens,
@@ -366,10 +440,11 @@ def tasklog_add(
 
 @mcp.tool()
 def job_get(job_id: int) -> dict:
-    """读岗位（title/jd_text/hard_rules/template_msgs/scoring_prefs/llm_threshold/status）。"""
+    """读岗位（title/jd_text/hard_rules/template_msgs/scoring_prefs/llm_threshold/status）。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         job = session.get(Job, job_id)
-        if job is None:
+        if job is None or job.account_id != acct:
             return {"error": f"job {job_id} 不存在"}
         return {
             "id": job.id,
@@ -385,10 +460,15 @@ def job_get(job_id: int) -> dict:
 
 @mcp.tool()
 def job_list_active() -> dict:
-    """列 active 岗位。"""
+    """列 active 岗位。仅当前账号——手机上登的是哪个号，看到的就是哪个号的职位。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         jobs = (
-            session.execute(select(Job).where(Job.status == "active")).scalars().all()
+            session.execute(
+                select(Job).where(Job.account_id == acct, Job.status == "active")
+            )
+            .scalars()
+            .all()
         )
         return {
             "jobs": [
@@ -406,12 +486,19 @@ def job_upsert(
     scoring_prefs: dict | None = None,
     status: str = "active",
 ) -> dict:
-    """按 title 幂等建岗位：已存在返回 {created: false}，不存在则创建返回 {created: true}。"""
+    """按 title 幂等建岗位：已存在返回 {created: false}，不存在则创建返回 {created: true}。
+
+    仅当前账号内按 title 判重——两个号可以有同名职位，各建各的。
+    """
     with SessionLocal() as session:
-        job = session.execute(select(Job).where(Job.title == title)).scalar_one_or_none()
+        acct = _active_account_id(session)
+        job = session.execute(
+            select(Job).where(Job.account_id == acct, Job.title == title)
+        ).scalar_one_or_none()
         if job is not None:
             return {"id": job.id, "created": False}
         job = Job(
+            account_id=acct,
             title=title,
             jd_text=jd_text,
             hard_rules=hard_rules or {},
@@ -433,21 +520,24 @@ def rate_acquire(key: str, rate_per_window: int, window_seconds: int) -> dict:
 
 @mcp.tool()
 def risk_check() -> dict:
-    """全局风控熔断查询（cua:risk:paused）。paused=true 时所有触达类操作应停止。"""
-    return {"paused": _redis().get(RISK_PAUSE_KEY) is not None}
+    """当前账号的风控熔断查询。paused=true 时所有触达类操作应停止。
+
+    按账号分片：熔断描述的是「手机上那个号」被猎聘限流了。
+    """
+    return {"paused": _redis().get(risk_pause_key(_current_account_id())) is not None}
 
 
 @mcp.tool()
 def risk_set() -> dict:
     """写全局风控熔断标志（检测到风控/安全验证页时调用，其余任务零操作）。"""
-    _redis().set(RISK_PAUSE_KEY, "1")
+    _redis().set(risk_pause_key(_current_account_id()), "1")
     return {"ok": True, "paused": True}
 
 
 @mcp.tool()
 def risk_clear() -> dict:
     """清除风控熔断标志（人工完成安全验证后调用）。"""
-    _redis().delete(RISK_PAUSE_KEY)
+    _redis().delete(risk_pause_key(_current_account_id()))
     return {"ok": True, "paused": False}
 
 
@@ -480,8 +570,9 @@ def screen(
     )
     if jc_id is not None:
         with SessionLocal() as session:
+            acct = _active_account_id(session)
             jc = session.get(JobCandidate, jc_id)
-            if jc is not None:
+            if jc is not None and jc.account_id == acct:
                 jc.match_score = result.score
                 jc.judge_reason = result.judge_reason
                 session.commit()
@@ -494,16 +585,26 @@ DAILY_TOUCH_CAP = 100
 @mcp.tool()
 def quota_status() -> dict:
     """当日触达额度：查 Redis 每日令牌桶计数（与 gated_tap 同源），返回 {used_today, daily_cap, remaining}。"""
-    key = f"msg-touch:{datetime.now():%Y%m%d}"
+    key = msg_touch_key(_current_account_id(), f"{datetime.now():%Y%m%d}")
     used = int(_redis().get(key) or 0)
     return {"used_today": used, "daily_cap": DAILY_TOUCH_CAP, "remaining": max(0, DAILY_TOUCH_CAP - used)}
 
 
 @mcp.tool()
 def job_quota_status() -> dict:
-    """按职位均分当日打招呼额度：quota = floor(100/N)，used_today 从互动流水按职位统计今日 out。"""
+    """按职位均分当日打招呼额度：quota = floor(100/N)，used_today 从互动流水按职位统计今日 out。
+
+    N 与流水都只看当前账号的职位——额度是按号算的。
+    """
     with SessionLocal() as session:
-        jobs = session.execute(select(Job).where(Job.status == "active")).scalars().all()
+        acct = _active_account_id(session)
+        jobs = (
+            session.execute(
+                select(Job).where(Job.account_id == acct, Job.status == "active")
+            )
+            .scalars()
+            .all()
+        )
         n = len(jobs)
         if n == 0:
             return {"quota_each": 0, "jobs": []}
@@ -512,7 +613,11 @@ def job_quota_status() -> dict:
         rows = session.execute(
             select(JobCandidate.job_id, func.count(Interaction.id))
             .join(Interaction, Interaction.job_candidate_id == JobCandidate.id)
-            .where(Interaction.direction == "out", Interaction.sent_at >= today_start)
+            .where(
+                JobCandidate.account_id == acct,
+                Interaction.direction == "out",
+                Interaction.sent_at >= today_start,
+            )
             .group_by(JobCandidate.job_id)
         ).all()
         used_by_job = {job_id: cnt for job_id, cnt in rows}
@@ -539,10 +644,11 @@ def gated_tap(x: int, y: int, touch: bool = False, daily_cap: int = DAILY_TOUCH_
     任一不过则**不执行 tap**。inbound 的回复/索要属响应性触达，传 counts_daily=False
     （只过风控熔断、不计入每日 100）。touch=False（浏览/进详情等读操作）直接执行。"""
     if touch:
-        if _redis().get(RISK_PAUSE_KEY) is not None:
+        _acct = _current_account_id()
+        if _redis().get(risk_pause_key(_acct)) is not None:
             return {"executed": False, "reason": "risk_paused（全局熔断中，拒绝触达）"}
         if counts_daily:
-            key = f"msg-touch:{datetime.now():%Y%m%d}"
+            key = msg_touch_key(_acct, f"{datetime.now():%Y%m%d}")
             if not _bucket().acquire(key, daily_cap, 86400):
                 return {"executed": False, "reason": f"rate_limited（每日 {daily_cap} 次已满，拒绝触达）"}
     result = subprocess.run(
@@ -566,8 +672,12 @@ def snapshot_put(liepin_user_id: str, file_path: str) -> dict:
     )
     _store().put_object(_store().bucket, key, data, "image/png")
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         cand = session.execute(
-            select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+            select(Candidate).where(
+                Candidate.account_id == acct,
+                Candidate.liepin_user_id == liepin_user_id,
+            )
         ).scalar_one_or_none()
         if cand is not None:
             cand.snapshot_object_key = key
@@ -611,19 +721,22 @@ def close_stale_awaiting() -> dict:
     from app.sweep import close_stale_awaiting as _close
 
     with SessionLocal() as session:
-        closed = _close(session)
+        acct = _active_account_id(session)
+        closed = _close(session, acct)
         session.commit()
         return {"closed": closed}
 
 
 @mcp.tool()
 def list_awaiting() -> dict:
-    """awaiting_resume 状态的 jc 列表（sweep 轮次用）。"""
+    """awaiting_resume 状态的 jc 列表（sweep 轮次用）。仅当前账号。"""
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         rows = (
             session.execute(
                 select(JobCandidate).where(
-                    JobCandidate.status == CandidateStatus.AWAITING_RESUME.value
+                    JobCandidate.account_id == acct,
+                    JobCandidate.status == CandidateStatus.AWAITING_RESUME.value,
                 )
             )
             .scalars()
@@ -664,8 +777,12 @@ def capture_attachment_pages(liepin_user_id: str, max_pages: int = 10) -> dict:
             time.sleep(1.0)
     if keys:
         with SessionLocal() as session:
+            acct = _active_account_id(session)
             cand = session.execute(
-                select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+                select(Candidate).where(
+                    Candidate.account_id == acct,
+                    Candidate.liepin_user_id == liepin_user_id,
+                )
             ).scalar_one_or_none()
             if cand is not None:
                 cand.snapshot_object_key = keys[0]  # 首页键回写（前端 snapshot_url 依赖）
@@ -868,13 +985,18 @@ def download_attachment(
     # 6. 回写：candidate.attachment_keys（receive_resume 守卫证据）
     #     + jc.minio_object_key（前端 has_pdf / resume_url 依赖）
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         cand = session.execute(
-            select(Candidate).where(Candidate.liepin_user_id == liepin_user_id)
+            select(Candidate).where(
+                Candidate.account_id == acct,
+                Candidate.liepin_user_id == liepin_user_id,
+            )
         ).scalar_one_or_none()
         if cand is not None:
             cand.attachment_keys = [key]
             jc = session.execute(
                 select(JobCandidate).where(
+                    JobCandidate.account_id == acct,
                     JobCandidate.candidate_id == cand.id,
                     JobCandidate.job_id == job_id,
                 )
@@ -898,8 +1020,12 @@ def list_backfill_candidates() -> dict:
     按 (姓名, 岗位) 去重，返回最新 liepin_user_id，供回填轮次逐个导航下载真 PDF。
     """
     with SessionLocal() as session:
+        acct = _active_account_id(session)
         rows = session.execute(
-            select(JobCandidate).where(JobCandidate.minio_object_key.is_(None))
+            select(JobCandidate).where(
+                JobCandidate.account_id == acct,
+                JobCandidate.minio_object_key.is_(None),
+            )
         ).scalars().all()
         best: dict[tuple[str, int], dict] = {}
         for jc in rows:

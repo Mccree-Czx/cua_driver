@@ -16,6 +16,7 @@ from app.messaging import (
     ensure_no_out_message,
     render_message,
 )
+from conftest import DEFAULT_ACCOUNT_ID
 
 
 def _unique(prefix: str) -> str:
@@ -24,6 +25,7 @@ def _unique(prefix: str) -> str:
 
 def _job(**overrides) -> models.Job:
     defaults = dict(
+        account_id=DEFAULT_ACCOUNT_ID,
         title="高级产品经理",
         jd_text="负责产品规划与迭代",
         template_msgs={
@@ -36,7 +38,11 @@ def _job(**overrides) -> models.Job:
 
 def _candidate(name: str = "张伟", source: str = "inbound") -> models.Candidate:
     return models.Candidate(
-        liepin_user_id=_unique("lp"), name=name, online_resume_minimal={}, source=source
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=_unique("lp"),
+        name=name,
+        online_resume_minimal={},
+        source=source,
     )
 
 
@@ -91,13 +97,21 @@ def test_render_unknown_placeholder_raises():
 
 
 def _persisted_jc(session) -> models.JobCandidate:
-    job = models.Job(title=_unique("岗位"), jd_text="负责产品规划")
+    job = models.Job(
+        account_id=DEFAULT_ACCOUNT_ID, title=_unique("岗位"), jd_text="负责产品规划"
+    )
     candidate = models.Candidate(
-        liepin_user_id=_unique("LP"), name="张伟", online_resume_minimal={}, source="inbound"
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=_unique("LP"),
+        name="张伟",
+        online_resume_minimal={},
+        source="inbound",
     )
     session.add_all([job, candidate])
     session.flush()
-    jc = models.JobCandidate(job_id=job.id, candidate_id=candidate.id)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=job.id, candidate_id=candidate.id
+    )
     session.add(jc)
     session.flush()
     return jc
@@ -144,4 +158,9 @@ def test_second_out_message_raises_one_message_error(session):
 
 def test_ensure_no_out_message_requires_persisted_jc(session):
     with pytest.raises(ValueError, match="尚未持久化"):
-        ensure_no_out_message(session, models.JobCandidate(job_id=1, candidate_id=1))
+        ensure_no_out_message(
+            session,
+            models.JobCandidate(
+                account_id=DEFAULT_ACCOUNT_ID, job_id=1, candidate_id=1
+            ),
+        )

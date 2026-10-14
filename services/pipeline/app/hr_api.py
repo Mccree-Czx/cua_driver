@@ -21,7 +21,14 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.config import get_settings
-from app.deps import get_login_state, get_queue, get_session, get_store
+from app.deps import (
+    get_active_account,
+    get_login_state,
+    get_queue,
+    get_session,
+    get_store,
+)
+from app.keys import risk_pause_key
 from app.state_machine import InvalidTransition, StateEvent, TransitionContext, transition
 from hr_workbuddy import CandidateStatus
 
@@ -64,18 +71,84 @@ def _presign(store: Any, key: str | None) -> str | None:
         return None
 
 
+# —— 账号（多账号支持，2026-10-14）——
+
+
+@router.get("/accounts")
+def hr_accounts(session: Session = Depends(get_session)) -> dict[str, Any]:
+    """账号列表 + 哪个生效。
+
+    唯一不依赖 get_active_account 的端点——它正是前端用来发现「没有生效账号」
+    并提示用户去选的地方，所以自己不能先被 503 挡住。
+    """
+    rows = session.execute(select(models.Account).order_by(models.Account.id)).scalars().all()
+    active = next((a.id for a in rows if a.is_active), None)
+    return {
+        "active_id": active,
+        "items": [{"id": a.id, "name": a.name, "is_active": a.is_active} for a in rows],
+    }
+
+
+class AccountCreate(BaseModel):
+    name: str
+
+
+@router.post("/accounts")
+def hr_account_create(
+    body: AccountCreate, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """新建账号。不自动设为生效——切号是人工在手机上做完之后才点的动作。"""
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="账号名不能为空")
+    acct = models.Account(name=name)
+    session.add(acct)
+    session.commit()
+    session.refresh(acct)
+    return {"id": acct.id, "name": acct.name, "is_active": acct.is_active}
+
+
+@router.post("/accounts/{account_id}/activate")
+def hr_account_activate(
+    account_id: int, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """把指定账号置为生效。事务内先全部置 false 再置目标为 true，保证恰好一个 active。
+
+    这一步**不会**去手机上切号——它只是告诉系统「接下来按哪个号算配额与隔离数据」。
+    """
+    target = session.get(models.Account, account_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    session.execute(
+        models.Account.__table__.update().values(is_active=False)
+    )
+    session.execute(
+        models.Account.__table__.update()
+        .where(models.Account.id == account_id)
+        .values(is_active=True)
+    )
+    session.commit()
+    return {"active_id": account_id, "name": target.name}
+
+
 # —— 只读端点 ——
 
 
 @router.get("/overview")
 def hr_overview(
-    job_id: int | None = None, session: Session = Depends(get_session)
+    job_id: int | None = None,
+    session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """漏斗概览：状态计数 / 评分分布 / 今日触达与回传。"""
-    status_stmt = select(models.JobCandidate.status, func.count()).group_by(
-        models.JobCandidate.status
+    """漏斗概览：状态计数 / 评分分布 / 今日触达与回传。仅当前账号。"""
+    status_stmt = (
+        select(models.JobCandidate.status, func.count())
+        .where(models.JobCandidate.account_id == acct.id)
+        .group_by(models.JobCandidate.status)
     )
-    score_stmt = select(models.JobCandidate.match_score)
+    score_stmt = select(models.JobCandidate.match_score).where(
+        models.JobCandidate.account_id == acct.id
+    )
     if job_id is not None:
         status_stmt = status_stmt.where(models.JobCandidate.job_id == job_id)
         score_stmt = score_stmt.where(models.JobCandidate.job_id == job_id)
@@ -90,13 +163,18 @@ def hr_overview(
         select(func.count())
         .select_from(models.Interaction)
         .join(models.JobCandidate, models.JobCandidate.id == models.Interaction.job_candidate_id)
-        .where(models.Interaction.direction == "out", models.Interaction.sent_at >= start)
+        .where(
+            models.JobCandidate.account_id == acct.id,
+            models.Interaction.direction == "out",
+            models.Interaction.sent_at >= start,
+        )
     )
     received_stmt = (
         select(func.count())
         .select_from(models.Interaction)
         .join(models.JobCandidate, models.JobCandidate.id == models.Interaction.job_candidate_id)
         .where(
+            models.JobCandidate.account_id == acct.id,
             models.Interaction.direction == "in",
             models.Interaction.msg_type == "attachment",
             models.Interaction.sent_at >= start,
@@ -107,13 +185,24 @@ def hr_overview(
         received_stmt = received_stmt.where(models.JobCandidate.job_id == job_id)
     touches = session.scalar(touches_stmt)
     received = session.scalar(received_stmt)
-    # manual：task_logs 无 job 关联，保持全局口径（告警参考）
+    # manual：task_logs 无 job 关联，按账号过滤（轮次落账时带账号）
     manual = session.scalar(
         select(func.count())
         .select_from(models.TaskLog)
-        .where(models.TaskLog.outcome == "failed_needs_manual", models.TaskLog.created_at >= start)
+        .where(
+            models.TaskLog.account_id == acct.id,
+            models.TaskLog.outcome == "failed_needs_manual",
+            models.TaskLog.created_at >= start,
+        )
     )
-    job = session.get(models.Job, job_id) if job_id is not None else None
+    job = (
+        session.get(models.Job, job_id)
+        if job_id is not None
+        else None
+    )
+    # 跨账号的 job_id 一律按不存在处理，不泄露其它账号的职位信息
+    if job is not None and job.account_id != acct.id:
+        job = None
     return {
         "job": {"id": job.id, "title": job.title, "llm_threshold": job.llm_threshold, "scoring_prefs": job.scoring_prefs} if job else None,
         "status_counts": status_counts,
@@ -136,16 +225,25 @@ def hr_candidates(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """候选人列表（筛选 + 分页；新到在前）。min_score：达标分档视图（回收目标口径）。"""
+    """候选人列表（筛选 + 分页；新到在前）。min_score：达标分档视图（回收目标口径）。
+
+    仅当前账号。列表与计数两条语句共用同一个 account 过滤——漏掉计数那条
+    会让分页总数串到别的账号。
+    """
     stmt = (
         select(models.JobCandidate, models.Candidate, models.Job)
         .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
         .join(models.Job, models.Job.id == models.JobCandidate.job_id)
+        .where(models.JobCandidate.account_id == acct.id)
         .order_by(models.JobCandidate.id.desc())
     )
-    count_stmt = select(func.count()).select_from(models.JobCandidate).join(
-        models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id
+    count_stmt = (
+        select(func.count())
+        .select_from(models.JobCandidate)
+        .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .where(models.JobCandidate.account_id == acct.id)
     )
     if job_id is not None:
         stmt = stmt.where(models.JobCandidate.job_id == job_id)
@@ -200,10 +298,15 @@ def hr_candidate_detail(
     jc_id: int,
     session: Session = Depends(get_session),
     store: Any = Depends(get_store),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """两级详情：初筛（截图预签名 + 7 字段 + 评分理由）+ 二筛（PDF 预签名）+ 互动时间线。"""
+    """两级详情：初筛（截图预签名 + 7 字段 + 评分理由）+ 二筛（PDF 预签名）+ 互动时间线。
+
+    其它账号的 jc_id 一律按 404 处理（不区分「不存在」与「不属于你」，
+    避免通过状态码探测别的账号有哪些 jc）。
+    """
     jc = session.get(models.JobCandidate, jc_id)
-    if jc is None:
+    if jc is None or jc.account_id != acct.id:
         raise HTTPException(status_code=404, detail=f"job_candidate {jc_id} 不存在")
     candidate = session.get(models.Candidate, jc.candidate_id)
     job = session.get(models.Job, jc.job_id)
@@ -262,27 +365,48 @@ def hr_candidate_detail(
 def hr_daily(
     days: int = Query(14, ge=1, le=DAILY_MAX_DAYS),
     session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """日报：逐日漏斗（新增/触达分型/回传/转化率）+ token 成本 + 转人工数。"""
+    """日报：逐日漏斗（新增/触达分型/回传/转化率）+ token 成本 + 转人工数。
+
+    漏斗与转人工按当前账号；**token 成本是全系统口径**——Pi 的推理开销不分
+    账号，按账号拆反而看不出真实花费。
+    """
     since = _today_start() - timedelta(days=days - 1)
     new_jc = {
         str(d): n
         for d, n in session.execute(
             select(func.date(models.JobCandidate.created_at), func.count())
-            .where(models.JobCandidate.created_at >= since)
+            .where(
+                models.JobCandidate.account_id == acct.id,
+                models.JobCandidate.created_at >= since,
+            )
             .group_by(func.date(models.JobCandidate.created_at))
         ).all()
     }
     out_rows = session.execute(
         select(func.date(models.Interaction.sent_at), models.Interaction.msg_type, func.count())
-        .where(models.Interaction.direction == "out", models.Interaction.sent_at >= since)
+        .join(
+            models.JobCandidate,
+            models.JobCandidate.id == models.Interaction.job_candidate_id,
+        )
+        .where(
+            models.JobCandidate.account_id == acct.id,
+            models.Interaction.direction == "out",
+            models.Interaction.sent_at >= since,
+        )
         .group_by(func.date(models.Interaction.sent_at), models.Interaction.msg_type)
     ).all()
     received = {
         str(d): n
         for d, n in session.execute(
             select(func.date(models.Interaction.sent_at), func.count())
+            .join(
+                models.JobCandidate,
+                models.JobCandidate.id == models.Interaction.job_candidate_id,
+            )
             .where(
+                models.JobCandidate.account_id == acct.id,
                 models.Interaction.direction == "in",
                 models.Interaction.msg_type == "attachment",
                 models.Interaction.sent_at >= since,
@@ -307,6 +431,7 @@ def hr_daily(
         for d, n in session.execute(
             select(func.date(models.TaskLog.created_at), func.count())
             .where(
+                models.TaskLog.account_id == acct.id,
                 models.TaskLog.outcome == "failed_needs_manual",
                 models.TaskLog.created_at >= since,
             )
@@ -360,17 +485,28 @@ def hr_manual_queue(
     offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
     queue: Any = Depends(get_queue),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """转人工队列：failed_needs_manual 落账 + 派发登记反查上下文（72h 内）。"""
+    """转人工队列：failed_needs_manual 落账 + 派发登记反查上下文（72h 内）。
+
+    必须按账号过滤：条目里会带出候选人姓名，不过滤就是跨账号泄露。
+    计数与列表共用同一条件，否则总数会串到别的账号。
+    """
     total = session.scalar(
         select(func.count())
         .select_from(models.TaskLog)
-        .where(models.TaskLog.outcome == "failed_needs_manual")
+        .where(
+            models.TaskLog.account_id == acct.id,
+            models.TaskLog.outcome == "failed_needs_manual",
+        )
     )
     rows = (
         session.execute(
             select(models.TaskLog)
-            .where(models.TaskLog.outcome == "failed_needs_manual")
+            .where(
+                models.TaskLog.account_id == acct.id,
+                models.TaskLog.outcome == "failed_needs_manual",
+            )
             .order_by(models.TaskLog.id.desc())
             .limit(limit)
             .offset(offset)
@@ -388,7 +524,8 @@ def hr_manual_queue(
         name = status = None
         if dispatched is not None and dispatched.job_candidate_id is not None:
             jc = session.get(models.JobCandidate, dispatched.job_candidate_id)
-            if jc is not None:
+            # 双重保险：派发登记可能来自别的账号（或历史数据），只认本账号的 jc
+            if jc is not None and jc.account_id == acct.id:
                 status = jc.status
                 candidate = session.get(models.Candidate, jc.candidate_id)
                 name = candidate.name if candidate else None
@@ -413,12 +550,19 @@ class AckRequest(BaseModel):
 
 @router.post("/manual-queue/{task_id}/ack")
 def hr_manual_ack(
-    task_id: str, body: AckRequest, session: Session = Depends(get_session)
+    task_id: str,
+    body: AckRequest,
+    session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """人工队列忽略注记（追加 TaskLog.note，保留原注记）。"""
+    """人工队列忽略注记（追加 TaskLog.note，保留原注记）。仅限本账号的条目。"""
     log = session.execute(
         select(models.TaskLog)
-        .where(models.TaskLog.task_id == task_id, models.TaskLog.outcome == "failed_needs_manual")
+        .where(
+            models.TaskLog.task_id == task_id,
+            models.TaskLog.account_id == acct.id,
+            models.TaskLog.outcome == "failed_needs_manual",
+        )
         .order_by(models.TaskLog.id.desc())
     ).scalars().first()
     if log is None:
@@ -433,17 +577,21 @@ def hr_manual_ack(
 def hr_alerts(
     session: Session = Depends(get_session),
     login_state: Any = Depends(get_login_state),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """告警可观测（最小）：登录态 / 全局限流标志 / 今日配额用量 / 今日转人工。"""
+    """告警可观测（最小）：登录态 / 本账号限流标志 / 今日配额用量 / 今日转人工。
+
+    登录态与风控标志都按账号分片读取——它们描述的是「手机上那个号」的状态。
+    """
     try:
-        login = login_state.get()
+        login = login_state.get(acct.id)
     except Exception:  # noqa: BLE001  # 登录态键缺失按未知处理
         login = None
     risk_paused = False
     try:
         client = redis_lib.Redis.from_url(get_settings().redis_url, decode_responses=True)
         try:
-            risk_paused = client.get("cua:risk:paused") is not None
+            risk_paused = client.get(risk_pause_key(acct.id)) is not None
         finally:
             client.close()
     except Exception:  # noqa: BLE001
@@ -452,12 +600,24 @@ def hr_alerts(
     touches = session.scalar(
         select(func.count())
         .select_from(models.Interaction)
-        .where(models.Interaction.direction == "out", models.Interaction.sent_at >= start)
+        .join(
+            models.JobCandidate,
+            models.JobCandidate.id == models.Interaction.job_candidate_id,
+        )
+        .where(
+            models.JobCandidate.account_id == acct.id,
+            models.Interaction.direction == "out",
+            models.Interaction.sent_at >= start,
+        )
     )
     manual = session.scalar(
         select(func.count())
         .select_from(models.TaskLog)
-        .where(models.TaskLog.outcome == "failed_needs_manual", models.TaskLog.created_at >= start)
+        .where(
+            models.TaskLog.account_id == acct.id,
+            models.TaskLog.outcome == "failed_needs_manual",
+            models.TaskLog.created_at >= start,
+        )
     )
     return {
         "login": login,
@@ -469,11 +629,16 @@ def hr_alerts(
 
 @router.get("/tasklogs")
 def hr_tasklogs(
-    limit: int = Query(200, ge=1, le=1000), session: Session = Depends(get_session)
+    limit: int = Query(200, ge=1, le=1000),
+    session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """最近的运行日志（Pi 经 hr-tools tasklog_add 落账，倒序）。"""
+    """最近的运行日志（Pi 经 hr-tools tasklog_add 落账，倒序）。仅当前账号。"""
     rows = session.execute(
-        select(models.TaskLog).order_by(models.TaskLog.id.desc()).limit(limit)
+        select(models.TaskLog)
+        .where(models.TaskLog.account_id == acct.id)
+        .order_by(models.TaskLog.id.desc())
+        .limit(limit)
     ).scalars().all()
     return {
         "items": [
@@ -504,11 +669,17 @@ class ReviewRequest(BaseModel):
 
 @router.post("/candidates/{jc_id}/review")
 def hr_review(
-    jc_id: int, body: ReviewRequest, session: Session = Depends(get_session)
+    jc_id: int,
+    body: ReviewRequest,
+    session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """复核推翻：approve→hr_reviewed / reject→closed（OVERRIDE + 流水落账）。"""
+    """复核推翻：approve→hr_reviewed / reject→closed（OVERRIDE + 流水落账）。
+
+    跨账号的 jc_id 按 404 处理——复核是写动作，更不能落到别的账号上。
+    """
     jc = session.get(models.JobCandidate, jc_id)
-    if jc is None:
+    if jc is None or jc.account_id != acct.id:
         raise HTTPException(status_code=404, detail=f"job_candidate {jc_id} 不存在")
     if jc.status not in REVIEW_FROM:
         raise HTTPException(

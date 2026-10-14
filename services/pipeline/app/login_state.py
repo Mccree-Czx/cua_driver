@@ -5,6 +5,9 @@ GET /internal/state/login 供 scheduler 查询最近一次结果。
 行（R10）即"记录登录态"——outcome=success 且 evidence.logged_in=False
 即为失效记录。键无 TTL：最近一次检查始终可查；scheduler 侧对
 is_login=None（从未检查）不动作。
+
+多账号（2026-10-14）：键按账号分片。登录态本来就是账号级的——手机上
+同一个时刻只登录一个招聘号，查的是"那个号还在不在线"。
 """
 
 import json
@@ -14,32 +17,41 @@ import redis
 
 from app.config import get_settings
 
-LOGIN_STATE_KEY = "pipeline:state:login"
+LOGIN_STATE_KEY_PREFIX = "pipeline:state:login"
+
+
+def login_state_key(account_id: int) -> str:
+    """登录态 Redis 键。按账号分片——每个号各自记录上次检查结果。"""
+    return f"{LOGIN_STATE_KEY_PREFIX}:{account_id}"
 
 
 class LoginStateStore(Protocol):
     """登录态存储形状：生产 RedisLoginState，测试 FakeLoginState 内存替身。"""
 
-    def get(self) -> dict | None: ...
+    def get(self, account_id: int) -> dict | None: ...
 
-    def set(self, is_login: bool, task_id: str, checked_at: str) -> None: ...
+    def set(
+        self, is_login: bool, task_id: str, checked_at: str, account_id: int
+    ) -> None: ...
 
 
 class RedisLoginState:
-    """Redis 实现：pipeline:state:login → {"is_login", "task_id", "checked_at"} JSON。"""
+    """Redis 实现：pipeline:state:login:{account_id} → {"is_login","task_id","checked_at"} JSON。"""
 
     def __init__(self, redis_url: str | None = None) -> None:
         self._redis = redis.Redis.from_url(
             redis_url or get_settings().redis_url, decode_responses=True
         )
 
-    def get(self) -> dict | None:
-        raw = self._redis.get(LOGIN_STATE_KEY)
+    def get(self, account_id: int) -> dict | None:
+        raw = self._redis.get(login_state_key(account_id))
         return json.loads(raw) if raw else None
 
-    def set(self, is_login: bool, task_id: str, checked_at: str) -> None:
+    def set(
+        self, is_login: bool, task_id: str, checked_at: str, account_id: int
+    ) -> None:
         self._redis.set(
-            LOGIN_STATE_KEY,
+            login_state_key(account_id),
             json.dumps(
                 {"is_login": is_login, "task_id": task_id, "checked_at": checked_at},
                 ensure_ascii=False,

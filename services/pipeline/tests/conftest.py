@@ -12,6 +12,9 @@ import pytest
 
 from helpers import PIPELINE_DIR, TEST_DATABASE_URL, run_alembic
 
+# 迁移 0009 会建好 id=1 的默认账号；测试统一用它作为归属
+DEFAULT_ACCOUNT_ID = 1
+
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 sys.path.insert(0, str(PIPELINE_DIR))  # 使 `import app` 在任意 cwd 下可用
 

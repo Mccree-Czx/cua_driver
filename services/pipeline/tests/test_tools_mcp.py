@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from app import models
 from app.db import SessionLocal
+from conftest import DEFAULT_ACCOUNT_ID
 
 import tools_mcp_server as tools
 
@@ -51,8 +52,15 @@ def jc_factory():
     created = []
 
     def _make(source: str = "inbound", status: str = "screened_pass") -> models.JobCandidate:
-        job = models.Job(title="工具测试", jd_text="JD", hard_rules={}, template_msgs={})
+        job = models.Job(
+            account_id=DEFAULT_ACCOUNT_ID,
+            title="工具测试",
+            jd_text="JD",
+            hard_rules={},
+            template_msgs={},
+        )
         cand = models.Candidate(
+            account_id=DEFAULT_ACCOUNT_ID,
             liepin_user_id=f"tool_{uuid4().hex[:8]}",
             name="工具候选人",
             online_resume_minimal={},
@@ -62,7 +70,10 @@ def jc_factory():
             session.add_all([job, cand])
             session.flush()
             jc = models.JobCandidate(
-                job_id=job.id, candidate_id=cand.id, status=status
+                account_id=DEFAULT_ACCOUNT_ID,
+                job_id=job.id,
+                candidate_id=cand.id,
+                status=status,
             )
             jc.candidate = cand
             session.add(jc)
@@ -203,7 +214,11 @@ class TestCaptureAttachmentPages:
         lid = f"cap_{uuid4().hex[:8]}"
         with SessionLocal() as session:
             cand = models.Candidate(
-                liepin_user_id=lid, name="截图回写", online_resume_minimal={}, source="inbound"
+                account_id=DEFAULT_ACCOUNT_ID,
+                liepin_user_id=lid,
+                name="截图回写",
+                online_resume_minimal={},
+                source="inbound",
             )
             session.add(cand)
             session.commit()

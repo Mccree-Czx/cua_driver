@@ -991,3 +991,40 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 顶部条：账号切换 + 告警（多账号支持，2026-10-14） ---------- */
+
+.portal-topbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.account-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--subtle-border);
+  border-radius: var(--radius-md);
+  background: var(--card-surface);
+}
+
+.account-switcher-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* 未选账号 / 出错时的醒目提示——这时候轮次不会执行，必须让人一眼看到 */
+.account-switcher-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--brand-orange);
+  font-size: 13px;
+  white-space: nowrap;
+}

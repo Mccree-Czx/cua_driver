@@ -17,12 +17,19 @@ from hr_workbuddy import CandidateStatus
 RESUME_TIMEOUT = timedelta(hours=72)
 
 
-def close_stale_awaiting(session: Session, now: datetime | None = None) -> int:
-    """关闭过期的 awaiting_resume（严格 > 72h），返回关闭数。"""
+def close_stale_awaiting(
+    session: Session, account_id: int, now: datetime | None = None
+) -> int:
+    """关闭过期的 awaiting_resume（严格 > 72h），返回关闭数。
+
+    account_id 必填：多账号下必须只扫当前生效账号的 jc，否则会把别的号的
+    候选人一起关掉。
+    """
     now = now or datetime.now()
     cutoff = now - RESUME_TIMEOUT
     stale = session.execute(
         select(JobCandidate).where(
+            JobCandidate.account_id == account_id,
             JobCandidate.status == CandidateStatus.AWAITING_RESUME.value,
             JobCandidate.resume_requested_at < cutoff,
         )

@@ -16,6 +16,7 @@ from app import models
 from app.deps import get_login_state, get_queue
 from app.main import app
 from app.storage import ObjectStore
+from conftest import DEFAULT_ACCOUNT_ID
 from fakes import FakeTaskQueue
 from hr_workbuddy import AtomicTask, AtomicTaskType
 
@@ -23,10 +24,12 @@ BUCKET = "hr-workbuddy"
 
 
 class FakeLoginState:
+    """登录态假实现：多账号下 GET /alerts 按账号取登录态，这里各账号返回同一份。"""
+
     def __init__(self, payload=None):
         self._payload = payload
 
-    def get(self):
+    def get(self, account_id: int):
         return self._payload
 
 
@@ -74,6 +77,7 @@ def _seed_jc(
     pdf_key=None,
 ) -> models.JobCandidate:
     candidate = models.Candidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         liepin_user_id=f"LP{uuid4().hex[:10]}",
         name=name or f"候选人{uuid4().hex[:4]}",
         source="inbound",
@@ -82,7 +86,9 @@ def _seed_jc(
     )
     session.add(candidate)
     session.flush()
-    jc = models.JobCandidate(job_id=job_id, candidate_id=candidate.id, status=status)
+    jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID, job_id=job_id, candidate_id=candidate.id, status=status
+    )
     jc.match_score = score
     jc.minio_object_key = pdf_key
     jc.judge_reason = "测试理由"
@@ -170,12 +176,21 @@ def test_daily_report_funnel_and_cost(client, session):
     _add_interaction(session, jc.id, "in", "attachment")
     session.add(
         models.TaskLog(
-            task_id=str(uuid4()), outcome="success", attempt=0, tokens=100, cost=0.01
+            account_id=DEFAULT_ACCOUNT_ID,
+            task_id=str(uuid4()),
+            outcome="success",
+            attempt=0,
+            tokens=100,
+            cost=0.01,
         )
     )
     session.add(
         models.TaskLog(
-            task_id=str(uuid4()), outcome="failed_needs_manual", attempt=0, note="风控"
+            account_id=DEFAULT_ACCOUNT_ID,
+            task_id=str(uuid4()),
+            outcome="failed_needs_manual",
+            attempt=0,
+            note="风控",
         )
     )
     session.commit()
@@ -254,7 +269,12 @@ def test_manual_queue_and_ack(client, fake_queue, session):
     )
     fake_queue.record(task)
     session.add(
-        models.TaskLog(task_id=str(task.task_id), outcome="failed_needs_manual", note="风控拦截")
+        models.TaskLog(
+            account_id=DEFAULT_ACCOUNT_ID,
+            task_id=str(task.task_id),
+            outcome="failed_needs_manual",
+            note="风控拦截",
+        )
     )
     session.commit()
 

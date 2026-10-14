@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 
 from app import models
 from app.sweep import RESUME_TIMEOUT, close_stale_awaiting
+from conftest import DEFAULT_ACCOUNT_ID
 from hr_workbuddy import CandidateStatus
 
 FIXED_NOW = datetime(2026, 10, 5, 12, 0, 0)
@@ -22,13 +23,20 @@ FIXED_NOW = datetime(2026, 10, 5, 12, 0, 0)
 def _make_awaiting(session, resume_requested_at: datetime) -> models.JobCandidate:
     """落一条 awaiting_resume 的 jc + 1 行历史 out/greet_request（一人一消息基线）。"""
     suffix = uuid.uuid4().hex[:12]
-    job = models.Job(title=f"产品经理-{suffix}", jd_text="负责产品规划与迭代")
+    job = models.Job(
+        account_id=DEFAULT_ACCOUNT_ID, title=f"产品经理-{suffix}", jd_text="负责产品规划与迭代"
+    )
     candidate = models.Candidate(
-        liepin_user_id=f"LP{suffix}", name="张伟", online_resume_minimal={}, source="inbound"
+        account_id=DEFAULT_ACCOUNT_ID,
+        liepin_user_id=f"LP{suffix}",
+        name="张伟",
+        online_resume_minimal={},
+        source="inbound",
     )
     session.add_all([job, candidate])
     session.flush()
     jc = models.JobCandidate(
+        account_id=DEFAULT_ACCOUNT_ID,
         job_id=job.id,
         candidate_id=candidate.id,
         status=CandidateStatus.AWAITING_RESUME.value,
@@ -63,7 +71,7 @@ def test_close_stale_awaiting_after_72h_closes(session):
     """+72h1s → no_response→closed；out 消息总数仍 1（零追发，决策 3）。"""
     jc = _make_awaiting(session, FIXED_NOW - RESUME_TIMEOUT - timedelta(seconds=1))
 
-    closed = close_stale_awaiting(session, now=FIXED_NOW)
+    closed = close_stale_awaiting(session, DEFAULT_ACCOUNT_ID, now=FIXED_NOW)
     assert closed == 1
 
     # 编排层不提交（提交归 HTTP 层）：变更在同一会话内可见；expire_all 会从库
@@ -76,7 +84,7 @@ def test_boundary_exact_72h_still_waits(session):
     """Review Focus 3：恰好 72h（严格 < 边界）不关闭，继续等待。"""
     jc = _make_awaiting(session, FIXED_NOW - RESUME_TIMEOUT)
 
-    closed = close_stale_awaiting(session, now=FIXED_NOW)
+    closed = close_stale_awaiting(session, DEFAULT_ACCOUNT_ID, now=FIXED_NOW)
     assert closed == 0
     assert session.get(models.JobCandidate, jc.id).status == CandidateStatus.AWAITING_RESUME.value
 
@@ -86,7 +94,7 @@ def test_close_only_touches_stale_awaiting_rows(session):
     fresh = _make_awaiting(session, FIXED_NOW - timedelta(hours=1))
     stale = _make_awaiting(session, FIXED_NOW - RESUME_TIMEOUT - timedelta(minutes=1))
 
-    closed = close_stale_awaiting(session, now=FIXED_NOW)
+    closed = close_stale_awaiting(session, DEFAULT_ACCOUNT_ID, now=FIXED_NOW)
     assert closed == 1
 
     assert session.get(models.JobCandidate, fresh.id).status == CandidateStatus.AWAITING_RESUME.value

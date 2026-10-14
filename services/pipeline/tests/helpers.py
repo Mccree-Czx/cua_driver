@@ -27,6 +27,10 @@ def run_alembic(*args: str) -> subprocess.CompletedProcess:
         cwd=PIPELINE_DIR,
         env=env,
         capture_output=True,
+        # 必须显式 utf-8：迁移消息里有中文，Windows 默认按 GBK 解码会让读取线程
+        # 抛 UnicodeDecodeError，stdout 拿不全 → 断言随机失手。
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
     )

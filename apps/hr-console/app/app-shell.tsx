@@ -14,6 +14,7 @@ import {
   RobotOutlined,
 } from "@ant-design/icons";
 import AlertBar from "./alert-bar";
+import AccountSwitcher from "./account-switcher";
 
 const NAV = [
   { key: "/", icon: <DashboardOutlined />, label: <Link href="/">驾驶舱</Link> },
@@ -90,7 +91,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </Drawer>
 
         <div className="portal-content">
-          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+          <div className="portal-topbar">
+            <AccountSwitcher />
             <AlertBar />
           </div>
           {children}
