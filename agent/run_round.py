@@ -3,9 +3,16 @@
 用法：
   python run_round.py main_round
   python run_round.py daily_round
+  python run_round.py backfill_round
+  python run_round.py login_round
 
 组装：系统提示 + 轮次指令 → `pi -p`（DeepSeek v4 flash）。
-工作窗口（08:00-20:00）判断在脚本层，窗口外直接跳过不启动 Pi。
+工作窗口（08:00-20:00）判断在脚本层，窗口外直接跳过不启动 Pi（backfill 与
+login 例外，见 WINDOW_EXEMPT_ROUNDS）。
+
+本脚本**只用标准库**——它跑在 Mac 的裸 python3 上，没有 pipeline 的依赖。因此
+需要 Redis 的判断（比如「有没有登录在途」）一律由 login_watch.py 落成哨兵文件，
+这里只读文件。
 """
 from __future__ import annotations
 
@@ -32,6 +39,17 @@ LOCK_STALE_SECONDS = 3900  # 一轮最长 3600s + 300s 余量，兜底防 PID �
 INBOUND_STATE_FILE = AGENT_DIR / ".inbound_state.json"
 BACKOFF_EMPTY_STREAK = 2
 BACKOFF_INTERVAL_SECONDS = 1800
+
+# 登录在途哨兵。由 login_watch.py（它有 Redis 客户端）维护，本脚本只读——
+# run_round.py 只用标准库，读不了 Redis。手机停在登录页时跑 main_round 会把它
+# 误判成「掉登录」→ risk_set() → 全系统假熔断，所以这两轮必须让路。
+LOGIN_IN_FLIGHT_FILE = AGENT_DIR / ".login_in_flight"
+# 哨兵过期时间：轮询器每 20 秒重写一次，正常永远新鲜。它若挂掉或 Redis 失联，
+# 哨兵最长只能堵住这么多分钟——否则一个陈旧文件会把所有 main_round 永久挡死。
+LOGIN_SENTINEL_MAX_AGE = 2400
+
+# 工作窗口豁免：backfill 只读下载；login 是人工发起的即时动作，晚上换号是常态
+WINDOW_EXEMPT_ROUNDS = ("backfill_round", "login_round")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -93,6 +111,14 @@ def should_backoff() -> bool:
         return False
     last = state.get("last_empty_ts", 0)
     return (time.time() - last) < BACKOFF_INTERVAL_SECONDS
+
+
+def login_in_flight() -> bool:
+    """有登录在途吗？哨兵文件带过期，避免轮询器挂掉后把主线永久堵死。"""
+    try:
+        return (time.time() - LOGIN_IN_FLIGHT_FILE.stat().st_mtime) < LOGIN_SENTINEL_MAX_AGE
+    except OSError:
+        return False
 
 
 def parse_round_result(output: str):
@@ -246,7 +272,13 @@ ROUND_SECTIONS = [
     ("main_round", "## 1."),
     ("daily_round", "## 2."),
     ("backfill_round", "## 3."),
+    ("login_round", "## 4."),
 ]
+
+# 每轮的超时（秒）。登录轮次必须短：它卡住时会一直占着全局轮次锁，而在默认的
+# 3600s 下，那意味着整整一小时里 main_round 全被挡住。
+ROUND_TIMEOUTS = {"login_round": 420}
+DEFAULT_ROUND_TIMEOUT = 3600
 
 
 def within_window(now: datetime) -> bool:
@@ -278,9 +310,13 @@ def main() -> int:
         print(f"用法: python run_round.py <{'|'.join(n for n, _ in ROUND_SECTIONS)}>")
         return 2
     now = datetime.now()
-    # backfill_round 只读下载（不触达、不发消息），可跨工作窗口运行
-    if name != "backfill_round" and not within_window(now):
+    # backfill_round 只读下载（不触达、不发消息），login_round 是人工发起的即时动作，
+    # 两者都可跨工作窗口运行
+    if name not in WINDOW_EXEMPT_ROUNDS and not within_window(now):
         print(f"[skip] {name}: 工作窗口外（{now:%H:%M}）")
+        return 0
+    if name in ("main_round", "daily_round") and login_in_flight():
+        print(f"[skip] {name}: 有登录在途（手机停在登录页，跑本轮会误判成掉登录）")
         return 0
     if name == "main_round" and should_backoff():
         print(f"[skip] {name}: 空未读退避（连续空，30 分钟内不再启动 Pi）")
@@ -290,6 +326,7 @@ def main() -> int:
         return 0
     try:
         prompt = extract_round_prompt(name)
+        timeout = ROUND_TIMEOUTS.get(name, DEFAULT_ROUND_TIMEOUT)
         cmd = [
             "node", str(PI_CLI),
             "--provider", PROVIDER,
@@ -319,10 +356,10 @@ def main() -> int:
                     text=True,
                     cwd=str(AGENT_DIR),
                     env=env,
-                    timeout=3600,
+                    timeout=timeout,
                 )
         except subprocess.TimeoutExpired:
-            print(f"[{name}] 超时（3600s）强制结束，释放锁")
+            print(f"[{name}] 超时（{timeout}s）强制结束，释放锁")
             return 124
         output = log_path.read_text(encoding="utf-8")
         if output:

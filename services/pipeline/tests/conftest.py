@@ -16,6 +16,11 @@ from helpers import PIPELINE_DIR, TEST_DATABASE_URL, run_alembic
 DEFAULT_ACCOUNT_ID = 1
 
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+# 账号密码加密主密钥：测试用固定值。与 DATABASE_URL 同理，必须在导入 app.* 之前
+# 固化——get_settings 有 lru_cache，导入后再设就晚了。真实密钥只放 .env，绝不入库。
+os.environ.setdefault(
+    "ACCOUNT_SECRET_KEY", "H3D-OE4iGm6D4ctIG8TkNbq_oI1GtcQYSN_3064cARM="
+)
 sys.path.insert(0, str(PIPELINE_DIR))  # 使 `import app` 在任意 cwd 下可用
 
 from app import models  # noqa: E402, F401  注册全部表到 Base.metadata

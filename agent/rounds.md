@@ -45,7 +45,9 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 一次性收尾，顺序执行：
 
 1. **72h 关闭 + 追附件**：调用 close_stale_awaiting()（72h 关闭 awaiting_resume）；再 list_awaiting()，对每个 awaiting 的 jc：手机进对应会话查是否已收到附件简历；有 → 点对方头像进资料页 → 划到底 → 点「附件简历」→ download_attachment(job_id, liepin_user_id, name, job_title) 归档真 PDF + state_transition(receive_resume) + interaction_log(in, attachment)；无 → 不动。全程无触达。
-2. **登录检查**：手机打开猎聘，dump 判断登录态：未登录（登录页锚点）→ risk_set() + 报告「请扫码登录」；已登录 → risk_clear()。
+2. **登录检查**：手机打开猎聘，dump 判断登录态。
+   - 未登录（登录页锚点）→ `risk_set()` + 报告「猎聘已掉登录：请到网页端的『账号管理』里发起登录，或人工在手机上登录」。
+   - 已登录 → `risk_clear()`。
 3. **配额对账**：调 quota_status() 报当日已打招呼 used_today/100。触顶（remaining==0）→ 报告「当日 100 次打招呼已用完，明日 08:00 恢复」。本轮只报告，不操作手机。
 4. **延期重判**：查 jc_status 中 status=new 且 judge_reason 含 deferred 的 jc，用已存 online_resume_minimal 重新 screen；通过者按 inbound/outbound 路径补触达（同 §1 的闸门流程）。
 5. **职位检测**：手机打开猎聘 → tap 底部「职位」tab → tap「招聘中」tab → dump 职位列表（提取每个职位的职位名）→ `job_list_active()` 读 DB 已有职位名 → 对比，发现**新职位**（DB 无此 title）→ 点进该职位 → 找「编辑职位」入口 → dump「职位描述」字段得到 jd_text → `job_upsert(title=职位名, jd_text=JD)` 录入。无新职位则报告「无新职位」。全程无触达。
@@ -61,4 +63,49 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
    - **无附件**（只有在线简历/打招呼，没有附件气泡）→ 跳过，报告「误判：{name} 无附件」。
 4. 单轮上限 20 个，超出的留待下一轮（下一轮再调 `list_backfill_candidates()` 会只剩未完成的）。
 5. 输出：本轮回填几人、成功几人、误判几人（列出误判名单）。
+
+## 4. login_round（代登录猎聘账号，按需触发，**不受工作窗口限制**）
+
+由 Mac 上的 `login_watch.py` 发现 Redis 里有登录请求时拉起。用户在网页端填手机号 → 系统把手机操作到「验证码已发送」→ 用户从自己的手机上读码填回网页 → 系统提交。
+
+**每轮第一步先调 `login_req_get()`**，按返回的 `phase` 决定做哪一段。本文件不区分「第一次调用/第二次调用」——一切以 `phase` 为准，因为两段之间隔着一个不可预测的人工填码时长。
+
+全程**只碰登录界面**：不碰消息、不碰候选人、不打招呼。手机此刻可能处于未登录状态，任何触达都不可能、也不允许。
+
+### 4a. `phase = pending`——把手机操作到「验证码已发送」
+
+1. `mobile_open_app(packageName="com.lietou.mishu")` 打开猎聘，等渲染后 `mobile_dump_ui`。
+2. **先判断现在是什么页面**（这一步决定后面所有动作，不要跳过）：
+   - **已是招聘首页**（底部有「职位」「消息」等 tab）→ 手机上还登着别的号。**绝不尝试登出**，直接 `login_req_set("failed", "手机上当前登录的是其他账号，请先在猎聘 App 里退出登录，再重新发起")`，结束本轮。
+   - **是登录页**（有手机号输入框和「获取验证码」）→ 继续第 3 步。
+   - **出现「图形验证码」「猎聘安全中心」「账号行为异常」** → 按铁律 3：`risk_set()` → `login_req_set("failed", "遇到风控验证，需人工处理")` → 结束。
+   - **其它不认识的页面** → 重新 dump 一次；仍不认识 → `login_req_set("failed", "停在无法识别的页面：<把你看到的关键文本写进来>")`。
+3. 从 `login_req_get()` 取 `phone`，tap 手机号输入框 → `mobile_type(phone)` → dump 确认号码已上屏。**号码没上屏就停**，不要重试、不要猜。
+4. `login_req_set("dispatched")`。
+5. tap「获取验证码」（或「重新获取」）→ dump 确认进入验证码等待态（出现验证码输入框或倒计时）。
+   - 若 `login_req_get()` 返回的 `resend_seq > 0`，说明用户点了重发——**仍然只点一次**，绝不连点。
+6. dump 确认无误后 `login_req_set("awaiting_code")`，**本轮结束**。
+   **不要等待验证码、不要轮询、不要反复 dump**。验证码发到的是用户自己的另一台手机，Pi 物理上等不到；把控制权交回前端，等用户填码后会有新的一轮。
+
+### 4b. `phase = awaiting_code`——把人工填的码提交掉
+
+1. `login_req_claim_code()` 取码。
+   - 返回 `code: None` → `login_req_set("failed", "验证码不可用（未填、已用过或已过期）")`，结束。**不要重试这个工具。**
+2. `mobile_open_app` → dump，确认仍在验证码等待页。
+   - 若已不在该页：dump 判断——已是招聘首页 → 直接 `login_req_set("success")`；回到登录页（页面超时重置）→ `login_req_set("failed", "登录页已重置，请重新发起")`。
+3. tap 验证码输入框 → `mobile_type(code)` → dump 确认已上屏。
+4. `login_req_set("verifying")` → tap「登录」→ 等渲染 → dump。
+5. 判定：
+   - 进入招聘首页（底部 tab 齐全）→ `login_req_set("success")`。该工具会自动把此账号写为登录态、并置为系统生效账号。
+   - 出现「验证码错误」「已失效」→ `login_req_set("failed", "验证码错误或已失效，请重新发起")`。
+   - 出现图形验证码 / 风控页 → `risk_set()` + `login_req_set("failed", "遇到风控验证，需人工处理")`。
+   - 其它 → 重新 dump 一次；仍无法判定 → `login_req_set("failed", "提交后停在无法识别的页面：<关键文本>")`。
+
+### 4c. 通用约束（本轮的铁律）
+
+- **不点「重发」循环**。重发只由用户在前端触发；`resend_seq` 变了才点一次。
+- **不尝试登出**、不切换账号、不改任何账号设置。登出由人工在手机上做——自动登出失败会让流水线彻底停摆。
+- **不碰消息与候选人**：本轮没有任何触达，不需要 `gated_tap`。
+- 每步之间保持 1 秒以上间隔（铁律 7）。
+- 任何一步失败都**如实写进 `login_req_set(..., note)`**，让用户在前端看到原因，而不是只在日志里。
 

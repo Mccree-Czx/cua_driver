@@ -105,6 +105,26 @@ uv sync --all-packages    # 必须 --all-packages！
 | `DAILY_MSG_CAP` | `240` | 日触达上限，触顶停触达类派发 |
 | `INBOUND_INTERVAL_SECONDS` 等 5 项 | 300 / 600 / 3600 / 3600 / 1800 | inbound / sweep / login_health / reconcile / deferred 轮次间隔 |
 | `SCREENING_LLM_BASE_URL` / `_API_KEY` / `_MODEL` | `https://api.deepseek.com` / 空 / `deepseek-flash` | 简历评分文本模型 |
+| `ACCOUNT_SECRET_KEY` | 空 | 猎聘账号密码的加密主密钥（Fernet）。**只放本文件，绝不入库**。留空则账号密码功能不可用（错误码 503），登录核验等不受影响 |
+
+### 2.2 账号密码加密密钥（`ACCOUNT_SECRET_KEY`）
+
+生成：
+
+```
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+要点：
+
+- **只有 pipeline 所在的机器需要它**（加密与解密都在 CT104）。Mac 侧目前不需要——
+  账号登录走的是验证码路径，Mac 不解密任何东西。等哪天启用「密码登录」
+  （Pi 直接输入密码，需 Mac 侧解密）再同步过去，**届时两处必须是同一个密钥**。
+- **密钥丢失 = 已存的密码不可恢复**。账号本身不受影响（重新填一次即可），但换号回滚
+  就没有旧号密码可用了——所以密钥要纳入备份。
+- 轮换用 `MultiFernet`（新密钥放最前，旧密文仍能解，逐个重加密后再摘掉旧密钥）。
+- 密码在库里只有 Fernet 密文；接口只回 `phone_masked` 与 `has_password`，**密文与明文都不外传**。
+
 
 `.env.example` 中的 `LLM_DEFAULT_THRESHOLD` / `RESUME_TIMEOUT_HOURS` 当前**无代码消费**（阈值 70 与 72h 为代码内定值），保留占位。
 

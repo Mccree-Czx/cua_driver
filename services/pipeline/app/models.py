@@ -50,15 +50,33 @@ class Account(Base):
     is_active 放数据库而不是 Redis：这是配置性状态，要持久、要进备份。
     Redis 一刷就丢失当前账号，系统便不知道该按哪个号算配额。应用层保证
     全局最多一个为 true（切换走 hr_api 的 activate 端点，事务内保证）。
+
+    phone / password_enc 是账号的凭据（2026-10-14 补）。手机号是账号的真实
+    身份——系统靠它核对「手机上登录的到底是不是这个号」；密码只存密文
+    （见 app/crypto.py），用途是换号失败时的回滚保障。
+
+    两者都可空：存量那行「默认账号」（id=1）没有凭据，且 1845 条候选人挂在
+    它名下，不能为加列去动它。MySQL 唯一索引允许多个 NULL，所以 phone 上的
+    唯一约束不会与存量的 NULL 冲突。
     """
 
     __tablename__ = "accounts"
+    __table_args__ = (
+        # 显式命名：Base 没有 naming_convention，匿名的 unique=True 会与迁移里
+        # 手写的约束名对不上，`alembic check` 随即报漂移（scoring_prefs 前车之鉴）。
+        UniqueConstraint("phone", name="uq_accounts_phone"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("0"), index=True
     )
+    # 一个手机号 = 一个猎聘账号，唯一约束防重复建档
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Fernet 密文，明文永不落库；解密见 app/crypto.decrypt_secret
+    password_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    credential_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )

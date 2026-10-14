@@ -12,10 +12,9 @@
 - 打招呼按**职位均分**：先 `job_quota_status()` 读每职位 `quota`（floor(100/N)）与 `used_today`，优先给「已打 < 配额 且 还有候选人」的职位打招呼；某职位满配额或候选人耗尽则让给其他未满职位。
 - inbound 候选人详情页有「沟通职位」字段（标签「沟通职位：」+ 职位名）；处理未读会话时也读它，按 title 模糊匹配 `job_list_active` 拿 job_id，同样不要写死 job 1。
 
-**状态与数据（hr-tools，25 工具）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / job_upsert / job_quota_status / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / download_attachment / close_stale_awaiting / list_awaiting。
+**状态与数据（hr-tools，28 工具）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / job_upsert / job_quota_status / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / download_attachment / close_stale_awaiting / list_awaiting / login_req_get / login_req_set / login_req_claim_code。
 
 ## 二、铁律（违反任一条立即停止并报告）
-
 1. **触达点击必须走 gated_tap(touch=True)**。「立即沟通」「发送」「索要附件」「索要简历」等会真实触达候选人的点击，禁止用 mobile_tap；必须用 gated_tap 并传 touch=True。它会在服务端先过「风控熔断 + 每日 100 次限频」两道硬闸门，不过则物理上点不出去。返回 `executed=false` 时**立即停止**并报告原因，绝不换 mobile_tap 绕过。
 2. **一人一消息**。任何发消息前必须 ensure_one_message（jc 级）+ candidate_has_out_message（候选人级）双查，任一报错/已发过即停止。
 3. **风控页即停**。dump 中出现「账号行为异常」「猎聘安全中心」「图形验证码」→ 立即停止全部操作 → risk_set() → 报告转人工。绝不尝试绕过验证。
@@ -24,6 +23,7 @@
 6. **先落账后推进（顺序不可颠倒）**。触达动作验证成功后：先 `interaction_log(out)` 落触达流水，再 `state_transition` 推进状态——触达类事件（greet/request_resume/await_resume）在该 jc 无 out 流水时会被工具直接拒绝；`interaction_log` 对第二次 out 也会拒绝。顺序错了工具会拦，但正确的顺序只有：**触达 → 验证 → interaction_log → state_transition → tasklog_add**。
 7. **节奏**。连续手机动作之间保持 1 秒间隔（提速档；若触发风控熔断立即回退到 2-3 秒）。
 8. **在线简历 ≠ 附件简历**（防重复踩坑）。判定「有附件」的唯一依据是**会话里有附件气泡（文件名）或详情页有「附件简历」区+文件名**。「看简历」按钮打开的在线简历（页面上带「**在线**」标签）**不是**附件，只是候选人公开档案。**没有附件时严禁** `state_transition(receive_resume)` 和 `interaction_log(msg_type='attachment')`——两者会被工具直接拒绝（无附件归档证据 `attachment_keys` 时）；此时唯一正确路径是**索要简历**：`gated_tap(touch=True, counts_daily=False)` → `interaction_log(out)` → `state_transition(request_resume/await_resume)`。
+9. **登录轮次里绝不登出、绝不碰账号设置**。`login_round` 只负责把手机操作到「验证码已发送」和提交人工填的码。登出由人工在手机上做——自动登出失败会让整条流水线停摆，那是不可逆的损失。手机若已登录别的号，如实报告并停下。
 
 ## 三、数据契约
 

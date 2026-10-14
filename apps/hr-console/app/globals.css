@@ -16,6 +16,8 @@
   --text-primary: #1c1917;
   --text-secondary: #78716c;
   --text-muted: #a8a29e;
+  /* 成功态文字。取偏暖的橄榄绿而不是纯绿——与奶油底 + 品牌橙同族，不打架 */
+  --status-ok: #4d7c0f;
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 14px;
@@ -1027,4 +1029,146 @@ body {
   color: var(--brand-orange);
   font-size: 13px;
   white-space: nowrap;
+}
+
+/* —— 账号管理弹窗 —— */
+
+.account-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.account-manager-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.account-manager-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--subtle-border);
+  border-radius: var(--radius-md);
+  background: var(--card-surface);
+}
+
+/* 名称与状态占满剩余宽度，按钮永远贴右——多行内容也不会把按钮挤走 */
+.account-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.account-row-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-row-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.account-form {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* 三个输入框等宽，窄屏自动折行——弹窗在手机宽度下也要能用 */
+.account-form .ant-input-affix-wrapper,
+.account-form .ant-input {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.account-form-hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.account-form-ok {
+  margin: 0;
+  color: var(--status-ok);
+  font-size: 13px;
+}
+
+.account-form-err {
+  margin: 0;
+  color: var(--brand-orange);
+  font-size: 13px;
+}
+
+/* —— 登录向导 —— */
+
+.login-wizard {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--subtle-border);
+  border-radius: var(--radius-md);
+  background: var(--cold-brew-light);
+}
+
+/* 向导里的按钮不该被拉成整行宽（沿用了 .account-form 的 flex:1 输入框规则） */
+.login-wizard .account-form .ant-btn {
+  flex: 0 0 auto;
+}
+
+.login-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.login-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--subtle-border-hover);
+  border-top-color: var(--brand-orange);
+  border-radius: var(--radius-full);
+  animation: login-spin 0.8s linear infinite;
+}
+
+@keyframes login-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-spinner {
+    animation-duration: 3s;
+  }
 }

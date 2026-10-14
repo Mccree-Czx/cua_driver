@@ -28,7 +28,15 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.keys import msg_touch_key, risk_pause_key
+from app.keys import login_state_key, msg_touch_key, risk_pause_key
+from app.login_request import (
+    PHASE_AWAITING_CODE,
+    PHASE_DISPATCHED,
+    PHASE_FAILED,
+    PHASE_SUCCESS,
+    PHASE_VERIFYING,
+    RedisLoginRequest,
+)
 from app.messaging import OneMessagePerCandidateError, ensure_no_out_message
 from app.models import Account, Candidate, Interaction, Job, JobCandidate, TaskLog
 from app.screening_client import ScreeningClient
@@ -539,6 +547,101 @@ def risk_clear() -> dict:
     """清除风控熔断标志（人工完成安全验证后调用）。"""
     _redis().delete(risk_pause_key(_current_account_id()))
     return {"ok": True, "paused": False}
+
+
+# —— 登录（批次 2）——
+#
+# 跨机器：前端在 CT104 发起 → 写 Redis → Mac 上的 login_watch.py 拉起 login_round
+# → Pi 用下面这几个工具读写进度。手机号从 MySQL 取（PII 不进 Redis），密码走
+# login_fill_password()，明文永不进 LLM 上下文。
+
+
+@mcp.tool()
+def login_req_get() -> dict:
+    """读当前登录请求。**每轮开头先调这个**，按 phase 决定做什么。
+
+    返回 {phase, account_id, account_name, phone, resend_seq, attempts, error}。
+    phase:
+      pending       → 打开猎聘，把手机号填进登录页，点「获取验证码」
+      awaiting_code → 调 login_req_claim_code() 取人工填的码，填进去并提交
+    其它相位（dispatched/verifying/success/failed/…）都不该由本工具驱动。
+    """
+    with SessionLocal() as session:
+        req = RedisLoginRequest().get()
+        if req is None:
+            return {"phase": "idle"}
+        acct = session.get(Account, req["account_id"])
+        return {
+            "phase": req["phase"],
+            "account_id": req["account_id"],
+            "account_name": acct.name if acct else None,
+            "phone": acct.phone if acct else None,
+            "resend_seq": req["resend_seq"],
+            "attempts": req["attempts"],
+            "error": req["error"] or None,
+        }
+
+
+@mcp.tool()
+def login_req_set(phase: str, note: str = "") -> dict:
+    """回报登录进度。phase 取值：
+      dispatched     已开始操作手机
+      awaiting_code  已点「获取验证码」，等人工在前端填码
+      verifying      已拿到码，正在提交
+      success        登录成功（本工具会顺带把该账号写为登录态）
+      failed         失败，note 里写可读原因
+    只有这几个值合法——写别的会被拒，避免提示词跑偏写出谁也不认识的相位。
+    """
+    allowed = {
+        PHASE_DISPATCHED,
+        PHASE_AWAITING_CODE,
+        PHASE_VERIFYING,
+        PHASE_SUCCESS,
+        PHASE_FAILED,
+    }
+    if phase not in allowed:
+        return {"ok": False, "error": f"phase 必须是 {sorted(allowed)} 之一"}
+    store = RedisLoginRequest()
+    req = store.get()
+    if req is None:
+        return {"ok": False, "error": "当前没有登录请求"}
+    if phase == PHASE_SUCCESS:
+        # 登录成功 = 手机上现在登的就是这个号，登录态与生效账号一起落地。
+        # 这一步终于给 RedisLoginState.set() 找到了调用点——在此之前它全仓库无人调用。
+        _redis().set(
+            login_state_key(req["account_id"]),
+            json.dumps(
+                {
+                    "is_login": True,
+                    "task_id": None,
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        with SessionLocal() as session:
+            session.execute(Account.__table__.update().values(is_active=False))
+            session.execute(
+                Account.__table__.update()
+                .where(Account.id == req["account_id"])
+                .values(is_active=True)
+            )
+            session.commit()
+    store.set_phase(phase, note)
+    return {"ok": True, "phase": phase, "account_id": req["account_id"]}
+
+
+@mcp.tool()
+def login_req_claim_code() -> dict:
+    """原子取走人工填的验证码。取过一次就取不到第二次（防同一枚码被重复提交）。
+
+    返回 {code} 或 {code: None, reason}。手动关闭提示后**不要**重试本工具，
+    直接 login_req_set('failed', ...) 交回人工。
+    """
+    code = RedisLoginRequest().claim_code()
+    if code:
+        return {"code": code}
+    return {"code": None, "reason": "没有可用的验证码（未填、已用过或已过期）"}
 
 
 @mcp.tool()

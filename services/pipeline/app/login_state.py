@@ -16,13 +16,9 @@ from typing import Protocol
 import redis
 
 from app.config import get_settings
+from app.keys import login_state_key
 
-LOGIN_STATE_KEY_PREFIX = "pipeline:state:login"
-
-
-def login_state_key(account_id: int) -> str:
-    """登录态 Redis 键。按账号分片——每个号各自记录上次检查结果。"""
-    return f"{LOGIN_STATE_KEY_PREFIX}:{account_id}"
+__all__ = ["RedisLoginState", "login_state_key"]
 
 
 class LoginStateStore(Protocol):

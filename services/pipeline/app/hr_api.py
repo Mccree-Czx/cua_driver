@@ -17,12 +17,15 @@ import redis as redis_lib
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models
 from app.config import get_settings
+from app.crypto import CredentialCryptoError, encrypt_secret
 from app.deps import (
     get_active_account,
+    get_login_request,
     get_login_state,
     get_queue,
     get_session,
@@ -74,6 +77,58 @@ def _presign(store: Any, key: str | None) -> str | None:
 # —— 账号（多账号支持，2026-10-14）——
 
 
+def _mask_phone(phone: str | None) -> str | None:
+    """手机号打码。前端只需能区分「是哪个号」，不需要完整号码。"""
+    if not phone:
+        return None
+    if len(phone) < 7:
+        return "***"
+    return f"{phone[:3]}****{phone[-4:]}"
+
+
+def _account_out(acct: models.Account) -> dict[str, Any]:
+    """账号的对外形状。**绝不包含 password_enc**——密文同样不外传。"""
+    return {
+        "id": acct.id,
+        "name": acct.name,
+        "is_active": acct.is_active,
+        "phone_masked": _mask_phone(acct.phone),
+        "has_password": bool(acct.password_enc),
+    }
+
+
+def _clean_phone(raw: str) -> str:
+    """规范化手机号并做基本校验。
+
+    App 的输入框只收数字，系统还要拿这个号跟手机上读到的号比对，所以在这里
+    挡掉明显的手误（字母、位数不对）比事后排查便宜得多。不强制 11 位与前缀 1：
+    那是大陆号段的形状，不该成为拒绝一个真实账号的理由。
+    """
+    phone = raw.strip().replace(" ", "").replace("-", "")
+    if not phone:
+        raise HTTPException(status_code=400, detail="手机号不能为空")
+    if not phone.isdigit() or not (6 <= len(phone) <= 20):
+        raise HTTPException(status_code=400, detail="手机号须为 6-20 位数字")
+    return phone
+
+
+def _encrypt_password(raw: str) -> str:
+    """校验并加密密码。
+
+    不限制字符集：密码要原样送进猎聘，任何「为你好」的过滤都可能让用户存下
+    一个自己都登不上去的密码。特殊字符的输入问题在 Pi 那一侧解决。
+    """
+    if not raw:
+        raise HTTPException(status_code=400, detail="密码不能为空")
+    if len(raw) > 128:
+        raise HTTPException(status_code=400, detail="密码过长（上限 128 字符）")
+    try:
+        return encrypt_secret(raw)
+    except CredentialCryptoError as exc:
+        # 多半是 ACCOUNT_SECRET_KEY 没配。给可读的 503，别让 Fernet 的异常冒成 500。
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/accounts")
 def hr_accounts(session: Session = Depends(get_session)) -> dict[str, Any]:
     """账号列表 + 哪个生效。
@@ -83,29 +138,80 @@ def hr_accounts(session: Session = Depends(get_session)) -> dict[str, Any]:
     """
     rows = session.execute(select(models.Account).order_by(models.Account.id)).scalars().all()
     active = next((a.id for a in rows if a.is_active), None)
-    return {
-        "active_id": active,
-        "items": [{"id": a.id, "name": a.name, "is_active": a.is_active} for a in rows],
-    }
+    return {"active_id": active, "items": [_account_out(a) for a in rows]}
 
 
 class AccountCreate(BaseModel):
     name: str
+    phone: str = ""
+    password: str = ""
 
 
 @router.post("/accounts")
 def hr_account_create(
     body: AccountCreate, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
-    """新建账号。不自动设为生效——切号是人工在手机上做完之后才点的动作。"""
+    """新建账号。不自动设为生效——切号是人工在手机上做完之后才点的动作。
+
+    手机号与密码都必填：这个端点承担的是「把账号登记进系统」，而账号的身份
+    就是手机号。留空的账号系统无法核验，也无从在换号失败时回滚。
+    """
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="账号名不能为空")
-    acct = models.Account(name=name)
+    acct = models.Account(
+        name=name,
+        phone=_clean_phone(body.phone),
+        password_enc=_encrypt_password(body.password),
+        credential_updated_at=datetime.now(),
+    )
     session.add(acct)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="该手机号已登记过账号") from exc
     session.refresh(acct)
-    return {"id": acct.id, "name": acct.name, "is_active": acct.is_active}
+    return _account_out(acct)
+
+
+class AccountPatch(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    password: str | None = None
+
+
+@router.patch("/accounts/{account_id}")
+def hr_account_patch(
+    account_id: int, body: AccountPatch, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """补录 / 修改账号凭据。只更新显式传入的字段；password 传空串表示清除。
+
+    存在的理由：存量那个「默认账号」（id=1）没有手机号，而 1845 条候选人挂在
+    它名下——不能新建一个号把数据搬过去，只能就地补录。
+    """
+    acct = session.get(models.Account, account_id)
+    if acct is None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    data = body.model_dump(exclude_unset=True)
+    if "name" in data:
+        name = (data["name"] or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="账号名不能为空")
+        acct.name = name
+    if "phone" in data:
+        acct.phone = _clean_phone(data["phone"] or "")
+    if "password" in data:
+        raw = data["password"] or ""
+        acct.password_enc = _encrypt_password(raw) if raw else None
+    acct.credential_updated_at = datetime.now()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="该手机号已登记过账号") from exc
+    session.refresh(acct)
+    return _account_out(acct)
 
 
 @router.post("/accounts/{account_id}/activate")
@@ -129,6 +235,123 @@ def hr_account_activate(
     )
     session.commit()
     return {"active_id": account_id, "name": target.name}
+
+
+# —— 登录（批次 2：系统代操作手机）——
+#
+# 跨机器：这里只写 Redis，Mac 上的 login_watch.py 轮询到就拉起 Pi 操作手机。
+# CT104 连不到 Mac（Mac 在 NAT 后），Redis 是两边唯一的会面点。
+# 状态机本体见 app/login_request.py。
+
+
+def _login_payload(
+    req: dict[str, Any] | None, account: models.Account | None = None
+) -> dict[str, Any]:
+    """给前端的登录进度。**不含验证码本身**——前端刚提交过，回显没有意义。"""
+    if req is None:
+        return {"phase": "idle"}
+    return {
+        "request_id": req.get("request_id"),
+        "account_id": req.get("account_id"),
+        "account_name": account.name if account else None,
+        "phone_masked": _mask_phone(account.phone) if account else None,
+        "phase": req.get("phase"),
+        "resend_seq": req.get("resend_seq", 0),
+        "error": req.get("error") or None,
+        "expires_at": req.get("expires_at"),
+    }
+
+
+@router.get("/accounts/login-request")
+def hr_login_request_get(
+    session: Session = Depends(get_session),
+    store: Any = Depends(get_login_request),
+) -> dict[str, Any]:
+    """当前登录请求 + 进度。前端轮询这个。"""
+    req = store.get()
+    if req is None:
+        return {"phase": "idle"}
+    account = session.get(models.Account, req["account_id"])
+    return _login_payload(req, account)
+
+
+class LoginStart(BaseModel):
+    """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。"""
+
+    force: bool = False
+
+
+@router.post("/accounts/{account_id}/login")
+def hr_login_start(
+    account_id: int,
+    body: LoginStart | None = None,
+    session: Session = Depends(get_session),
+    store: Any = Depends(get_login_request),
+) -> dict[str, Any]:
+    """发起登录：系统将代你在手机上打开猎聘、输手机号、点「获取验证码」。
+
+    前置条件由前端确认（手机上得先退出旧号），这里只校验数据面。
+    """
+    account = session.get(models.Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    if not account.phone:
+        raise HTTPException(
+            status_code=400, detail="该账号没有登记手机号，无法登录——请先在账号管理里补录"
+        )
+    in_flight = store.active()
+    if in_flight is not None and not (body and body.force):
+        raise HTTPException(
+            status_code=409,
+            detail=f"已有一个登录在进行中（账号 {in_flight['account_id']}，"
+            f"阶段 {in_flight['phase']}）——一部手机同一时刻只能登一个号",
+        )
+    req = store.start(account_id)
+    return _login_payload(req, account)
+
+
+class LoginCode(BaseModel):
+    code: str
+
+
+@router.post("/accounts/login-request/code")
+def hr_login_submit_code(
+    body: LoginCode,
+    session: Session = Depends(get_session),
+    store: Any = Depends(get_login_request),
+) -> dict[str, Any]:
+    """提交人工从自己手机上读到的验证码。"""
+    code = body.code.strip().replace(" ", "")
+    if not code.isdigit() or not (4 <= len(code) <= 8):
+        raise HTTPException(status_code=400, detail="验证码应为 4-8 位数字")
+    req = store.active()
+    if req is None:
+        raise HTTPException(status_code=409, detail="当前没有进行中的登录")
+    store.submit_code(code)
+    account = session.get(models.Account, req["account_id"])
+    return _login_payload(store.get(), account)
+
+
+@router.post("/accounts/login-request/resend")
+def hr_login_resend(
+    session: Session = Depends(get_session),
+    store: Any = Depends(get_login_request),
+) -> dict[str, Any]:
+    """重发验证码。**只是记一个请求**，真正去点「重发」由下一轮 Pi 执行——
+    禁止 Pi 自己循环点获取验证码，那是风控画像里最显眼的动作之一。"""
+    req = store.active()
+    if req is None:
+        raise HTTPException(status_code=409, detail="当前没有进行中的登录")
+    store.bump_resend()
+    account = session.get(models.Account, req["account_id"])
+    return _login_payload(store.get(), account)
+
+
+@router.post("/accounts/login-request/cancel")
+def hr_login_cancel(store: Any = Depends(get_login_request)) -> dict[str, Any]:
+    """取消：清掉请求，Mac 侧的轮询器随之不再拉起轮次。"""
+    store.clear()
+    return {"phase": "idle"}
 
 
 # —— 只读端点 ——

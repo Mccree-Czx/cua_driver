@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     minio_bucket: str = "hr-workbuddy"  # E2E 用独立 bucket（hr-workbuddy-e2e）隔离生产归档
     screening_url: str = "http://127.0.0.1:8001"
     daily_resume_target: int = 50  # 日回收目标（回收端 KPI；未达标日低分简历照常入库）
+    # 账号密码加密主密钥（Fernet）。只放 .env，绝不入库、不进 git。
+    # 留空则「账号密码」功能不可用（登录核验等不依赖它的功能不受影响）。
+    account_secret_key: str = ""
 
 
 @lru_cache

@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.login_request import RedisLoginRequest
 from app.login_state import RedisLoginState
 from app.models import Account
 from app.screening_client import ScreeningClient
@@ -65,3 +66,8 @@ def get_store() -> ObjectStore:
 @lru_cache
 def get_login_state() -> RedisLoginState:
     return RedisLoginState()
+
+
+@lru_cache
+def get_login_request() -> RedisLoginRequest:
+    return RedisLoginRequest()
