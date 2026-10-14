@@ -60,11 +60,15 @@ def backup_db() -> Path:
         "--no-tablespaces",
         db,
     ]
-    with gzip.open(out, "wb") as gz:
-        proc = subprocess.run(cmd, stdout=gz, stderr=subprocess.PIPE)
+    # 不能把 GzipFile 直接交给 subprocess 的 stdout：子进程拿到的是底层 fd，
+    # 会绕开 gzip 层直接往里写，产出未压缩的裸 SQL（却顶着 .gz 后缀）。
+    # 先收进内存再压缩——全库 dump 只有几 MB。
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         out.unlink(missing_ok=True)
         raise RuntimeError(f"mysqldump 失败：{proc.stderr.decode(errors='replace')}")
+    with gzip.open(out, "wb") as gz:
+        gz.write(proc.stdout)
     return out
 
 
