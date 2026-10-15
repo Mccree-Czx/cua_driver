@@ -7,7 +7,7 @@
   python run_round.py login_round
 
 组装：系统提示 + 轮次指令 → `pi -p`（DeepSeek v4 flash）。
-工作窗口（08:00-20:00）判断在脚本层，窗口外直接跳过不启动 Pi（backfill 与
+工作窗口（08:00-24:00）判断在脚本层，窗口外直接跳过不启动 Pi（backfill 与
 login 例外，见 WINDOW_EXEMPT_ROUNDS）。
 
 本脚本**只用标准库**——它跑在 Mac 的裸 python3 上，没有 pipeline 的依赖。因此
@@ -395,7 +395,10 @@ def _load_api_key() -> str:
 API_KEY = _load_api_key()
 
 WORK_WINDOW_START = (8, 0)
-WORK_WINDOW_END = (20, 0)
+# ★ `(24, 0)` 表示**到当天结束**，不是「凌晨 0 点」。
+#   注意 Python 的 `datetime.replace(hour=…)` 只接受 0–23，写 24 会直接 ValueError，
+#   所以 `within_window` 里对这个边界做了显式处理（见那里）。
+WORK_WINDOW_END = (24, 0)
 
 # rounds.md 中的轮次标题 → 节号（解析用）
 ROUND_SECTIONS = [
@@ -412,7 +415,15 @@ DEFAULT_ROUND_TIMEOUT = 3600
 
 
 def within_window(now: datetime) -> bool:
+    """现在在工作窗口内吗？窗口外直接跳过、不启动 Pi。
+
+    ★ 结束时间允许写 `(24, 0)`（= 到当天结束）。**不能直接 `replace(hour=24)`**
+      ——Python 的 `hour` 合法范围是 0–23，写了会 ValueError 抛栈，
+      而这里是在每一轮开头调的，等于整个调度直接崩。
+    """
     start = now.replace(hour=WORK_WINDOW_START[0], minute=WORK_WINDOW_START[1], second=0)
+    if WORK_WINDOW_END[0] >= 24:
+        return now >= start
     end = now.replace(hour=WORK_WINDOW_END[0], minute=WORK_WINDOW_END[1], second=0)
     return start <= now < end
 
