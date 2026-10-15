@@ -31,6 +31,9 @@ PREEMPT = {"ok": True, "count": 0}
 # 记下每次真正落库的职位同步：(account_id, 条数, truncated)
 SYNCED: list[tuple] = []
 
+# 记下抓 JD 时被要求抓哪些职位
+JD: dict[str, list] = {"called_with": []}
+
 
 @pytest.fixture()
 def watch(monkeypatch, tmp_path):
@@ -70,6 +73,14 @@ def watch(monkeypatch, tmp_path):
             "seen": [],
         },
     )
+    # 抓 JD：默认一个都没抓到（fake 里没有真手机）。**必须打桩**——
+    # 不打的话它会真的去调 adb，而这些测试的契约是「绝不碰手机」。
+    monkeypatch.setattr(
+        login_watch.flows,
+        "fetch_jds",
+        lambda titles, **kw: JD.update(called_with=list(titles))
+        or {"ok": True, "jds": {}, "complete": {}, "failed": {}, "skipped": [], "visited": 0},
+    )
     monkeypatch.setattr(
         login_watch,
         "sync_scanned_jobs",
@@ -89,6 +100,7 @@ def watch(monkeypatch, tmp_path):
     PREEMPT["ok"] = True
     PREEMPT["count"] = 0
     SYNCED.clear()
+    JD["called_with"] = []
 
     def _fake_preempt() -> bool:
         PREEMPT["count"] += 1
@@ -183,6 +195,77 @@ def test_scan_result_reaches_the_database(watch):
 
     assert login_watch.main() == 0
     assert SYNCED == [(7, 1, False)]
+
+
+def test_scan_asks_for_jd_of_every_scanned_job(watch):
+    """扫到职位之后要接着去抓 JD——不然扫回来的职位永远是 draft。"""
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    assert JD["called_with"] == ["机械结构工程师"]
+
+
+def test_jd_fetch_failure_keeps_login_success(watch, monkeypatch):
+    """★ 抓 JD 失败**不是**登录失败——和扫职位失败同理。
+
+    抓 JD 要逐个进详情页，是最容易出岔子的一步（页面变了、风控、超时）。
+    它一失败就把登录打成 failed，会让用户白白再消耗一条短信验证码。
+    """
+    store, calls, tmp_path = watch
+
+    def _boom(titles, **kw):
+        raise login_watch.flows.FlowMismatch("抓 JD", "职位详情页锚点过期")
+
+    monkeypatch.setattr(login_watch.flows, "fetch_jds", _boom)
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    assert store.get()["phase"] == "success"
+    assert "JD 没抓到" in store.get()["notice"]
+    assert store.get()["error"] == ""
+
+
+def test_fetched_jd_is_stored_and_activated(watch, monkeypatch):
+    """抓到 JD 之后要再走一次落库，并且把 complete 一并带过去。
+
+    `complete` 是「这段 JD 确认读完整了」——只有它为真才允许自动启用。
+    """
+    store, calls, tmp_path = watch
+    jd_text = "负责机械结构设计，熟悉 Creo / SolidWorks，五年以上相关经验，能独立完成从方案到量产。" * 2
+    monkeypatch.setattr(
+        login_watch.flows,
+        "fetch_jds",
+        lambda titles, **kw: {
+            "ok": True,
+            "jds": {"机械结构工程师": jd_text},
+            "complete": {"机械结构工程师": True},
+            "failed": {},
+            "skipped": [],
+            "visited": 1,
+        },
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        login_watch,
+        "sync_scanned_jobs",
+        lambda account_id, items, **kw: saved.append({"items": items, **kw})
+        or {"created": 0, "updated": 0, "unchanged": 0, "scanned": 0,
+            "skipped": [], "truncated": False, "jd_filled": 1, "jd_activated": 1},
+    )
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    # 落库走两次：先落职位列表，再 items=[] 只补 JD
+    assert saved[-1] == {
+        "items": [],
+        "jds": {"机械结构工程师": jd_text},
+        "complete": {"机械结构工程师": True},
+    }
+    assert "已自动启用" in store.get()["notice"]
 
 
 def test_awaiting_code_without_a_code_just_waits(watch):

@@ -192,6 +192,96 @@ def test_blank_title_is_skipped(session):
     assert (result["created"], result["skipped"]) == (0, ["(空标题)"])
 
 
+# ——— 补 JD ———
+
+GOOD_JD = (
+    "【岗位职责】1.负责从需求分析、方案设计到量产导入的全流程硬件工作，主导关键元器件选型与成本控制。"
+    "【任职要求】1.本科及以上，电子类相关专业，3年以上消费电子产品硬件开发经验。"
+)
+
+
+def test_complete_jd_fills_and_activates(session):
+    """★ 读到完整 JD 就自动启用——这是用户要的「全自动」。
+
+    但门槛是 `complete=True`：`fetch_jds` 只有「滚动也不再变长」才敢说读全了。
+    """
+    title = _title()
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": title, "details": "上海 本科 3-5年 20-30k"}])
+    job = session.execute(select(models.Job).where(models.Job.title == title)).scalar_one()
+    assert job.status == models.JOB_STATUS_DRAFT
+
+    saved = sync_scanned_jobs(
+        DEFAULT_ACCOUNT_ID, [], jds={title: GOOD_JD}, complete={title: True}
+    )
+    assert (saved["jd_filled"], saved["jd_activated"]) == (1, 1)
+    session.commit()
+    session.refresh(job)
+    assert job.jd_text == GOOD_JD
+    assert job.status == models.JOB_STATUS_ACTIVE
+
+
+def test_incomplete_jd_is_stored_but_not_activated(session):
+    """★ 半截 JD 比空 JD **更危险**——它看起来像有依据。
+
+    所以抓到多少存多少（前端看得见），但**绝不自动启用**。
+    """
+    title = _title()
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": title, "details": "上海 本科"}])
+    saved = sync_scanned_jobs(
+        DEFAULT_ACCOUNT_ID, [], jds={title: GOOD_JD}, complete={title: False}
+    )
+    assert (saved["jd_filled"], saved["jd_activated"]) == (1, 0)
+    job = session.execute(select(models.Job).where(models.Job.title == title)).scalar_one()
+    session.commit()
+    session.refresh(job)
+    assert job.jd_text == GOOD_JD
+    assert job.status == models.JOB_STATUS_DRAFT
+
+
+def test_too_short_jd_is_stored_but_not_activated(session):
+    """读完整了、但太短（比如 JD 本来就只写了「面议」）——同样不启用。"""
+    title = _title()
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": title, "details": "上海 本科"}])
+    saved = sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [], jds={title: "面议"}, complete={title: True})
+    assert saved["jd_activated"] == 0
+    job = session.execute(select(models.Job).where(models.Job.title == title)).scalar_one()
+    session.commit()
+    session.refresh(job)
+    assert job.status == models.JOB_STATUS_DRAFT
+
+
+def test_jd_never_overwrites_what_is_already_there(session):
+    """★ 永不覆盖非空 JD：用户可能已经在前端改过了。
+
+    没有 provenance 列就无权覆盖——重扫一次把用户改的 JD 冲掉，而且完全没有报错，
+    是这套系统里最难发现的那类故障。
+    """
+    title = _title()
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": title, "details": "上海 本科"}])
+    job = session.execute(select(models.Job).where(models.Job.title == title)).scalar_one()
+    job.jd_text = "这是我在前端手工写的 JD，比自动抓的准。" * 3
+    job.status = models.JOB_STATUS_ACTIVE
+    session.commit()
+
+    saved = sync_scanned_jobs(
+        DEFAULT_ACCOUNT_ID, [], jds={title: GOOD_JD}, complete={title: True}
+    )
+    assert (saved["jd_filled"], saved["jd_activated"]) == (0, 0)
+    session.commit()
+    session.refresh(job)
+    assert job.jd_text.startswith("这是我在前端手工写的")
+    assert job.status == models.JOB_STATUS_ACTIVE
+
+
+def test_jd_for_unknown_title_is_ignored(session):
+    """JD 的标题不在库里就跳过，不硬塞、更不凭标题新建。"""
+    ghost = _title("不存在")
+    saved = sync_scanned_jobs(
+        DEFAULT_ACCOUNT_ID, [], jds={ghost: GOOD_JD}, complete={ghost: True}
+    )
+    assert (saved["jd_filled"], saved["jd_activated"]) == (0, 0)
+
+
 # ——— 空转闸门 ———
 
 

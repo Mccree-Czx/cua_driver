@@ -100,6 +100,10 @@ SENTINEL = run_round.LOGIN_IN_FLIGHT_FILE
 # （登录表单里那个「我已阅读并同意」勾选框是流程必经步骤，不受此开关影响。）
 AGREE_TERMS = os.environ.get("HR_AGREE_TERMS", "").strip() in {"1", "true", "yes"}
 
+# 每次登录后最多抓几个职位的 JD。抓 JD 要逐个进详情页（约 20 秒一个），
+# 而这段时间登录相位一直停在非终态挡着 main_round——所以必须封顶。
+HR_JD_MAX_JOBS = int(os.environ.get("HR_JD_MAX_JOBS", "5"))
+
 
 def _round_running() -> bool:
     """有轮次正在跑吗？判定与 run_round.acquire_round_lock 同源，不另写一套。"""
@@ -401,15 +405,66 @@ def _scan_jobs(store, req: dict) -> str:
         return f"登录成功，扫到 {len(result['jobs'])} 个职位但写库失败（{exc}）"
 
     print(f"[login_watch] 职位同步：{summary}")
+    jd_note = _fetch_and_store_jds(req["account_id"], result["jobs"])
+
     if summary["created"]:
-        tail = "（列表没扫全，可重扫）" if summary["truncated"] else ""
-        return (
-            f"已同步 {summary['created']} 个在招职位{tail}，"
-            "在前端补齐 JD 并启用后才会开始打招呼"
+        head = f"已同步 {summary['created']} 个在招职位"
+        if summary["truncated"]:
+            head += "（列表没扫全，可重扫）"
+    elif summary["updated"]:
+        head = f"已更新 {summary['updated']} 个职位的详情"
+    else:
+        head = f"职位已是最新（{summary['unchanged']} 个已存在）"
+    if jd_note:
+        return f"{head}；{jd_note}"
+    return f"{head}，在前端补齐 JD 并启用后才会开始打招呼"
+
+
+def _fetch_and_store_jds(account_id: int, jobs: list[dict]) -> str:
+    """从职位详情页把 JD 读回来落库，返回要拼进 notice 的一句话。
+
+    ★ **失败一律不外溢**：这是「登录成功之后顺手多做一件」，做不成只该是一句话，
+      绝不能把已经成功的登录打成失败——那会让前端报红，还会诱导用户重来一遍，
+      而重来要再消耗一条短信验证码。
+
+    ★ 全程只读：`flows.fetch_jds()` 只点职位卡进详情页，详情页上只有
+      dump/滚动/BACK。**不碰「编辑职位」**——实测点它会弹
+      「修改职位将导致【邀请应聘】服务终止」。
+    """
+    titles = [j["title"] for j in jobs if j.get("title")]
+    if not titles:
+        return ""
+
+    print(f"[login_watch] 抓 JD：{len(titles)} 个职位（上限 {HR_JD_MAX_JOBS}）")
+    try:
+        result = flows.fetch_jds(titles[:HR_JD_MAX_JOBS])
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        return f"JD 没抓到（{exc}）"
+
+    if not result["jds"]:
+        return "JD 一个都没抓到，需要在前端手工补"
+
+    try:
+        saved = sync_scanned_jobs(
+            account_id, [], jds=result["jds"], complete=result["complete"]
         )
-    if summary["updated"]:
-        return f"已更新 {summary['updated']} 个职位的详情"
-    return f"职位已是最新（{summary['unchanged']} 个已存在）"
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        return f"JD 抓到 {len(result['jds'])} 个但写库失败（{exc}）"
+
+    print(f"[login_watch] JD 同步：{saved}")
+    parts = [f"JD 抓到 {saved['jd_filled']} 个"]
+    if saved["jd_activated"]:
+        parts.append(f"{saved['jd_activated']} 个已自动启用")
+    else:
+        parts.append("都没自动启用，请在前端核对后启用")
+    if result["failed"]:
+        detail = "、".join(f"{t}({r})" for t, r in list(result["failed"].items())[:3])
+        parts.append(f"未成：{detail}")
+    if result["skipped"]:
+        parts.append(f"{len(result['skipped'])} 个留到下次")
+    return "，".join(parts)
 
 
 if __name__ == "__main__":

@@ -68,13 +68,25 @@ def parse_details(details: str) -> dict[str, str]:
 
 
 def sync_scanned_jobs(
-    account_id: int, items: list[dict[str, Any]], *, truncated: bool = False
+    account_id: int,
+    items: list[dict[str, Any]],
+    *,
+    truncated: bool = False,
+    jds: dict[str, str] | None = None,
+    complete: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """把一次扫描结果落库。`items` 形如 `[{"title": ..., "details": ...}]`。
 
     `truncated` 只用于回报（说明这次没扫全），不影响写入行为——因为本函数从不删改状态。
+
+    `jds` 是**另一次调用**补上来的（从职位详情页读到的 JD），所以 `items` 可以是空的。
+    `complete[title]` 表示那段 JD **确认读完整了**（没被截断）。
+
+    ★ 只有 `complete` 且长度达标的 JD 才会把职位转成 `active`。抓半截的 JD 比空 JD
+      **更危险**——它看起来像有依据，LLM 会拿它当真去筛真实候选人。
     """
     created = updated = unchanged = 0
+    jd_filled = jd_activated = 0
     skipped: list[str] = []
 
     with SessionLocal() as session:
@@ -125,6 +137,19 @@ def sync_scanned_jobs(
             else:
                 unchanged += 1
 
+        # 补 JD。可能是同一次调用的尾巴，也可能是 items=[] 的第二次调用。
+        for title, text in (jds or {}).items():
+            job = existing.get(title)
+            if job is None:
+                continue  # 库里没这个职位就不硬塞
+            if (job.jd_text or "").strip():
+                continue  # ★ 永不覆盖非空 JD：用户可能已经在前端改过了
+            job.jd_text = text
+            jd_filled += 1
+            if (complete or {}).get(title) and len(text.strip()) >= MIN_JD_CHARS:
+                job.status = JOB_STATUS_ACTIVE
+                jd_activated += 1
+
         session.commit()
 
     return {
@@ -134,6 +159,8 @@ def sync_scanned_jobs(
         "scanned": len(items),
         "skipped": skipped,
         "truncated": truncated,
+        "jd_filled": jd_filled,
+        "jd_activated": jd_activated,
     }
 
 

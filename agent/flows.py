@@ -333,8 +333,11 @@ def _find_startswith(xml: str, prefix: str) -> dict[str, Any] | None:
     return None
 
 
-def _collect_job_cards(xml: str, seen: dict[str, dict[str, str]]) -> int:
-    """把这一屏的职位卡收进 `seen`，返回新增条数。"""
+def _collect_job_cards(xml: str, seen: dict[str, dict[str, Any]]) -> int:
+    """把这一屏的职位卡收进 `seen`，返回新增条数。
+
+    带上 `bounds`：抓 JD 时要按卡片位置算出点击点（见 `_card_tap_point`）。
+    """
     added = 0
     for node in phone.nodes(xml):
         text = (node["desc"] or node["text"]).strip()
@@ -348,9 +351,105 @@ def _collect_job_cards(xml: str, seen: dict[str, dict[str, str]]) -> int:
             continue
         title = lines[0]
         if title not in seen:
-            seen[title] = {"title": title, "details": details}
+            seen[title] = {"title": title, "details": details, "bounds": node["bounds"]}
             added += 1
     return added
+
+
+# ——— 抓 JD（2026-10-15 实测）———
+
+_JD_LABEL = "职位介绍"
+
+# ★★ 详情页底部并排两颗按钮：「关闭职位」(237,2111) 会把职位下架，
+#    「编辑职位」(747,2111) 会弹「该职位正在使用【邀请应聘】服务，修改职位将导致服务终止」。
+#    **两颗都不碰**——读 JD 走详情页本身，是纯只读的。
+_JD_DENY = (
+    "关闭职位", "编辑职位", "保存", "发布", "发布职位", "提交", "确定", "完成", "更新", "删除",
+)
+
+
+def _card_tap_point(bounds: tuple[int, int, int, int]) -> tuple[int, int]:
+    """点职位卡上一个安全的落点。
+
+    实测（2026-10-15）点卡的标题区进「职位详情页」。落点取卡片左上角偏移 (300,100)：
+    避开右上角那颗「火爆刷」付费推广按钮（x 786~996），也避开卡片下部的
+    看过我/沟通过/收到简历三个计数按钮。
+    """
+    x1, y1, x2, y2 = bounds
+    return (min(x1 + 300, x2 - 30), min(y1 + 100, y2 - 30))
+
+
+def _jd_from_screen(xml: str) -> str:
+    """从一屏 dump 里取 JD：「职位介绍」标签下方最长的那段文本。"""
+    label = phone.find_exact(xml, _JD_LABEL)
+    nodes = phone.nodes(xml)
+    if label:
+        top = label["bounds"][3]
+        pool = [
+            n for n in nodes
+            if n["bounds"][1] >= top - 20 and (n["text"] or n["desc"]).strip()
+        ]
+        if pool:
+            pick = max(pool, key=lambda n: len(n["text"] or n["desc"]))
+            return (pick["desc"] or pick["text"]).strip()
+    # 标签没找到就退而求其次：全屏最长的那个文本节点
+    pick = max(nodes, key=lambda n: len(n["text"] or n["desc"]), default=None)
+    return ((pick["desc"] or pick["text"]).strip() if pick else "")
+
+
+def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
+    """读 JD，返回 `(jd_text, complete)`。调用前必须已在职位详情页。
+
+    实测（2026-10-15）：「职位介绍」下方那个节点的 content-desc **一次性给出全部
+    543 字**，不需要滚动。
+
+    ★ 但那是**一个职位**的实测行为，不能当保证——Flutter 有可能只暴露它已布局出来的
+      那部分。所以做一次**增长检测**：往下滚一屏再取一次，文本变长说明被截断了，
+      继续滚（最多 `max_scroll` 次）直到不再增长。**没增长过才敢说 complete**，
+      而只有 complete 的 JD 才会被自动启用（见 `app/job_sync.py`）。
+    """
+    text = _jd_from_screen(phone.dump())
+    for _ in range(max_scroll):
+        before = len(text)
+        phone.swipe((540, 1600), (540, 900))
+        text = _jd_from_screen(phone.dump())
+        if len(text) <= before:
+            return text, True
+    return text, False
+
+
+def _goto_job_list(step: str) -> str:
+    """把手机带到「职位管理 → 招聘中」列表，返回那一屏的 dump。
+
+    每一步都校验；失配即抛，绝不猜着点。`scan_jobs` 与 `fetch_jds` 共用这一条路，
+    所以锚点只有一份。
+    """
+    m = load_map()["职位扫描"]
+    result = phone.ensure_main_tabs(PKG)
+    if not result["ok"]:
+        raise FlowMismatch(step, "退不回主界面，找不到底部「职位」tab", result.get("seen", []))
+
+    xml = phone.dump()
+    _guard_risk(xml, step)
+    tab = phone.find_exact(xml, m["phone_tab"]["match"])
+    if not tab:
+        raise FlowMismatch(step, "主界面底部没有「职位」tab", phone.texts(xml))
+    phone.tap_node(tab, pause=4.5)
+
+    xml = phone.dump()
+    _guard_risk(xml, "进职位页")
+    _guard_publish_form(xml)
+    joined = " ".join(phone.texts(xml))
+    if not all(marker in joined for marker in _JOB_PAGE_MARKERS):
+        raise FlowMismatch(step, "没进到职位管理页（看不到「招聘中/发职位」）", phone.texts(xml))
+
+    recruiting = _find_startswith(xml, "招聘中")
+    if not recruiting:
+        raise FlowMismatch(step, "职位管理页上没有「招聘中」筛选 tab", phone.texts(xml))
+    phone.tap_node(recruiting, pause=3)
+    xml = phone.dump()
+    _guard_publish_form(xml)
+    return xml
 
 
 def scan_jobs(*, max_swipe: int = 6, budget_seconds: float = 180.0) -> dict[str, Any]:
@@ -376,31 +475,7 @@ def scan_jobs(*, max_swipe: int = 6, budget_seconds: float = 180.0) -> dict[str,
     if _is_onboarding(xml):
         return {"ok": False, "reason": "onboarding", "jobs": [], "seen": phone.texts(xml)}
 
-    result = phone.ensure_main_tabs(PKG)
-    if not result["ok"]:
-        raise FlowMismatch(
-            "扫描职位", "退不回主界面，找不到底部「职位」tab", result.get("seen", [])
-        )
-
-    xml = phone.dump()
-    _guard_risk(xml, "扫描职位")
-    tab = phone.find_exact(xml, m["phone_tab"]["match"])
-    if not tab:
-        raise FlowMismatch("扫描职位", "主界面底部没有「职位」tab", phone.texts(xml))
-    phone.tap_node(tab, pause=4.5)
-
-    xml = phone.dump()
-    _guard_risk(xml, "进职位页")
-    _guard_publish_form(xml)
-    joined = " ".join(phone.texts(xml))
-    if not all(marker in joined for marker in _JOB_PAGE_MARKERS):
-        raise FlowMismatch("扫描职位", "没进到职位管理页（看不到「招聘中/发职位」）", phone.texts(xml))
-
-    recruiting = _find_startswith(xml, "招聘中")
-    if recruiting:
-        phone.tap_node(recruiting, pause=3)
-        xml = phone.dump()
-        _guard_publish_form(xml)
+    xml = _goto_job_list("扫描职位")
 
     # ★ 时间预算：扫描跑在「登录成功之后、相位还是非终态」这段时间里，
     #   卡住不动会让 `.login_in_flight` 哨兵一直挡着 main_round。每次 dump 都要
@@ -427,4 +502,106 @@ def scan_jobs(*, max_swipe: int = 6, budget_seconds: float = 180.0) -> dict[str,
         "swipes": swipes,
         "truncated": truncated,
         "seen": phone.texts(xml),
+    }
+
+
+def _page_is_for(xml: str, title: str) -> bool:
+    """详情页上的职位名是点的那张卡吗？——防止点歪了把 A 的 JD 记到 B 头上。
+
+    只看页面上半部分：标题在 y≈331，而下半部分是 JD 正文，正文里**会**出现职位名，
+    不限定区域会被正文里的字样骗过去。
+    """
+    want = title.replace("…", "").strip()
+    for node in phone.nodes(xml):
+        if node["bounds"][1] >= 600:
+            continue
+        got = phone.label(node).replace("…", "").strip()
+        if len(got) < 4:
+            continue
+        if got == want or got.startswith(want) or want.startswith(got):
+            return True
+    return False
+
+
+def fetch_jds(
+    titles: list[str], *, max_jobs: int = 5, budget_seconds: float = 150.0
+) -> dict[str, Any]:
+    """逐个职位进详情页读 JD。**全程只读**。
+
+    ★ **为什么走详情页而不是「编辑职位」表单**：实测点「编辑职位」会弹
+      「该职位正在使用【邀请应聘】服务，修改职位将导致服务终止，确定修改职位吗？」
+      ——进表单是有真实代价的副作用。而详情页的「职位介绍」里 JD 是**完整的**，
+      且纯只读。
+
+    ★ 详情页上**一次都不点**：只有 dump / 滚动 / BACK。底部并排的
+      「关闭职位」与「编辑职位」两颗按钮因此根本不在可达路径里。
+
+    ★ 这里**不判断 JD 够不够长**——只如实报告读到什么。阈值与「要不要启用」
+      是 `app/job_sync.py` 的事，免得同一个数字在两地各写一遍。
+
+    单个职位失败不影响其余；`failed` 里带原因，调用方如实上报。
+    """
+    jds: dict[str, str] = {}
+    complete: dict[str, bool] = {}
+    failed: dict[str, str] = {}
+    skipped: list[str] = []
+    visited = 0
+    deadline = time.monotonic() + budget_seconds
+
+    seen: dict[str, dict[str, Any]] = {}
+    _collect_job_cards(_goto_job_list("抓 JD"), seen)
+
+    for title in titles:
+        if visited >= max_jobs or time.monotonic() >= deadline:
+            skipped.append(title)
+            continue
+
+        card = seen.get(title)
+        if card is None:
+            # 列表可能已经滚过、或这次没扫到——重扫一屏再找
+            seen.clear()
+            _collect_job_cards(phone.dump(), seen)
+            card = seen.get(title)
+        if card is None:
+            failed[title] = "not_on_list"
+            continue
+
+        visited += 1
+        phone.tap(_card_tap_point(card["bounds"]), pause=3)
+        detail = phone.dump()
+        _guard_risk(detail, "职位详情页")
+
+        if not phone.find_exact(detail, _JD_LABEL):
+            failed[title] = "wrong_page"
+            phone.back()
+            continue
+        # ★ 身份核对：读到的是**这个**职位的 JD 吗
+        if not _page_is_for(detail, title):
+            failed[title] = "title_mismatch"
+            phone.back()
+            continue
+
+        text, done = _extract_jd()
+        got_jd = bool(text.strip())
+        if got_jd:
+            jds[title] = text.strip()
+            complete[title] = done
+        else:
+            failed[title] = "no_content"
+
+        phone.back()
+        back_xml = phone.dump()
+        if not all(m in " ".join(phone.texts(back_xml)) for m in _JOB_PAGE_MARKERS):
+            # 退不回列表就别在错的页面上继续了——把已经拿到的带回去，如实说明
+            if not got_jd:
+                failed[title] = "back_failed"
+            break
+
+    return {
+        "ok": True,
+        "jds": jds,
+        "complete": complete,
+        "failed": failed,
+        "skipped": skipped,
+        "visited": visited,
     }

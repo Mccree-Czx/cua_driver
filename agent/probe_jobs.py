@@ -89,11 +89,18 @@ def _report(xml: str, *, raw: bool, save: str | None) -> None:
         label = phone.label(node)
         x1, y1, x2, y2 = node["bounds"]
         mark = "●" if node["clickable"] else "○"  # ○ = clickable=false，Flutter 图标常是这样
+        # ★ 不截断。曾经这里写死 [:58]，于是「职位介绍」那段 543 字的 JD 只显示
+        #   前 58 字，看起来像被 uiautomator 截断了——差点据此得出「详情页读不全」
+        #   的错误结论，还去试了有副作用的编辑表单。**探查工具必须如实呈现全部内容。**
         if label:
-            shown = label.replace("\n", "⏎")[:58]
+            shown = label.replace("\n", "⏎")
         else:
             shown = f"({node['cls']} 无文字)"
-        print(f"  {mark} {shown:<60} ({node['center'][0]:>4},{node['center'][1]:>4})  {x2-x1}x{y2-y1}")
+        if len(shown) > 58:
+            print(f"  {mark} {shown[:58]}… (共 {len(shown)} 字)")
+            print(f"      {shown}")
+        else:
+            print(f"  {mark} {shown:<60} ({node['center'][0]:>4},{node['center'][1]:>4})  {x2-x1}x{y2-y1}")
 
     print()
     print("=== 屏上文字（去重）===")
