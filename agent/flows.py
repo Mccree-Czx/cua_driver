@@ -162,6 +162,18 @@ def submit_code(code: str) -> dict[str, Any]:
     raise FlowMismatch("提交验证码", "停在无法识别的页面", seen)
 
 
+# 已经登出时会看到的几种页面。**不能只认登录页**——协议页和验证码页同样是登出态。
+# 漏掉它们会让 logout() 走错分支：去按 BACK 找底部导航，而那种页面本来就没有，
+# 于是一路退出 App 退到桌面，报出一个假的「退不回主界面」。
+# （2026-10-15 真机第二次跑就栽在这儿。）
+_LOGGED_OUT_MARKERS = ("手机号登录", "验证码已发送", "服务协议及个人信息保护")
+
+
+def _is_logged_out_screen(xml: str) -> bool:
+    joined = " ".join(phone.texts(xml))
+    return any(marker in joined for marker in _LOGGED_OUT_MARKERS)
+
+
 def logout(*, agree: bool = False) -> dict[str, Any]:
     """退出登录。
 
@@ -177,8 +189,9 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
     xml = phone.dump()
 
     # 已经是登出状态就直接返回（幂等）。
-    # ★ 这条必须**先判**：登录页没有底部导航，先调 ensure_main_tabs 会把正常状态判成异常。
-    if "手机号登录" in " ".join(phone.texts(xml)):
+    # ★ 这条必须**先判**：登录页/协议页/验证码页都没有底部导航，
+    #   先调 ensure_main_tabs 会把正常状态判成异常（甚至把 App 退出到桌面）。
+    if _is_logged_out_screen(xml):
         return {"ok": True, "already_logged_out": True}
 
     # 新账号引导页也没有底部导航，且有自己的退出入口

@@ -206,15 +206,23 @@ def ensure_main_tabs(package: str, max_back: int = 5, settle: float = 6.0) -> di
 
     2026-10-15 第一次真机运行就栽在这儿：`logout()` 上来就点「我的」tab 的坐标 (945,2122)，
     而 App 被上一轮留在了**会话页**，那里没有底部导航，那一下打到了别处。
-    所幸步骤校验发现「不是我的页」就停手了——否则那一下会落在一个**真实候选人的会话页**上，
-    而那种页面一屏之内就有「不合适」「看简历」这类会真实影响候选人的按钮。
 
-    退不到就如实返回，绝不猜。
+    ★ **每一步都要确认还在目标 App 里**：登录页、协议页、验证码页**都没有底部导航**，
+      盲按 BACK 会一路退出 App 退到桌面——那样「退不回主界面」这个结论就是假的，
+      真相是「本来就不该退」。所以一旦发现离开了目标包，立刻重新打开并如实返回。
     """
     home()
     open_app(package, settle=settle)
     for attempt in range(max_back + 1):
         xml = dump()
+        if package not in current_package(xml):
+            # BACK 把 App 退掉了 —— 说明它原本就在一个没有底部导航的页面（登录页/协议页…）
+            return {
+                "ok": False,
+                "left_app": True,
+                "seen": texts(xml),
+                "hint": "按 BACK 退出了 App，说明它本来就不在主界面（可能是登录页/协议页/验证码页）",
+            }
         marks = [m for m in MAIN_TAB_MARKERS if find_exact(xml, m)]
         if len(marks) >= 2:
             return {"ok": True, "attempts": attempt, "marks": marks}
