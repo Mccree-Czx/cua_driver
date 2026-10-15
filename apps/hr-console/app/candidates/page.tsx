@@ -134,13 +134,17 @@ export default function Candidates() {
     openDetail(detail.jc.id);
   }
 
-  async function rerun() {
-    if (!detail) return;
-    const resp = await fetch(`/api/hr/candidates/${detail.jc.id}/rerun`, { method: "POST" });
-    const body = await resp.json().catch(() => ({}));
-    if (resp.ok) message.success(`已派发重跑：${body.type}`);
-    else message.error(`重跑失败（HTTP ${resp.status}：${body.detail ?? ""}）`);
-  }
+  // ★ 「手动重跑」按钮已于 2026-10-15 **移除**。
+  //
+  // 它调的 `POST /api/hr/candidates/{jc_id}/rerun` **这个端点从来不存在**，
+  // 点了只会弹「重跑失败（HTTP 404）」。
+  //
+  // 为什么不补上它：那个按钮的语义是「把任务重新入队」——而队列（arq）的消费者
+  // 两代前就随旧编排层删掉了。补一个只会**入队到没人读的地方**，按钮报「已派发」，
+  // 实际什么都没发生。**那比 404 更糟**：404 至少是诚实的。
+  //
+  // 真要做「重跑某个候选人」，需要的是 Pi 侧的机制（在下一轮里优先处理这个 jc），
+  // 那是一个功能，不是补一个端点。
 
   const columns: ColumnsType<CandidateRow> = [
     {
@@ -363,7 +367,6 @@ export default function Candidates() {
                   复核推翻
                 </Button>
               </Space>
-              <Button onClick={rerun}>手动重跑</Button>
             </div>
           </>
         )}

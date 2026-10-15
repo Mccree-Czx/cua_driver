@@ -122,7 +122,7 @@ def test_overview_counts_buckets_and_today(client, session):
     _add_interaction(session, jc_b.id, "in", "attachment")
 
     body = client.get(f"/api/hr/overview?job_id={job_id}").json()
-    assert body["job"]["llm_threshold"] == 40
+    assert body["job"]["llm_threshold"] == 70
     assert body["status_counts"] == {"new": 1, "resume_received": 1, "closed": 1}
     assert body["score_buckets"] == {"1星": 0, "2星": 1, "3星": 0, "4星": 1, "5星": 0, "未评分": 1}
     assert body["today"]["touches_out"] == 1  # 岗位维度计数

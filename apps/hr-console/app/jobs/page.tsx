@@ -8,7 +8,6 @@ import {
   Drawer,
   Empty,
   Input,
-  InputNumber,
   Space,
   Table,
   Tag,
@@ -24,8 +23,9 @@ type Job = {
   education: string | null;
   experience: string | null;
   salary: string | null;
-  llm_threshold: number;
   status: string;
+  // 接口还回 llm_threshold，但**这个页面不碰它**：那是已失效的遗留量纲，
+  // 筛选只看星级（见下方 Alert 的说明）。
 };
 
 /** 一个职位要能被系统拿去打招呼，JD 至少得有这么多字（后端同一常量把关）。 */
@@ -50,7 +50,6 @@ export default function Jobs() {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Job | null>(null);
   const [jd, setJd] = useState("");
-  const [threshold, setThreshold] = useState(40);
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -73,7 +72,6 @@ export default function Jobs() {
   function openEditor(job: Job) {
     setEditing(job);
     setJd(job.jd_text ?? "");
-    setThreshold(job.llm_threshold);
   }
 
   /** `status` 只在「保存并启用」时传——不传就等于只改 JD，不影响启停。 */
@@ -86,7 +84,8 @@ export default function Jobs() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           jd_text: jd,
-          llm_threshold: threshold,
+          // 不传 llm_threshold：那是已经失效的遗留量纲（见下方说明），
+          // 传了也只是覆盖一个没人读的数字。
           ...(nextStatus ? { status: nextStatus } : {}),
         }),
       });
@@ -207,10 +206,17 @@ export default function Jobs() {
             </div>
           </div>
 
-          <div>
-            <div style={{ marginBottom: 8 }}>LLM 阈值（遗留 0–100）</div>
-            <InputNumber min={0} max={100} value={threshold} onChange={(v) => setThreshold(v ?? 40)} />
-          </div>
+          {/* ★ 这里原先有个 0–100 的「LLM 阈值」输入框，**已移除**：
+              它是第一代架构的遗留量纲，现在的筛选链根本不读它——
+              `ScreenRequest` 契约里只有 `min_stars`（1–5），screening 也只比
+              `llm_score >= min_stars`。留着它等于给 HR 一个**转了没反应**的旋钮。
+              真要调筛选严格度，去「评分偏好」页调最低星级。 */}
+          <Alert
+            type="info"
+            showIcon
+            message="筛选严格度在「评分偏好」页调"
+            description="系统按星级（1–5）判断候选人合不合适。这个页只管 JD 与启停。"
+          />
         </Space>
       </Drawer>
     </Card>

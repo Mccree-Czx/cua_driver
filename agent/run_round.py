@@ -226,21 +226,67 @@ def _summarize_tokens(session_file: Path) -> tuple[int, float]:
     return total_tokens, total_cost
 
 
-def _write_token_summary(name: str, tokens: int, cost: float) -> None:
-    """用项目 python 写一条 token 汇总 TaskLog。"""
+def _session_tokens_since(sdir: Path | None, before_mtime: float) -> tuple[int, float] | None:
+    """本轮**新产生**的 session 文件的 (tokens, cost)；没有就返回 None。
+
+    抽出来是为了让正常结束与超时结束**两条路都能落账**——原先超时那条直接
+    `return 124`，成本连记都不记，而超时恰恰是最贵的那种轮次。
+    """
+    if not sdir:
+        return None
+    try:
+        new_files = [f for f in sdir.glob("*.jsonl") if f.stat().st_mtime > before_mtime]
+    except OSError:
+        return None
+    if not new_files:
+        return None
+    return _summarize_tokens(max(new_files, key=lambda f: f.stat().st_mtime))
+
+
+def _write_token_summary(
+    name: str, tokens: int, cost: float, outcome: str, account_id: int | None = None
+) -> None:
+    """用项目 python 写一条 token 汇总 TaskLog。
+
+    ★ `outcome` 必须由调用方按**实际退出码**传入。这里原先硬编码 `'success'`，
+      于是所有轮次（含真实失败的）在库里全记成功——成本与成功率统计因此都是假的，
+      而前端看起来一切正常。**「系统说自己成功」比「系统报错」危险得多。**
+
+    ★ `account_id` 也要带上：`/api/hr/tasklogs` 是按账号过滤的，不带的那些行
+      **前端一条都看不见**。NULL 只该留给真正的系统级汇总。
+
+    账号在同一个进程里顺手查（本来就要开会话），不额外起子进程。
+    """
     script = (
-        "import sys; sys.path.insert(0, 'services/pipeline')\n"
+        "import sys, json; sys.path.insert(0, 'services/pipeline')\n"
         "from app.db import SessionLocal\n"
-        "from app.models import TaskLog\n"
+        "from app.models import Account, TaskLog\n"
         "from datetime import datetime\n"
+        "from sqlalchemy import select\n"
+        "p = json.loads(sys.argv[1])\n"
         "with SessionLocal() as s:\n"
-        f"    s.add(TaskLog(task_id=f'{name}_token_' + datetime.now().strftime('%Y%m%d%H%M%S'), "
-        f"outcome='success', tokens={tokens}, cost={cost}))\n"
+        "    if p['account_id'] is None:\n"
+        "        p['account_id'] = s.scalar(\n"
+        "            select(Account.id).where(Account.is_active.is_(True))\n"
+        "        )\n"
+        "    s.add(TaskLog(\n"
+        "        task_id=p['name'] + '_token_' + datetime.now().strftime('%Y%m%d%H%M%S'),\n"
+        "        outcome=p['outcome'], tokens=p['tokens'], cost=p['cost'],\n"
+        "        account_id=p['account_id']))\n"
         "    s.commit()\n"
+    )
+    payload = json.dumps(
+        {
+            "name": name,
+            "tokens": tokens,
+            "cost": cost,
+            "outcome": outcome,
+            "account_id": account_id,
+        }
     )
     cwd = AGENT_DIR.parent
     subprocess.run(
-        ["uv", "run", "--package", "hr-workbuddy-pipeline", "python", "-c", script],
+        ["uv", "run", "--package", "hr-workbuddy-pipeline", "python", "-c", script, payload],
         cwd=str(cwd), capture_output=True, timeout=60,
     )
 
@@ -413,21 +459,28 @@ def main() -> int:
                 )
         except subprocess.TimeoutExpired:
             print(f"[{name}] 超时（{timeout}s）强制结束，释放锁")
+            # ★ 超时的一轮**最贵**（跑到上限才被砍），不能让它连账都不落：
+            #   原先这里直接 return，成本与「失败」双双消失在统计之外。
+            got = _session_tokens_since(sdir, before_mtime)
+            if got:
+                print(f"[{name}] tokens={got[0]}, cost={got[1]:.6f}（超时结束）")
+                _write_token_summary(name, got[0], got[1], outcome="timeout")
             return 124
         output = log_path.read_text(encoding="utf-8")
         if output:
             print(output, end="")
         print(f"[{name}] 退出码 {result.returncode}，耗时 {time.time()-started:.0f}s")
-        if sdir:
-            try:
-                new_files = [f for f in sdir.glob("*.jsonl") if f.stat().st_mtime > before_mtime]
-            except OSError:
-                new_files = []
-            if new_files:
-                latest = max(new_files, key=lambda f: f.stat().st_mtime)
-                tokens, cost = _summarize_tokens(latest)
-                print(f"[{name}] tokens={tokens}, cost={cost:.6f}")
-                _write_token_summary(name, tokens, cost)
+        # ★ 成败按**真实退出码**判。原先一律写 'success'，于是失败在库里看不出来，
+        #   成本与成功率统计全是假的——而前端看起来一切正常。
+        got = _session_tokens_since(sdir, before_mtime)
+        if got:
+            print(f"[{name}] tokens={got[0]}, cost={got[1]:.6f}")
+            _write_token_summary(
+                name,
+                got[0],
+                got[1],
+                outcome="success" if result.returncode == 0 else "failed",
+            )
         if name == "main_round":
             parsed = parse_round_result(output)
             if parsed is not None:

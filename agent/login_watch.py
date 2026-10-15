@@ -161,16 +161,23 @@ def _record_preempted(pid: int) -> None:
     try:
         from datetime import datetime
 
+        from sqlalchemy import select
+
         from app.db import SessionLocal
-        from app.models import TaskLog
+        from app.models import Account, TaskLog
 
         with SessionLocal() as session:
+            # ★ 带上生效账号：`/api/hr/tasklogs` 是按账号过滤的，不带的话这一行
+            #   前端**一条都看不见**——而被中断的轮次恰恰是最该被看见的那种。
             session.add(
                 TaskLog(
                     task_id="preempted_" + datetime.now().strftime("%Y%m%d%H%M%S"),
                     outcome="preempted",
                     tokens=0,
                     cost=0.0,
+                    account_id=session.scalar(
+                        select(Account.id).where(Account.is_active.is_(True))
+                    ),
                 )
             )
             session.commit()

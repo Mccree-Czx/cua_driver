@@ -117,8 +117,15 @@ class Job(Base):
     hard_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     template_msgs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     scoring_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    # ★ **已废弃**（2026-10-15）：筛选链根本不读它——`ScreenRequest` 契约里只有
+    #   `min_stars`（1–5），screening 也只做 `llm_score >= min_stars` 判断。
+    #   它是第一代「LLM 评分 0–100」量纲的遗留，现在只剩几处回显。
+    #   列先留着（有存量数据），但**新代码不要再往里写**；要调筛选严格度请改
+    #   `scoring_prefs["min_stars"]`。
+    #   顺带把 Python 默认与 DB 默认对齐到 70——原先 40 / 70 不一致，
+    #   走 ORM 建的行和走 SQL 建的行会拿到不同的值。
     llm_threshold: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=40, server_default=text("70")
+        Integer, nullable=False, default=70, server_default=text("70")
     )
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=JOB_STATUS_ACTIVE,
@@ -133,7 +140,7 @@ class Job(Base):
         kwargs.setdefault("hard_rules", {})
         kwargs.setdefault("template_msgs", {})
         kwargs.setdefault("scoring_prefs", {})
-        kwargs.setdefault("llm_threshold", 40)
+        kwargs.setdefault("llm_threshold", 70)  # 与 server_default 对齐，见列上的说明
         kwargs.setdefault("status", JOB_STATUS_ACTIVE)
         super().__init__(**kwargs)
 

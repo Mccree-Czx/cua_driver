@@ -538,7 +538,11 @@ def hr_candidates(
     job_id: int | None = None,
     status: str | None = None,
     q: str | None = None,
-    min_score: int | None = Query(None, ge=0, le=100, description="仅看达标分档（评分>=此值）"),
+    # ★ 量纲是**星级 1–5**，不是 0–100。`match_score` 存的就是 screening 给的
+    #   `llm_score`，而 screening 只做 `llm_score >= min_stars` 判断（星级量纲）。
+    #   这里原先写 `ge=0, le=100`，是第一代 0–100 量纲的残留——传 50 能通过校验，
+    #   却永远匹配不到任何人。契约写得比实际宽，是会让调用方白调试的那种错。
+    min_score: int | None = Query(None, ge=1, le=5, description="仅看达标分档（星级 >= 此值，1-5）"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),

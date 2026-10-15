@@ -22,7 +22,9 @@ class JobCreate(BaseModel):
     jd_text: str
     hard_rules: dict[str, Any] = Field(default_factory=dict)
     template_msgs: dict[str, Any] = Field(default_factory=dict)
-    llm_threshold: int = 40
+    # 已废弃（2026-10-15）：筛选不读它，见 models.Job.llm_threshold 上的说明。
+    # 默认值曾是 40，与 DB 的 70 不一致；统一到 70。
+    llm_threshold: int = 70
     scoring_prefs: dict[str, Any] = Field(default_factory=dict)
     status: str = JOB_STATUS_ACTIVE
 

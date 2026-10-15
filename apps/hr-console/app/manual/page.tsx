@@ -61,13 +61,10 @@ export default function ManualQueue() {
     load();
   }
 
-  async function rerun(jcId: number | null) {
-    if (jcId === null) return;
-    const resp = await fetch(`/api/hr/candidates/${jcId}/rerun`, { method: "POST" });
-    const body = await resp.json().catch(() => ({}));
-    if (resp.ok) message.success(`已派发重跑：${body.type}`);
-    else message.error(`重跑失败（HTTP ${resp.status}）`);
-  }
+  // ★ 「重跑」按钮已于 2026-10-15 **移除**：它调的
+  // `POST /api/hr/candidates/{jc_id}/rerun` 端点从来不存在（点了只弹 404）。
+  // 不补它的理由见 candidates/page.tsx 里同一处的说明——入队没有消费者，
+  // 补上只会变成「按钮说已派发、实际没动」，比 404 更糟。
 
   const columns: ColumnsType<QueueItem> = [
     { title: "时间", dataIndex: "created_at", key: "created_at", width: 160, render: (v: string | null) => fmtTime(v) },
@@ -85,11 +82,6 @@ export default function ManualQueue() {
       key: "action",
       render: (_: unknown, r: QueueItem) => (
         <Space>
-          {r.job_candidate_id !== null && (
-            <Button size="small" onClick={() => rerun(r.job_candidate_id)}>
-              重跑
-            </Button>
-          )}
           <Button size="small" onClick={() => ack(r.task_id)}>
             忽略
           </Button>
