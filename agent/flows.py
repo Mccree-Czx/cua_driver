@@ -267,10 +267,17 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
                 )
         phone.tap_node(target, pause=3)
 
-    # 确认框：一律用 BACK 取消，但这里要确认
+    # 确认框。**它不一定出现**——常规路径（我的→设置）会弹「是否退出登录」，
+    # 而新账号引导页的「更多操作→退出登录」点了直接退。所以「没弹框」不等于失败：
+    # 先看是不是已经退出了。（2026-10-15 第四次跑就误判在这儿，
+    # 而且给用户的信息还反了——明明退干净了，却说「应该还登着原账号」。）
     xml = phone.dump()
     if "是否退出登录" not in " ".join(phone.texts(xml)):
-        raise FlowMismatch("退出", "没弹出「是否退出登录」确认框", phone.texts(xml))
+        if _is_logged_out_screen(xml):
+            return {"ok": True, "already_logged_out": False, "no_confirm": True}
+        raise FlowMismatch(
+            "退出", "点了「退出登录」但既没弹确认框、也没退出", phone.texts(xml)
+        )
     confirm = phone.find_exact(xml, "确定")
     cancel = phone.find_exact(xml, "取消")
     if not confirm or (cancel and confirm["center"][0] <= cancel["center"][0]):
@@ -279,6 +286,6 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
 
     xml = phone.dump()
     _guard_risk(xml, "退出后")
-    if "手机号登录" not in " ".join(phone.texts(xml)):
+    if not _is_logged_out_screen(xml):
         raise FlowMismatch("退出", "退出后没落到登录页", phone.texts(xml))
     return {"ok": True, "already_logged_out": False}
