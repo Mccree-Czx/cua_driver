@@ -616,18 +616,33 @@ def adb_selftest() -> dict:
     }
 
 
-def _type_into_focused(text: str) -> dict:
-    """把文本敲进手机**当前焦点的输入框**。定位（点哪个框）不归它管。
+# 清空焦点框用的退格序列。一次 keyevent 传多个键码，省掉几十次 adb 往返。
+_DEL_KEYS = ["KEYCODE_DEL"] * 40
 
-    必须走 shlex.quote：`adb shell` 会把命令字符串交给设备端的 sh 重新解析，
+
+def _type_into_focused(text: str) -> dict:
+    """清空当前焦点框，再把文本敲进去。
+
+    **必须先清空**：`input text` 是追加不是覆盖，而猎聘登录页的手机号是**预填**的
+    （App 记住了上次的号）。直接敲就会变成两个号粘在一起——而且不会报错，
+    只会在点登录之后才以「账号不存在」的形式暴露。
+
+    清空用 `input keyevent` 一次传多个键码（Android 的 input 支持多键），
+    比循环发 40 次 adb 快一个数量级。
+
+    传入文本必须走 shlex.quote：`adb shell` 会把命令字符串交给设备端的 sh 重新解析，
     裸拼就是命令注入——而密码里出现 `& | ; $ 反引号` 一点都不罕见。
-    空格还要先换成 `%s`，那是 `input text` 自己的转义；不换的话设备端 sh 会把
-    它当成参数分隔符，`input text` 只拿到第一个词。
+    空格还要先换成 `%s`，那是 `input text` 自己的转义；不换的话设备端 sh 会把它
+    当成参数分隔符，`input text` 只拿到第一个词。
     """
-    payload = shlex.quote(text.replace(" ", "%s"))
     try:
+        subprocess.run(
+            [ADB, "shell", "input", "keyevent", "KEYCODE_MOVE_END", *_DEL_KEYS],
+            capture_output=True,
+            timeout=30,
+        )
         result = subprocess.run(
-            [ADB, "shell", "input", "text", payload],
+            [ADB, "shell", "input", "text", shlex.quote(text.replace(" ", "%s"))],
             capture_output=True,
             timeout=30,
         )
