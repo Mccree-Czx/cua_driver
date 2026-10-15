@@ -16,6 +16,7 @@ A 号的职位会被静默记到 B 号头上。这里全部显式吃 `account_id
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from sqlalchemy import select
@@ -27,6 +28,23 @@ from app.models import JOB_STATUS_ACTIVE, JOB_STATUS_DRAFT, Account, Job
 # 而「没有 JD 的 active 职位」会让 LLM 凭空判断谁合适，然后给真实候选人发招呼。
 # 三处共用：本模块、前端 PATCH、MCP 的 job_upsert。
 MIN_JD_CHARS = 30
+
+def norm_title(title: str) -> str:
+    """职位标题**归一化**——判「是不是同一个职位」时用它，不存库。
+
+    NFKC 把全角折成半角（`（` → `(`）、兼容字符折成标准形式，再折叠空白、统一大小写。
+
+    ★ 为什么必须有这一层：猎聘 App 上显示的是「海外ToB渠道销售（出海品牌）」
+      （**全角**括号），而库里手工建的是「海外ToB渠道销售(出海品牌)」（半角）。
+      按标题**精确相等**去重，同一个职位会建出两行——前端候选人页的「职位」列
+      看起来就是重名，`job_quota_status` 还会把额度拆到两行上。
+      （2026-10-15 真机换号后实测撞上，就是 id=1 / id=8 那一对。）
+
+    ★ 去重**必须始终带 account_id**：两个号可以有同名职位（账号 3 的
+      「海外ToB渠道销售（出海品牌）」与账号 1 的同名职位是**两个不同的职位**）。
+    """
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", title)).strip().casefold()
+
 
 # 分类顺序有讲究：薪资要先判，否则「25-45k」里的连字符会被当成地点。
 _SALARY_RE = re.compile(r"\d+\s*[-~]\s*\d+\s*[kK]|\d+\s*[kK]")
@@ -92,8 +110,10 @@ def sync_scanned_jobs(
     with SessionLocal() as session:
         # 去重键与 job_upsert 保持一致：(account_id, title) 精确相等。
         # 两个号可以有同名职位，各建各的。
+        # ★ 按**归一标题**索引，不是原始标题——见 norm_title 的 docstring。
+        #   命中时沿用库里那一行的标题（不改成手机上的写法）：标题可能是用户自己设的。
         existing = {
-            job.title: job
+            norm_title(job.title): job
             for job in session.execute(
                 select(Job).where(Job.account_id == account_id)
             ).scalars()
@@ -110,7 +130,8 @@ def sync_scanned_jobs(
             fields = {
                 k: (v or None) for k, v in parse_details(str(item.get("details") or "")).items()
             }
-            job = existing.get(title)
+            key = norm_title(title)
+            job = existing.get(key)
 
             if job is None:
                 job = Job(
@@ -121,7 +142,7 @@ def sync_scanned_jobs(
                     **fields,
                 )
                 session.add(job)
-                existing[title] = job  # 同一次扫描里的重名卡片只建一条
+                existing[key] = job  # 同一次扫描里的重名卡片只建一条
                 created += 1
                 continue
 
@@ -139,7 +160,7 @@ def sync_scanned_jobs(
 
         # 补 JD。可能是同一次调用的尾巴，也可能是 items=[] 的第二次调用。
         for title, text in (jds or {}).items():
-            job = existing.get(title)
+            job = existing.get(norm_title(title))
             if job is None:
                 continue  # 库里没这个职位就不硬塞
             if (job.jd_text or "").strip():

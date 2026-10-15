@@ -157,6 +157,97 @@ def test_rescan_fills_missing_details_only(session):
     assert (job.education, job.salary) == ("本科", "25-45k")
 
 
+def test_norm_title_folds_width_case_and_space():
+    """归一化：全角→半角、大小写、多余空白。
+
+    这层存在的唯一理由是**判「是不是同一个职位」**——猎聘 App 上显示的是全角括号，
+    库里手工建的可能是半角，精确比较会给同一个职位建两行。
+    """
+    from app.job_sync import norm_title
+
+    assert norm_title("海外ToB渠道销售（出海品牌）") == norm_title("海外ToB渠道销售(出海品牌)")
+    assert norm_title("Java  工程师") == norm_title("java 工程师")
+    assert norm_title(" 产品经理 ") == norm_title("产品经理")
+    # 不能归得太过：不同的职位名就该不同
+    assert norm_title("机械结构工程师") != norm_title("高级结构工程师")
+    assert norm_title("海外ToB渠道销售(出海品牌)") != norm_title("海外ToB渠道销售")
+
+
+def test_scanned_title_variants_do_not_create_a_duplicate(session):
+    """★ 全角/半角的同一个职位，扫描**不能**建出第二行。
+
+    2026-10-15 真机换号后实测撞上：库里已有手工建的「海外ToB渠道销售(出海品牌)」
+    （半角），扫回来的是手机上的「海外ToB渠道销售（出海品牌）」（全角）——
+    精确比较没匹配上，建了 id=8，前端候选人页的「职位」列于是出现重名，
+    配额也被拆成了 33/33/33。
+    """
+    token = uuid.uuid4().hex[:12]
+    half = f"海外ToB渠道销售(出海品牌)-{token}"
+    full = half.replace("(", "（").replace(")", "）")  # 同一个名字，只是括号换成全角
+    assert full != half
+
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": half, "details": "上海 本科 1年以上 15-30k"}])
+    result = sync_scanned_jobs(
+        DEFAULT_ACCOUNT_ID, [{"title": full, "details": "上海 本科 1年以上 15-30k"}]
+    )
+    assert result["created"] == 0, "全角括号的同一个职位又建了一行"
+
+    # 只数本次这一对（测试库里还有历次运行留下的同前缀行）
+    rows = session.execute(
+        select(models.Job).where(models.Job.title.contains(token))
+    ).scalars().all()
+    assert len(rows) == 1
+    # 命中的是库里那一行 → 标题保持原样（可能是用户自己设的），不被手机上的写法覆盖
+    assert rows[0].title == half
+
+
+def test_full_width_variant_still_fills_the_jd(session):
+    """归一命中之后，JD 要落到**已有那一行**上，而不是找不到目标。"""
+    half = _title("运营专员(海外)")
+    full = half.replace("(", "（").replace(")", "）")
+    sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [{"title": half, "details": "上海 本科"}])
+    saved = sync_scanned_jobs(DEFAULT_ACCOUNT_ID, [], jds={full: GOOD_JD}, complete={full: True})
+    assert (saved["jd_filled"], saved["jd_activated"]) == (1, 1)
+
+    job = session.execute(
+        select(models.Job).where(models.Job.title == half)
+    ).scalar_one()
+    session.commit()
+    session.refresh(job)
+    assert job.jd_text == GOOD_JD
+    assert job.status == models.JOB_STATUS_ACTIVE
+
+
+def test_job_upsert_folds_width_too(session):
+    """★ MCP 的 `job_upsert` 是同一个坑——**Pi 走的就是这条路**。
+
+    它原先是 `where(Job.title == title)` 精确匹配。猎聘上显示全角括号，
+    Pi 拿它去建岗位，而库里可能已经有半角那一行 → 又是重名 + 配额被拆。
+    """
+    import tools_mcp_server as tools
+
+    # 这个工具按「当前生效账号」写，先把默认账号摆正
+    session.execute(
+        models.Account.__table__.update()
+        .where(models.Account.id == DEFAULT_ACCOUNT_ID)
+        .values(is_active=True)
+    )
+    session.commit()
+
+    half = _title("销售经理(海外)")
+    full = half.replace("(", "（").replace(")", "）")
+
+    try:
+        first = tools.job_upsert(title=half, jd_text=GOOD_JD)
+        assert first["created"] is True
+        second = tools.job_upsert(title=full, jd_text=GOOD_JD)
+        assert second["created"] is False, "全角括号的同一个职位又建了一行"
+        assert second["id"] == first["id"]
+    finally:
+        session.execute(models.Job.__table__.delete().where(models.Job.title == half))
+        session.commit()
+
+
 def test_same_title_in_two_accounts_stays_separate(session):
     """★ 两个号可以有同名职位，各建各的。
 

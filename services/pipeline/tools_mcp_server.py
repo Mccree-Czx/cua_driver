@@ -49,7 +49,7 @@ from app.login_request import (
     mark_account_logged_in,
 )
 from app.messaging import OneMessagePerCandidateError, ensure_no_out_message
-from app.job_sync import MIN_JD_CHARS
+from app.job_sync import MIN_JD_CHARS, norm_title
 from app.models import (
     JOB_STATUS_ACTIVE,
     JOB_STATUS_DRAFT,
@@ -554,9 +554,20 @@ def job_upsert(
         status = JOB_STATUS_DRAFT
     with SessionLocal() as session:
         acct = _active_account_id(session)
-        job = session.execute(
-            select(Job).where(Job.account_id == acct, Job.title == title)
-        ).scalar_one_or_none()
+        # ★ 按**归一标题**判重，不是精确相等：猎聘上的标题用全角括号、库里手工建的
+        #   可能是半角，精确比会同一个职位建两行（2026-10-15 实测撞上）。
+        #   一个账号的职位就那么几个，取回来在 Python 侧比，代价可忽略。
+        key = norm_title(title)
+        job = next(
+            (
+                j
+                for j in session.execute(
+                    select(Job).where(Job.account_id == acct)
+                ).scalars()
+                if norm_title(j.title) == key
+            ),
+            None,
+        )
         if job is not None:
             return {"id": job.id, "created": False}
         job = Job(
