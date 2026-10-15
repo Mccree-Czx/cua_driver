@@ -281,6 +281,7 @@ def _login_payload(
         "account_name": account.name if account else None,
         "phone_masked": _mask_phone(account.phone) if account else None,
         "method": req.get("method"),
+        "mode": req.get("mode"),
         "phase": req.get("phase"),
         "resend_seq": req.get("resend_seq", 0),
         "error": req.get("error") or None,
@@ -305,11 +306,14 @@ def hr_login_request_get(
 class LoginStart(BaseModel):
     """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。
 
-    method 由用户在前端选：password = 全自动（前提是密码已存），code = 人工填一次码。
+    method: 目前只支持 code——password 已停用（见 hr_login_start 里的说明）。
+    mode:   auto = Mac 的轮询器拉起 Pi 操作手机；manual = 轮询器不碰手机，由操作者驱动。
+            前端在两种模式下完全一样，都要弹验证码框。
     """
 
     force: bool = False
     method: Literal["password", "code"] = "code"
+    mode: Literal["auto", "manual"] = "auto"
 
 
 @router.post("/accounts/{account_id}/login")
@@ -319,7 +323,7 @@ def hr_login_start(
     session: Session = Depends(get_session),
     store: Any = Depends(get_login_request),
 ) -> dict[str, Any]:
-    """发起登录：系统将代你在手机上打开猎聘、输手机号、（密码或验证码）并提交。
+    """发起登录：系统将代你在手机上打开猎聘、输手机号、点「下一步」发出验证码。
 
     前置条件由前端确认（手机上得先退出旧号），这里只校验数据面。
     """
@@ -331,10 +335,12 @@ def hr_login_start(
         raise HTTPException(
             status_code=400, detail="该账号没有登记手机号，无法登录——请先在账号管理里补录"
         )
-    if opts.method == "password" and not account.password_enc:
+    if opts.method == "password":
+        # 2026-10-15 实测：猎聘的「账号密码登录」填完点下去会弹滑块验证码，走不通。
+        # 这里给明确原因，而不是让前端猜为什么按钮点了没反应。
         raise HTTPException(
             status_code=400,
-            detail="该账号没有存密码，无法用密码登录——请先补录，或改用验证码登录",
+            detail="猎聘已不支持账号密码登录（点登录会弹滑块验证，实测走不通），请改用验证码登录",
         )
     in_flight = store.active()
     if in_flight is not None and not opts.force:
@@ -343,7 +349,7 @@ def hr_login_start(
             detail=f"已有一个登录在进行中（账号 {in_flight['account_id']}，"
             f"阶段 {in_flight['phase']}）——一部手机同一时刻只能登一个号",
         )
-    req = store.start(account_id, opts.method)
+    req = store.start(account_id, opts.method, opts.mode)
     return _login_payload(req, account)
 
 

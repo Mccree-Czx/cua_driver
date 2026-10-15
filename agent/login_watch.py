@@ -69,6 +69,7 @@ import run_round  # noqa: E402  同目录的轮次运行器（借用它的锁判
 from app.login_request import (  # noqa: E402
     LAUNCHABLE_PHASES,
     MAX_ATTEMPTS,
+    MODE_AUTO,
     PHASE_EXPIRED,
     PHASE_FAILED,
     TERMINAL_PHASES,
@@ -122,6 +123,13 @@ def main() -> int:
         return 0
 
     _write_sentinel(req)
+
+    # 人工模式：轮询器**一律不碰手机**，由操作者驱动（脚本或人工）。
+    # 但上面的哨兵照常维护——手动模式下手机同样会停在登录页，
+    # main_round 跑起来照样会误判成「掉登录」。
+    # 前端在两种模式下完全一样：照常显示进度、照常弹验证码框。
+    if req["mode"] != MODE_AUTO:
+        return 0
 
     if req["phase"] not in LAUNCHABLE_PHASES:
         # dispatched / verifying：Pi 正在跑，等它自己推进

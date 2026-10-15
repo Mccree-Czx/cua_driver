@@ -41,12 +41,22 @@ TERMINAL_PHASES = frozenset(
 )
 
 # 登录方式（用户在前端选）：
-#   password —— 全自动，不需要人；前提是密码已存且正确
-#   code     —— 无需密码，但要人工从自己手机上读一次验证码
-# 密码失败会自动降级到 code，并在 notice 里说明原因（不静默换路）。
+#   password —— 已**停用**（2026-10-15）：实测猎聘的账号密码登录点下去会弹滑块验证码，
+#               走不通。字段保留是为了把这条结论钉在数据模型里，而不是悄悄删掉。
+#   code     —— 唯一可用路径：点「下一步」后验证码自动发出，人工从自己手机上读一次
 METHOD_PASSWORD = "password"
 METHOD_CODE = "code"
 LOGIN_METHODS = frozenset({METHOD_PASSWORD, METHOD_CODE})
+DISABLED_METHODS = frozenset({METHOD_PASSWORD})
+
+# 谁驱动手机：
+#   auto   —— Mac 上的 login_watch.py 拉起 Pi 轮次去操作手机
+#   manual —— **轮询器一律不碰手机**，由操作者驱动（脚本或人工）。
+#             前端在两种模式下完全一样：照常显示进度、照常弹验证码框。
+#             存在的意义：接口不可用时仍能换号；也是运维手动接管的正当入口。
+MODE_AUTO = "auto"
+MODE_MANUAL = "manual"
+LOGIN_MODES = frozenset({MODE_AUTO, MODE_MANUAL})
 
 # 该拉起 Pi 的相位。pending = 发起，awaiting_code = 人工已填码。
 LAUNCHABLE_PHASES = frozenset({PHASE_PENDING, PHASE_AWAITING_CODE})
@@ -90,6 +100,7 @@ def _parse(raw: dict[str, str]) -> dict[str, Any]:
     out["error"] = raw.get("error") or ""
     out["notice"] = raw.get("notice") or ""
     out["method"] = raw.get("method") or METHOD_CODE
+    out["mode"] = raw.get("mode") or MODE_AUTO
     return out
 
 
@@ -126,16 +137,21 @@ class RedisLoginRequest:
 
     # —— 写 ——
 
-    def start(self, account_id: int, method: str = METHOD_CODE) -> dict[str, Any]:
+    def start(
+        self, account_id: int, method: str = METHOD_CODE, mode: str = MODE_AUTO
+    ) -> dict[str, Any]:
         """发起一次登录。会**覆盖**在途的旧请求——同一时刻只能有一个。"""
         if method not in LOGIN_METHODS:
             raise ValueError(f"未知登录方式：{method}")
+        if mode not in LOGIN_MODES:
+            raise ValueError(f"未知驱动模式：{mode}")
         now = time.time()
         key = login_req_key()
         payload = {
             "request_id": uuid.uuid4().hex,
             "account_id": account_id,
             "method": method,
+            "mode": mode,
             "phase": PHASE_PENDING,
             "code": "",
             "code_expires_at": 0,

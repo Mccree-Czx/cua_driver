@@ -89,32 +89,29 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 `mobile_open_app(packageName="com.lietou.mishu")` 打开猎聘，等渲染后 `mobile_dump_ui`，**先判断现在是什么页面**（这一步决定后面所有动作，不要跳过）：
 
 - **已是招聘首页**（底部有「职位」「消息」等 tab）→ 手机上还登着别的号。**绝不尝试登出**（自动化登出属于另一个批次，风险更高），直接 `login_req_set("failed", "手机上当前登录的是其他账号，请先在猎聘 App 里退出登录，再重新发起")`，结束本轮。
-- **是登录页**（有手机号输入框）→ 按 `login_req_get()` 返回的 `method` 走 4a-1 或 4a-2。
+- **是登录页**（有手机号输入框）→ 继续下面的「发出验证码」。
+
+#### 发出验证码（唯一路径）
+
+> **密码登录已停用**（2026-10-15 实测：填完账号密码点「登录」会弹滑块验证码，走不通）。
+> `login_map.json` 里那个 `password_login` 段落**不要用**——它是历史锚点，留作参考。
+> 唯一可用路径就是下面这条验证码登录。
+
+1. 确认当前在 `login_map.json` 的 `login_page_anchor`（「手机号登录/注册」）页；
+   不在就用 `password_login.back_to_code_login` 切回。
+2. tap `phone_login.phone_field` → `login_fill_phone()` → **必须确认 `ok=true` 且 `verified=true`**。
+   `verified=false` 说明号码没真正上屏，**停下报失败**，不要接着往下走。
+   （登录页的手机号是**预填**的，工具会先清空再输——直接敲会变成两个号粘一起。）
+3. 勾协议（见 4x 的「按钮点不动就先勾协议」）。
+4. `login_req_set("dispatched")` → 点 `next_button`（「下一步」）→ 等渲染 → dump。
+5. **不要去找「获取验证码」按钮**——登录页没有这个按钮。实测点完「下一步」验证码就
+   **自动发出**，界面直接跳到「输入验证码」页（标题「验证码已发送到+86 …」+ 倒计时）。
+   dump 确认确实进了这个页面。
+6. 确认无误后 `login_req_set("awaiting_code")`，**本轮结束**。
+   **不要等待验证码、不要轮询、不要反复 dump**。验证码发到的是用户自己的另一台手机，
+   Pi 物理上等不到；把控制权交回前端，用户填码后会有新的一轮。
 - **出现「图形验证码」「猎聘安全中心」「账号行为异常」** → 按铁律 3：`risk_set()` → `login_req_set("failed", "遇到风控验证，需人工处理")` → 结束。
 - **其它不认识的页面** → 重新 dump 一次；仍不认识 → `login_req_set("failed", "停在无法识别的页面：<把你看到的关键文本写进来>")`。
-
-#### 4a-1. `method = password`（全自动，不需要人工）
-
-1. 点 map 里 `password_login.entry`（「密码登录」）切到「账号密码登录」页，dump 确认标题变成 `password_login.title_anchor`。
-2. tap 手机号框 → `login_fill_phone()` → 确认 `ok=true` 且 `verified=true`。**`verified=false` 就停下报失败**，不要接着往下走。
-3. tap 密码框 → `login_fill_password()` → 只确认 `ok=true`。**返回值里的任何内容都不得复述、不得转述**（它只回长度，但这条规矩要守住）。
-4. 勾协议（见 4x）。
-5. `login_req_set("dispatched")` → tap map 里的 `login_button`（「登录」）→ 等渲染 → dump。
-6. 判定：
-   - **进入招聘首页** → `login_req_set("success")`，结束。该工具会自动写登录态并把这个号置为系统生效账号。
-   - **提示密码错误 / 账号密码不匹配** → **在同一轮内降级**：点 `back_to_code_login` 切回手机号登录页，接着走 4a-2 的第 3 步起；最终置相位时**必须带上原因**：`login_req_set("awaiting_code", "密码登录失败（密码错误或已过期），已改用验证码")`。**绝不静默换路**——用户选的是密码登录，换了方式就得告诉他。
-   - **出现图形验证码 / 风控页** → 铁律 3：`risk_set()` + `login_req_set("failed", ...)`。**这种情况不降级、不重试**——风控下再操作只会更糟。
-   - 其它 → 重新 dump 一次；仍无法判定 → `login_req_set("failed", "密码登录后停在无法识别的页面：<关键文本>")`。
-
-#### 4a-2. `method = code`（需要人工从自己手机上读一次码）
-
-1. 确认当前在「手机号登录/注册」页；不在就点 `back_to_code_login` 切回。
-2. tap 手机号框 → `login_fill_phone()` → 确认 `ok=true` 且 `verified=true`。
-3. 勾协议（见 4x）。
-4. `login_req_set("dispatched")` → 点 `next_button`（「下一步」）→ dump 确认进入验证码页。
-5. 点「获取验证码」（或「重新获取」）。**每轮只点一次**；`resend_seq > 0` 说明用户点了重发，**仍然只点一次**，绝不连点——那是风控画像里最显眼的动作之一。
-6. dump 确认界面进入验证码等待态（出现验证码输入框或倒计时）→ `login_req_set("awaiting_code")`，**本轮结束**。
-   **不要等待验证码、不要轮询、不要反复 dump**。验证码发到的是用户自己的另一台手机，Pi 物理上等不到；把控制权交回前端，用户填码后会有新的一轮。
 
 ### 4b. `phase = awaiting_code`——把人工填的码提交掉
 

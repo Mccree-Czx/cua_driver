@@ -37,7 +37,6 @@ from PIL import Image, ImageChops
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.crypto import CredentialCryptoError, decrypt_secret
 from app.db import SessionLocal
 from app.keys import login_state_key, msg_touch_key, risk_pause_key
 from app.login_request import (
@@ -616,8 +615,76 @@ def adb_selftest() -> dict:
     }
 
 
-# 清空焦点框用的退格序列。一次 keyevent 传多个键码，省掉几十次 adb 往返。
-_DEL_KEYS = ["KEYCODE_DEL"] * 40
+def _ui_edittexts(xml: str) -> list[dict]:
+    """界面上所有 EditText，带文字与边界。"""
+    out = []
+    for node in re.findall(r"<node\b[^>]*>", xml):
+        if 'class="android.widget.EditText"' not in node:
+            continue
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", ""))
+        if not match:
+            continue
+        x1, y1, x2, y2 = map(int, match.groups())
+        out.append(
+            {
+                "text": html.unescape(attrs.get("text", "")),
+                "focused": attrs.get("focused") == "true",
+                "bounds": (x1, y1, x2, y2),
+                "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+            }
+        )
+    return out
+
+
+def _clear_button_near(xml: str, field: dict) -> tuple[int, int] | None:
+    """输入框右侧那个清除小×。
+
+    它是 Flutter 的 ImageView，**无文字且 clickable=false**——不能按 clickable 过滤，
+    只能按「与输入框垂直重叠、且在其右边缘附近」来找。
+    """
+    x1, y1, x2, y2 = field["bounds"]
+    for node in re.findall(r"<node\b[^>]*>", xml):
+        if "ImageView" not in node:
+            continue
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", attrs.get("bounds", ""))
+        if not match:
+            continue
+        a, b, c, d = map(int, match.groups())
+        cx, cy = (a + c) // 2, (b + d) // 2
+        if x1 < cx <= x2 + 130 and y1 - 40 <= cy <= y2 + 40:
+            return (cx, cy)
+    return None
+
+
+def _clear_focused_field() -> bool:
+    """清空当前焦点输入框；返回是否确实空了。
+
+    **不能用连发的退格。** 猎聘是 Flutter，实测一次发 40 个 `KEYCODE_DEL` 只生效 7 个，
+    连发 15 个则**一个都不生效**——而单个退格是有效的。原因就是 Flutter 丢弃快速连续
+    的按键。（这条在原生 EditText 的「设置」搜索框上验不出来：那里没有这个问题，
+    所以最早那版「一次发 40 个」的写法看起来是好的。）
+    所以：优先点输入框自带的清除小×，找不到才逐个慢速退格。
+    """
+    for _ in range(3):
+        xml = _ui_dump()
+        fields = [f for f in _ui_edittexts(xml) if f["focused"]]
+        if not fields:
+            return False
+        field = fields[0]
+        if not field["text"]:
+            return True
+        clear = _clear_button_near(xml, field)
+        if clear:
+            _adb_shell("input", "tap", str(clear[0]), str(clear[1]))
+            time.sleep(1.0)
+            continue
+        for _ in range(14):
+            _adb_shell("input", "keyevent", "KEYCODE_DEL")
+            time.sleep(0.3)
+    fields = [f for f in _ui_edittexts(_ui_dump()) if f["focused"]]
+    return bool(fields) and not fields[0]["text"]
 
 
 def _type_into_focused(text: str) -> dict:
@@ -625,22 +692,15 @@ def _type_into_focused(text: str) -> dict:
 
     **必须先清空**：`input text` 是追加不是覆盖，而猎聘登录页的手机号是**预填**的
     （App 记住了上次的号）。直接敲就会变成两个号粘在一起——而且不会报错，
-    只会在点登录之后才以「账号不存在」的形式暴露。
+    只会在点下一步之后才以「账号不存在」的形式暴露。
 
-    清空用 `input keyevent` 一次传多个键码（Android 的 input 支持多键），
-    比循环发 40 次 adb 快一个数量级。
-
-    传入文本必须走 shlex.quote：`adb shell` 会把命令字符串交给设备端的 sh 重新解析，
-    裸拼就是命令注入——而密码里出现 `& | ; $ 反引号` 一点都不罕见。
-    空格还要先换成 `%s`，那是 `input text` 自己的转义；不换的话设备端 sh 会把它
-    当成参数分隔符，`input text` 只拿到第一个词。
+    文本走 shlex.quote：`adb shell` 会把命令字符串交给设备端的 sh 重新解析，
+    裸拼就是命令注入。空格要先换成 `%s`，那是 `input text` 自己的转义；
+    不换的话设备端 sh 会把它当成参数分隔符，`input text` 只拿到第一个词。
     """
     try:
-        subprocess.run(
-            [ADB, "shell", "input", "keyevent", "KEYCODE_MOVE_END", *_DEL_KEYS],
-            capture_output=True,
-            timeout=30,
-        )
+        if not _clear_focused_field():
+            return {"ok": False, "reason": "clear_failed"}
         result = subprocess.run(
             [ADB, "shell", "input", "text", shlex.quote(text.replace(" ", "%s"))],
             capture_output=True,
@@ -659,13 +719,8 @@ def _focused_edittext_text() -> str | None:
     只认 EditText：dump 里 SearchView 排在它前面，而 SearchView 的 `text`
     **永远是空串**——按类名一起匹配会永远读到空（实测踩过这个坑）。
     """
-    xml = _ui_dump()
-    for node in re.findall(r"<node\b[^>]*>", xml):
-        if 'class="android.widget.EditText"' not in node:
-            continue
-        match = re.search(r'text="([^"]*)"', node)
-        return html.unescape(match.group(1)) if match else ""
-    return None
+    fields = [f for f in _ui_edittexts(_ui_dump()) if f["focused"]]
+    return fields[0]["text"] if fields else None
 
 
 def _login_account(account_id: int | None) -> tuple[int | None, str]:
@@ -701,38 +756,6 @@ def login_fill_phone(account_id: int | None = None) -> dict:
         return {"ok": False, "reason": typed["reason"]}
     # 数字框的 text 可读，回读校验是真的校验
     return {"ok": True, "typed_len": len(phone), "verified": _focused_edittext_text() == phone}
-
-
-@mcp.tool()
-def login_fill_password(account_id: int | None = None) -> dict:
-    """把账号密码敲进手机**当前焦点的输入框**。
-
-    **本工具永不接受密码作为参数**——这是刻意的，不是省事。Pi 的完整输出会落进
-    `.round_login_round.log`，任何进过 LLM 上下文的东西都会留在那里；密码只在本
-    工具内部解密后直接交给 adb，明文既不进上下文也不进日志。
-
-    只回**长度**，永不回内容。密码框是 `password=true`，uiautomator 读回来的
-    text 恒为空，所以密码无法回读校验——`verified` 恒为 false，这是设计而非缺陷。
-    失败时回 {ok: false, reason}，reason ∈ {no_request, no_account, no_password,
-    key_missing, decrypt_failed, input_failed}。**不要把返回值转述进汇报。**
-    """
-    acct_id, err = _login_account(account_id)
-    if err:
-        return {"ok": False, "reason": err}
-    with SessionLocal() as session:
-        enc = session.get(Account, acct_id).password_enc
-    if not enc:
-        return {"ok": False, "reason": "no_password"}
-    try:
-        password = decrypt_secret(enc)
-    except CredentialCryptoError:
-        return {"ok": False, "reason": "key_missing"}
-    except Exception:  # noqa: BLE001  解密失败不该把异常栈漏给 LLM
-        return {"ok": False, "reason": "decrypt_failed"}
-    typed = _type_into_focused(password)
-    if not typed["ok"]:
-        return {"ok": False, "reason": typed["reason"]}
-    return {"ok": True, "typed_len": len(password), "verified": False}
 
 
 @mcp.tool()

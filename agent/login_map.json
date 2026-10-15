@@ -1,5 +1,5 @@
 {
-  "_说明": "猎聘 App 登录/退出相关界面的实测锚点。存成文件而不是写进 rounds.md：App 升级只改这里，提示词保持稳定 = 缓存友好、Pi 不易跑偏。坐标基于 1080x2244。",
+  "_说明": "猎聘 App 登录/退出相关界面的实测锚点。存成文件而不是写进 rounds.md：App 升级只改这里，提示词保持稳定。坐标基于 1080x2244。",
   "app": {
     "package": "com.lietou.mishu",
     "version_code": 13120,
@@ -7,13 +7,15 @@
   },
   "probe": {
     "at": "2026-10-15",
-    "by": "adb 直接探查（只 dump 与导航，未输入任何字符、未确认任何退出）",
-    "note": "登录页部分于 2026-10-14 探得（当时生产号恰好自然过期，无需登出即可看到）；退出登录部分于 2026-10-15 在登录态下补探。"
+    "by": "adb 直接探查 + 一次手动驱动换号演练（登出 → 验证码登录 → 再登出）",
+    "note": "登录页锚点 2026-10-14 探得（当时生产号自然过期）；退出登录 2026-10-15 登录态下补探；登录/退出的完整链路 2026-10-15 手动走通。"
   },
 
   "★通用教训": {
     "flutter_图标不可按_clickable_过滤": "猎聘的图标按钮在无障碍树里常常「无文字 + clickable=false」，但实际能点。只按 clickable 或文字过滤会漏掉它们——「我的」页右上角的设置图标就是这么漏了三轮的。",
-    "webview_不吃滑动": "「我的」页是 WebView，uiautomator 的 swipe 滑不动它。要到下一页得用它自己的入口。",
+    "定位按钮必须精确匹配文字": "用「包含『登录』」去找按钮，会匹配到页面标题「账号密码登录」，点了个标题。必须 text == '登录' 精确匹配。",
+    "flutter_输入框丢弃连发退格": "一次发 40 个 KEYCODE_DEL 只生效 7 个；连发 15 个则一个都不生效。**单个退格有效**。清空优先用输入框自带的清除小×（一次点击），不行才逐个慢速退格。",
+    "webview_不吃滑动": "「我的」页是 WebView，uiautomator 的 swipe 滑不动它。",
     "确认框一律用_BACK": "对对话框，BACK 等价于取消且没有坐标风险。真正的风险不是点击本身，是「取消」按钮定位错而误触「确定」。"
   },
 
@@ -24,49 +26,62 @@
       "dismiss": { "match": "确定", "center": [540, 1262] }
     },
     "login_page_anchor": { "match": "手机号登录/注册", "center": [540, 1079] },
+
     "phone_login": {
       "phone_field": { "center": [640, 838], "prefilled": true,
+                       "clear_button": { "center": [888, 838],
+                                         "note": "无文字 clickable=false 的 ImageView，只能按坐标/邻近找" },
                        "注意": "预填！input text 是追加不是覆盖，直接敲会变成两个号粘一起" },
       "agree_checkbox": { "center": [307, 1057] },
-      "next_button": { "match": "下一步", "center": [540, 1282], "disabled_until_agreed": true }
+      "next_button": { "match": "下一步", "center": [540, 1282], "disabled_until_agreed": true },
+      "★没有获取验证码按钮": "实测：点完「下一步」验证码**自动发出**，界面直接跳到「输入验证码」页（标题「验证码已发送到+86 …」+ 倒计时）。不要去找「获取验证码」，找不到。"
     },
-    "password_login_available": true,
-    "password_login": {
+
+    "code_entry_page": {
+      "anchor": "验证码已发送到",
+      "code_field": { "center": [540, 784] },
+      "resend": { "match": "重新获取", "note": "倒计时结束后才出现" },
+      "success_anchor": "完成认证获取专属招聘权益",
+      "success_note": "新账号登录后会落到「创建招聘名片」引导页；已有账号直接进招聘首页（底部有 推荐/职位/我的）"
+    },
+
+    "password_login_available": false,
+    "password_login_disabled_reason": "2026-10-15 实测：手机号与密码都正确填入、协议已勾，点「登录」后**弹出滑块验证码**（Web 验证码 / 拖动下方滑块完成拼图）。**已停用**；backend 对 method=password 直接 400。",
+    "password_login_anchors_kept_as_reference": {
+      "_用途": "仅作历史参考，不要在流程里用",
       "entry": { "match": "密码登录", "center": [198, 1420] },
       "title_anchor": { "match": "账号密码登录", "center": [306, 410] },
-      "phone_field": { "center": [502, 805], "password": false },
-      "password_field": { "center": [457, 1003], "password": true,
-                          "bounds": [162, 931, 753, 1075] },
+      "phone_field": { "center": [502, 805] },
+      "password_field": { "center": [457, 1003], "password": true },
       "agree_checkbox": { "center": [138, 1225] },
-      "login_button": { "match": "登录", "center": [540, 1447] },
-      "back_to_code_login": { "match": "手机号登录/注册", "center": [274, 1585] },
-      "forgot_password": { "match": "找回密码", "center": [882, 1585] }
+      "login_button": { "match": "登录", "center": [540, 1447] }
     },
-    "captcha_seen": false,
-    "captcha_note": "尚未走完一次真实登录，图形验证码/滑块是否会出现仍是未知。铁律 3 仍然生效：出现即停 + risk_set()。"
+
+    "captcha_seen": true,
+    "captcha_note": "滑块验证码已在密码登录路径上真实出现。铁律 3 生效：出现即停手 + risk_set()，绝不尝试绕过。"
   },
 
   "退出": {
     "switch_account_exists": false,
     "switch_account_note": "已翻遍「我的」页与设置页，**没有「切换账号」入口**。换号必须走「退出登录 → 登录新号」两步。",
-    "logout_path": [
+    "logout_requires_2fa": false,
+    "logout_2fa_note": "退出确认框只有「取消/确定」两个按钮，**不需要短信或图形验证**。",
+    "logout_path_已登录态": [
       { "step": "打开底部「我的」tab", "center": [945, 2122] },
       { "step": "点右上角设置图标", "center": [1005, 151],
         "注意": "该图标无文字且 clickable=false，只能按坐标点" },
-      { "step": "在设置页最底部点「退出登录」", "center": [540, 2044] }
+      { "step": "在设置页最底部点「退出登录」", "center": [540, 2044] },
+      { "step": "确认框点「确定」", "center": [751, 1229] }
     ],
-    "logout_confirm_dialog": {
-      "title": "是否退出登录",
-      "cancel": { "center": [329, 1229], "bounds": [120, 1151, 539, 1307] },
-      "confirm": { "center": [751, 1229], "bounds": [542, 1151, 960, 1307] }
-    },
-    "logout_requires_2fa": false,
-    "logout_2fa_note": "退出确认框只有「取消/确定」两个按钮，**不需要短信或图形验证**。这是「自动登出」能成立的前提。",
+    "logout_path_新账号引导页": [
+      { "step": "点「更多操作」", "center": [144, 1341] },
+      { "step": "点「退出登录」", "note": "同一个菜单里还有「我要找工作」，会把账号切到求职者端，**绝不能碰**" }
+    ],
     "★危险邻居": {
-      "注销账号": "设置页里「修改密码」「注销账号」「清除缓存」「退出登录」是相邻项，而**「注销账号」是删号**——点错的代价是灾难性的。自动登出必须按坐标精确点击，且在任何不确定的情况下停手报告，绝不试探。"
+      "注销账号": "设置页里「修改密码」(540,1539)「注销账号」(540,1703)「清除缓存」(540,1866)「退出登录」(540,2044) 是相邻项，而**「注销账号」是删号**——点错的代价是灾难性的。必须按坐标精确点击，且在任何不确定的情况下停手报告，绝不试探。"
     }
   },
 
   "rollback_verified": null,
-  "rollback_note": "回滚能力尚未在真机验证过。验证前不允许自动登出（见 plan 的 rollback_verified 能力门）。"
+  "rollback_note": "回滚能力尚未在真机验证过。验证前不允许自动登出。"
 }

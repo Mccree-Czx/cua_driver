@@ -18,6 +18,7 @@ type Phase =
 type Progress = {
   phase: Phase;
   method?: "password" | "code" | null;
+  mode?: "auto" | "manual" | null;
   account_id?: number | null;
   account_name?: string | null;
   phone_masked?: string | null;
@@ -111,8 +112,8 @@ export default function LoginWizard({
     setErr(null);
   }
 
-  async function start(method: "password" | "code") {
-    await post(`/api/hr/accounts/${account.id}/login`, { method });
+  async function start(method: "password" | "code", mode: "auto" | "manual") {
+    await post(`/api/hr/accounts/${account.id}/login`, { method, mode });
   }
 
   const phase = progress.phase;
@@ -152,37 +153,42 @@ export default function LoginWizard({
           <div className="account-form">
             <Button
               type="primary"
-              disabled={!confirmed || !account.has_password}
+              disabled={!confirmed}
               loading={busy}
-              title={
-                account.has_password ? undefined : "该账号还没存密码，请先在账号管理里补录"
-              }
-              onClick={() => void start("password")}
+              onClick={() => void start("code", "auto")}
             >
-              密码登录（全自动）
+              验证码登录（系统操作手机）
             </Button>
-            <Button disabled={!confirmed} loading={busy} onClick={() => void start("code")}>
-              验证码登录（要填一次码）
+            {/* 置灰而不是删掉：让用户看得到「这条路为什么不能走」，而不是以为我们忘了做 */}
+            <Button
+              disabled
+              title="点「登录」会弹滑块验证码，实测走不通（2026-10-15）"
+            >
+              密码登录（已停用）
             </Button>
           </div>
           <p className="account-form-hint">
-            密码登录不用你管，但前提是密码已存且没改过；验证码登录不需要密码，
-            代价是你要从自己手机上读一次码填进来。
-            <b>密码登录失败会自动改用验证码，并告诉你原因。</b>
+            系统会在手机上打开猎聘、输好手机号、发出验证码，
+            <b>然后这里会弹出输入框让你填</b>。
+            <br />
+            密码登录已停用——猎聘的账号密码登录点下去会弹滑块验证，走不通。
           </p>
+          <Button size="small" type="text" disabled={!confirmed} onClick={() => void start("code", "manual")}>
+            改用手动模式（系统不碰手机，由我或脚本操作）
+          </Button>
         </>
       )}
 
-      {shown === "pending" && <Step text="正在手机上打开猎聘…" />}
-      {shown === "dispatched" && (
+      {shown === "pending" && (
         <Step
           text={
-            progress.method === "password"
-              ? "正在用密码登录…"
-              : "正在输入手机号并获取验证码…"
+            progress.mode === "manual"
+              ? "手动模式：请在手机上退出旧号并停在登录页，然后由操作者驱动…"
+              : "正在手机上打开猎聘…"
           }
         />
       )}
+      {shown === "dispatched" && <Step text="正在输入手机号并发出验证码…" />}
       {shown === "verifying" && <Step text="已收到验证码，正在提交…" />}
 
       {/* 过程说明（黄条）：例如「密码登录失败，已改用验证码」。

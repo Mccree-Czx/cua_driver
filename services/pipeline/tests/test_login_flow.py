@@ -186,26 +186,47 @@ def test_note_goes_to_notice_unless_failed(store):
     assert req["notice"] == ""  # 落终态失败时，过程提示要让位给结论
 
 
-def test_api_rejects_password_login_without_stored_password(client, made, session):
+def test_api_rejects_disabled_password_login(client, made):
+    """密码登录已停用（2026-10-15）：猎聘点「登录」会弹滑块验证码，实测走不通。
+
+    这里保留 method 字段并给明确原因，而不是从 schema 里删掉——让调用方知道
+    「为什么不能走」，而不是收到一个看不懂的 422。
+    """
     acct = _new_account(client, made)
-    session.execute(
-        models.Account.__table__.update()
-        .where(models.Account.id == acct["id"])
-        .values(password_enc=None)
-    )
-    session.commit()
     resp = client.post(
         f"/api/hr/accounts/{acct['id']}/login", json={"method": "password"}
     )
     assert resp.status_code == 400, resp.text
-    assert "没有存密码" in resp.json()["detail"]
+    assert "滑块" in resp.json()["detail"]
+
+
+def test_api_records_driver_mode(client, made):
+    """mode 决定谁驱动手机：auto = Pi，manual = 轮询器一律不碰。
+
+    两种模式下前端完全一样；区别只在 login_watch 会不会拉起轮次。
+    """
+    acct = _new_account(client, made)
+    client.post(
+        f"/api/hr/accounts/{acct['id']}/login",
+        json={"method": "code", "mode": "manual"},
+    )
+    assert client.get("/api/hr/accounts/login-request").json()["mode"] == "manual"
+
+
+def test_api_rejects_unknown_mode(client, made):
+    acct = _new_account(client, made)
+    resp = client.post(
+        f"/api/hr/accounts/{acct['id']}/login",
+        json={"method": "code", "mode": "carrier_pigeon"},
+    )
+    assert resp.status_code == 422, resp.text
 
 
 def test_api_returns_method(client, made):
     acct = _new_account(client, made)
-    client.post(f"/api/hr/accounts/{acct['id']}/login", json={"method": "password"})
+    client.post(f"/api/hr/accounts/{acct['id']}/login", json={"method": "code"})
     body = client.get("/api/hr/accounts/login-request").json()
-    assert body["method"] == "password"
+    assert body["method"] == "code"
     assert body["notice"] is None
 
 
@@ -311,19 +332,30 @@ def test_login_req_set_rejects_unknown_phase(client, made, hr_tools_on_test_redi
     assert tools.login_req_set("乱写的相位")["ok"] is False
 
 
-def test_fill_tools_never_accept_a_password_parameter():
+def test_no_tool_accepts_a_credential_parameter():
     """把设计约束变成可执行约束。
 
-    密码只能由工具内部解密后直接投递给 adb。一旦有人给这些工具加了密码入参，
-    Pi 就会把明文放进上下文——而它的完整 stdout 会落进 `.round_login_round.log`，
-    等于把密码写进磁盘。这条断言就是为了在那一天拦住它。
+    凭据只能由工具内部解密后直接投递给 adb。一旦有人给工具加了密码入参，Pi 就会把
+    明文放进上下文——而它的完整 stdout 会落进 `.round_login_round.log`，等于把密码
+    写进磁盘。这条断言扫**所有**注册的 hr-tools，不只看登录那几个。
+
+    （`login_fill_password` 已于 2026-10-15 删除：猎聘的密码登录会弹滑块验证码，
+    这条路实测走不通，工具随之成了死代码。）
     """
     import inspect
 
     forbidden = {"password", "secret", "pwd", "passwd", "credential", "token"}
-    for fn in (tools.login_fill_phone, tools.login_fill_password):
+    offenders = {}
+    for name in dir(tools):
+        fn = getattr(tools, name)
+        if name.startswith("_") or not callable(fn) or not hasattr(fn, "__wrapped__"):
+            continue
+        if getattr(fn, "__module__", "") != "tools_mcp_server":
+            continue
         leaked = set(inspect.signature(fn).parameters) & forbidden
-        assert not leaked, f"{fn.__name__} 出现了可传入的凭据参数：{leaked}"
+        if leaked:
+            offenders[name] = leaked
+    assert not offenders, f"这些工具出现了可传入的凭据参数：{offenders}"
 
 
 def test_success_writes_login_state_and_activates(client, made, session, hr_tools_on_test_redis):
