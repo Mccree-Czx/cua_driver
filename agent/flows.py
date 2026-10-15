@@ -180,10 +180,20 @@ def submit_code(code: str) -> dict[str, Any]:
 # （2026-10-15 真机第二次跑就栽在这儿。）
 _LOGGED_OUT_MARKERS = ("手机号登录", "验证码已发送", "服务协议及个人信息保护")
 
+# 新账号的入职引导页。**它是一串页面，不是一页**——"创建招聘名片" → "请填写公司名称" → …
+# 只认第一页会在第二页上判错分支（2026-10-15 第三次跑就这样把 App 退到了桌面）。
+# 这几页共同的特征是有「更多操作」（退出登录的入口藏在那儿）。
+_ONBOARDING_MARKERS = ("创建招聘名片", "完成认证", "更多操作", "请填写公司名称")
+
 
 def _is_logged_out_screen(xml: str) -> bool:
     joined = " ".join(phone.texts(xml))
     return any(marker in joined for marker in _LOGGED_OUT_MARKERS)
+
+
+def _is_onboarding(xml: str) -> bool:
+    joined = " ".join(phone.texts(xml))
+    return any(marker in joined for marker in _ONBOARDING_MARKERS)
 
 
 def logout(*, agree: bool = False) -> dict[str, Any]:
@@ -206,8 +216,9 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
     if _is_logged_out_screen(xml):
         return {"ok": True, "already_logged_out": True}
 
-    # 新账号引导页也没有底部导航，且有自己的退出入口
-    if "创建招聘名片" in " ".join(phone.texts(xml)):
+    # 新账号引导页也没有底部导航，且有自己的退出入口（藏在「更多操作」里）。
+    # ★ 引导页是一串页面，不是一个——用它自己的特征判，别只认第一页。
+    if _is_onboarding(xml):
         more = phone.find_exact(xml, "更多操作") or phone.find(xml, "更多操作")
         if not more:
             raise FlowMismatch("退出", "引导页上找不到「更多操作」", phone.texts(xml))
