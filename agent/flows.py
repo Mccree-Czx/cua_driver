@@ -155,11 +155,23 @@ def submit_code(code: str) -> dict[str, Any]:
     seen = phone.texts(xml)
     joined = " ".join(seen)
 
-    if any(k in joined for k in ("推荐", "职位", "我的")) or "创建招聘名片" in joined:
-        return {"ok": True, "landed": seen[:6]}
     if any(k in joined for k in ("验证码错误", "已失效", "不正确")):
         raise FlowMismatch("提交验证码", "验证码被拒", seen)
-    raise FlowMismatch("提交验证码", "停在无法识别的页面", seen)
+
+    # ★ 判据用「**离开了验证码页**」而不是「看到了某个特定页面」。
+    #   验证码页只在成功后才会消失（失败会停在原地或退回登录页），
+    #   而成功之后落到哪一页是不确定的：
+    #     - 已有账号 → 招聘首页（推荐/职位/我的）
+    #     - **新账号 → 入职引导，一页一页往下走**（"创建招聘名片" → "请填写公司名称" → …）
+    #   2026-10-15 就是在这儿误判的：验证码明明被接受、账号已经登进去，
+    #   只因为那一页叫「请填写公司名称」不在我的白名单里，就报了「停在无法识别的页面」。
+    if "验证码已发送" in joined:
+        raise FlowMismatch("提交验证码", "仍停在验证码页——码可能没提交上去", seen)
+    if "手机号登录" in joined:
+        raise FlowMismatch("提交验证码", "退回了登录页——登录没成", seen)
+
+    onboarding = "创建招聘名片" in joined or "请填写" in joined or "完成认证" in joined
+    return {"ok": True, "landed": seen[:6], "onboarding": onboarding}
 
 
 # 已经登出时会看到的几种页面。**不能只认登录页**——协议页和验证码页同样是登出态。
