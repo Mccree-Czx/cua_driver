@@ -193,6 +193,35 @@ def open_app(package: str, settle: float = 6.0) -> None:
     time.sleep(settle)
 
 
+# 底部导航的三个 tab。**出现两个以上**才算「在主界面」——只认一个会被
+# 页面里碰巧出现的同名文字骗过。
+MAIN_TAB_MARKERS = ("推荐", "职位", "我的")
+
+
+def ensure_main_tabs(package: str, max_back: int = 5, settle: float = 6.0) -> dict[str, Any]:
+    """退到带底部导航的主界面。
+
+    固定序列都假设 App 在**主界面**上，但手机可能停在任何页面——会话页、候选人详情页、
+    职位页……那是上一轮留下的，不可预测。
+
+    2026-10-15 第一次真机运行就栽在这儿：`logout()` 上来就点「我的」tab 的坐标 (945,2122)，
+    而 App 被上一轮留在了**会话页**，那里没有底部导航，那一下打到了别处。
+    所幸步骤校验发现「不是我的页」就停手了——否则那一下会落在一个**真实候选人的会话页**上，
+    而那种页面一屏之内就有「不合适」「看简历」这类会真实影响候选人的按钮。
+
+    退不到就如实返回，绝不猜。
+    """
+    home()
+    open_app(package, settle=settle)
+    for attempt in range(max_back + 1):
+        xml = dump()
+        marks = [m for m in MAIN_TAB_MARKERS if find_exact(xml, m)]
+        if len(marks) >= 2:
+            return {"ok": True, "attempts": attempt, "marks": marks}
+        back()
+    return {"ok": False, "seen": texts(dump())}
+
+
 def clear_button_near(xml: str, field: dict[str, Any]) -> tuple[int, int] | None:
     """输入框右侧那个清除小×。
 

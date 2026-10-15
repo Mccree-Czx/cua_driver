@@ -24,6 +24,10 @@ import run_round  # noqa: E402
 
 TEST_REDIS_URL = "redis://127.0.0.1:6379/15"
 
+# 抢占的打桩状态。**绝不能让它真的去杀进程**——这些测试跑在 pytest 自己的进程里，
+# 而「撞锁」的测试把 pytest 的 PID 写进了锁文件；真跑抢占会把测试进程本身 SIGTERM 掉。
+PREEMPT = {"ok": True, "count": 0}
+
 
 @pytest.fixture()
 def watch(monkeypatch, tmp_path):
@@ -47,6 +51,15 @@ def watch(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(login_watch.phone, "home", lambda *a, **k: None)
     monkeypatch.setattr(login_watch, "mark_account_logged_in", lambda _id: None)
+
+    PREEMPT["ok"] = True
+    PREEMPT["count"] = 0
+
+    def _fake_preempt() -> bool:
+        PREEMPT["count"] += 1
+        return PREEMPT["ok"]
+
+    monkeypatch.setattr(login_watch, "_preempt_round", _fake_preempt)
 
     yield store, calls, tmp_path
     store.clear()
@@ -127,13 +140,28 @@ def test_in_progress_keeps_sentinel_but_does_not_launch(watch):
     assert store.get()["attempts"] == 0
 
 
-def test_does_not_burn_attempt_when_another_round_is_running(watch):
-    """撞上轮次锁**不算**一次尝试。
+def test_preempts_the_round_in_flight_and_drives(watch):
+    """用户当场发起的登录比定时轮次更急 —— 撞上轮次在跑就**抢占**，而不是排队等。
 
-    否则连续三次撞锁就会把用户一次正常的登录判死——这正是「先 bump 再判断」的写法
-    会踩的坑。
+    等一轮可能要几十分钟（接口降级时今天有过 47 分钟的一轮），用户点一下不该等那么久。
     """
     store, calls, tmp_path = watch
+    store.start(account_id=7)
+    _hold_round_lock(tmp_path)
+
+    assert login_watch.main() == 0
+    assert PREEMPT["count"] == 1                       # 确实去抢了
+    assert calls == [("login_code", "13800000000")]     # 抢到后照常驱动
+    assert store.get()["phase"] == "awaiting_code"
+
+
+def test_gives_up_without_burning_attempt_when_preempt_fails(watch):
+    """抢不到就本轮放弃，**且不计尝试次数**。
+
+    否则三次抢不到就把用户一次正常的登录判死了——这和以前「撞锁不计」是同一个道理。
+    """
+    store, calls, tmp_path = watch
+    PREEMPT["ok"] = False
     store.start(account_id=7)
     _hold_round_lock(tmp_path)
 

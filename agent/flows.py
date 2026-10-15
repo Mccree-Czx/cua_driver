@@ -47,7 +47,11 @@ def _guard_risk(xml: str, step: str) -> None:
 
 
 def _ensure_login_page(agree: bool) -> str:
-    """确保停在「手机号登录/注册」页；顺带处理可能冒出来的独立协议同意页。"""
+    """确保停在「手机号登录/注册」页；顺带处理可能冒出来的独立协议同意页。
+
+    **这里不调 `ensure_main_tabs`**：登录页本身就没有底部导航，那样会把好好的状态
+    当成「退不回主界面」。`login_code` 的前提就是手机已经在登录页，不在就如实报告。
+    """
     phone.home()
     phone.open_app(PKG)
     xml = phone.dump()
@@ -67,7 +71,8 @@ def _ensure_login_page(agree: bool) -> str:
     _guard_risk(xml, "打开猎聘")
     if "手机号登录" not in " ".join(phone.texts(xml)):
         raise FlowMismatch(
-            "打开猎聘", "不在登录页——手机上可能还登着号，或用的是引导页", phone.texts(xml)
+            "打开猎聘", "不在登录页——手机停在别的页面（可能是上一轮留下的会话页/详情页）",
+            phone.texts(xml),
         )
     return xml
 
@@ -171,11 +176,12 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
     phone.open_app(PKG)
     xml = phone.dump()
 
-    # 已经是登出状态就直接返回（幂等）
+    # 已经是登出状态就直接返回（幂等）。
+    # ★ 这条必须**先判**：登录页没有底部导航，先调 ensure_main_tabs 会把正常状态判成异常。
     if "手机号登录" in " ".join(phone.texts(xml)):
         return {"ok": True, "already_logged_out": True}
 
-    # 新账号引导页有自己的退出入口
+    # 新账号引导页也没有底部导航，且有自己的退出入口
     if "创建招聘名片" in " ".join(phone.texts(xml)):
         more = phone.find_exact(xml, "更多操作") or phone.find(xml, "更多操作")
         if not more:
@@ -188,7 +194,16 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
             raise FlowMismatch("退出", "「更多操作」菜单里没有「退出登录」", phone.texts(xml))
         phone.tap_node(node, pause=3)
     else:
-        # 常规路径：我的 → 右上角设置图标 → 设置页底部「退出登录」
+        # 常规路径：**先退到主界面**再操作。
+        # 手机可能停在上一轮留下的任何页面（会话页/详情页），而底部「我的」tab 只在主界面存在。
+        result = phone.ensure_main_tabs(PKG)
+        if not result["ok"]:
+            raise FlowMismatch(
+                "退出", "退不回主界面（底部导航没出现），没法找到「我的」入口",
+                result.get("seen", []),
+            )
+        xml = phone.dump()
+
         tab = my_tab.get("打开底部「我的」tab")
         if tab:
             phone.tap(tuple(tab["center"]), pause=4.5)

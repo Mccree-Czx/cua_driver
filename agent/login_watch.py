@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -120,6 +122,92 @@ def _clear_sentinel() -> None:
         pass
 
 
+def _kill_tree(pid: int, sig: int) -> None:
+    """先杀子进程，再杀父进程。
+
+    ★ `run_round.py` 用 `subprocess.run` 拉起 node(Pi)——**父进程死了子进程不会跟着死**。
+      只杀父的话 Pi 会变成孤儿继续跑，手机还被它占着，抢占等于没做。
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=10
+        ).stdout
+        kids = [int(x) for x in out.split() if x.isdigit()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        kids = []
+    for kid in kids:
+        try:
+            os.kill(kid, sig)
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _record_preempted(pid: int) -> None:
+    """给被硬中断的那一轮记一笔账。
+
+    这是对「可能重复触达」的补偿：让人事后知道**有一轮被中断了**，该去核对什么。
+    """
+    try:
+        from datetime import datetime
+
+        from app.db import SessionLocal
+        from app.models import TaskLog
+
+        with SessionLocal() as session:
+            session.add(
+                TaskLog(
+                    task_id="preempted_" + datetime.now().strftime("%Y%m%d%H%M%S"),
+                    outcome="preempted",
+                    tokens=0,
+                    cost=0.0,
+                )
+            )
+            session.commit()
+    except Exception:  # noqa: BLE001  记账失败不该影响抢占
+        pass
+
+
+def _preempt_round() -> bool:
+    """掐掉正在跑的轮次，把手机抢过来。返回「锁是否已释放」。
+
+    ★ 硬中断的代价（用户已知悉并选择）：可能打断一次**已经点出去、但还没写
+      `interaction_log`** 的触达。数据库里没记录 → 下一轮会认为这个候选人没打过招呼
+      → **重复打招呼**。「一人一消息」是这套系统守得最死的一条，而杀进程正好绕过它。
+
+      所以这里必须**大声记录**：日志 + task_logs。人得知道有这一轮，才能去核对。
+    """
+    try:
+        pid = int(run_round.LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        return True
+    if not run_round._pid_alive(pid):
+        return True
+
+    print(f"[login_watch] ⚠ 硬抢占：强制中断正在跑的轮次（PID {pid}）")
+    _kill_tree(pid, signal.SIGTERM)
+    for _ in range(10):
+        time.sleep(1)
+        if not _round_running():
+            break
+    else:
+        print("[login_watch] ⚠ SIGTERM 没生效，改用 SIGKILL")
+        _kill_tree(pid, signal.SIGKILL)
+        time.sleep(2)
+
+    _record_preempted(pid)
+    still = _round_running()
+    print(
+        "[login_watch] 锁已释放，切换接手"
+        if not still
+        else "[login_watch] ⚠ 杀不掉，锁仍被占——本轮放弃，等下一轮"
+    )
+    return not still
+
+
 def main() -> int:
     store = RedisLoginRequest()
     req = store.get()
@@ -156,9 +244,11 @@ def main() -> int:
         return 0
 
     if _round_running():
-        # 有轮次在跑。**不能在这里 bump_attempts**——那会把「碰到锁」算作一次失败尝试，
-        # 三次撞锁就把用户正常的登录判死了。
-        return 0
+        # 用户当场发起的登录/切换比定时轮次更急 —— **直接抢占**（用户拍板选了硬抢占）。
+        # 抢不到就本轮放弃（不 bump_attempts：那会把「抢不到」算成一次失败尝试，
+        # 三次就把用户正常的登录判死了），等下一轮再试。
+        if not _preempt_round():
+            return 0
 
     store.bump_attempts()
     if req["phase"] == PHASE_PENDING:
@@ -167,10 +257,14 @@ def main() -> int:
 
 
 def _fail(store, message: str) -> int:
+    """停手并如实报告。
+
+    **刻意不按 HOME**：把 App 切到后台反而让人看不到现场。
+    失败要能被人工接手，手机就该停在出错的那一屏。
+    """
     print(f"[login_watch] 停手：{message}")
     store.set_phase(PHASE_FAILED, message)
     _clear_sentinel()
-    phone.home()
     return 0
 
 
