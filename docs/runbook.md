@@ -1,64 +1,95 @@
 # hr_workbuddy 运维手册（runbook）
 
-> M1 交付配套（T12）。约定：标注「待 T12 真实校准」的行为，以真实账号冒烟（§4）的实际结果为准；冒烟结果记入文末附录。
+> 适用范围：**B 方案（第二代架构，2026-10 起）**——Pi AI 代理 + 真安卓手机 + CT104 数据面。
+> 第一代架构（桌面 Chrome + `services/cua-agent` / `services/scheduler` / arq 队列 / HTTP 回调编排）已随 commit `aeacfe5`（2026-10-10）整体删除，本文档不再描述它们。
+> 编码约定：标注「TODO：待确认」的内容在写稿时**未在代码/仓库中找到依据**，需要人工核实后再补，不要当成事实引用。
 
 ## 1. 架构速览
 
 ```
-                ┌────────────────────────────────┐
-                │ scheduler（APScheduler，宿主机） │
-                │ 工作窗口 / 5 轮次 / 登录健康暂停   │
-                │ / 配额对账 / 在途去重            │
-                └──────┬────────────────┬────────┘
-        入队 AtomicTask │                │ HTTP：list_jobs / quota/today
-                        ▼                │      / state/login / sweeps
-┌───────────────────┐  arq 队列  ┌────────────────────────────┐
-│ Redis             │◄──────────►│ pipeline（FastAPI :8000）   │──► MySQL 8.4（唯一写入口：
-│ · arq 任务队列      │            │ 状态机 / 编排 / 话术渲染      │     jobs / candidates /
-│ · 派发登记表(TTL72h)│            │ / 一人一消息 / TaskLog 落账   │     job_candidate /
-│ · 在途索引(TTL 1h)  │            └──────▲────────────┬────────┘     interactions / task_logs）
-│ · 令牌桶 msg-touch:*│                   │回调 result  │ 归档
-│ · 登录态键          │                   │/artifact   ▼
-└───────────────────┘           ┌───────┴───────────┴─────────┐
-        ▲ 触达前权威桶检查        │ cua-agent arq worker          │   MinIO
-        └───────────────────────┤（宿主机，real 需桌面会话）      │（snapshots/ 快照、
-                                │ CUA SDK 驱动 + 视觉大脑        │  resumes/ PDF，预签名
-                                └──────────────────────────────┘   ≤15min）
-                                                   ▲ 评分旁路：pipeline 同步调用
-                                  ┌────────────────┴──────────┐
-                                  │ screening（FastAPI :8001） │
-                                  │ 硬规则 + LLM 评分 + 降级     │
-                                  └───────────────────────────┘
+┌─ Mac（执行面） ────────────────────────────────────────────────┐
+│ launchd 三个任务：                                             │
+│   pi-main  每 300s  → run_round.py main_round   ┐             │
+│   pi-login 每 20s   → login_watch.py（换号轮询） ├─ 全局轮次锁  │
+│   pi-daily 19:50    → run_round.py daily_round  ┘  串行一部手机 │
+│ run_round → Pi（deepseek-flash）                               │
+│   ├─ mobile-mcp（9 工具）：dump UI / tap / type ──adb──► 手机   │
+│   └─ hr-tools（stdio MCP，32 个确定性工具）                    │
+│ login_watch → flows.py + phone.py（确定性序列，不经 LLM）       │
+│   锚点外部化：agent/login_map.json                             │
+└──────────────┬────────────────────────────────────────────────┘
+               │ 两边只靠 Redis 见面（CT104 连不到 Mac，Mac 在 NAT 后）
+┌─ CT104（数据面 + 服务面，systemd） ────────────────────────────┐
+│ MySQL 8.4 · Redis 7 · MinIO                                    │
+│ pipeline(:8000)：MySQL/MinIO 唯一写入口、Alembic schema owner、 │
+│   /api/jobs + /api/hr/*（含账号/登录/复核/日报/人工队列）        │
+│ screening(:8001)：硬规则 → LLM 1-5 星评分 → degraded 降级       │
+│ hr-console(:3000)：OutIn HR Portal（/api/* 代理到 pipeline）    │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 要点：
 
-- **派发链**：scheduler 与 pipeline 都把 `AtomicTask` JSON 入 arq（Redis）；cua-agent worker 在宿主机执行页面动作，完成后 HTTP 回调 pipeline（`POST /internal/tasks/{id}/result`、`/artifact`）；pipeline 是 MySQL/MinIO 的唯一写入口，收到结果后推进状态机并入队后继任务。
-- **screening 是旁路**：pipeline 在评分点同步调用 `POST /screen`，不进 arq；LLM 不可用走 degraded 路径（只存快照不推进，deferred 巡检 30min 自动重判）。
-- **Redis 四用途**：arq 队列、派发登记表（`pipeline:dispatched:{task_id}`，TTL 72h）、在途索引（`pipeline:dispatched:idx:{type}:{jc_id}`，TTL 1h）、触达令牌桶（`msg-touch:{YYYYMMDDHH}`，20/hr）+ 登录态键（`pipeline:state:login`）。
-- 状态机 11 态（new → screened_pass/rejected_* → … → closed），详见 spec v1.6 §4。
+- **Pi 是唯一决策者，不直连数据库**：一切状态/数据经 hr-tools 工具（`services/pipeline/tools_mcp_server.py`）读写。hr-tools 复用 pipeline 的 `models`/`state_machine`/`messaging` 模块（import，非 HTTP），自带 Redis 客户端、直连 MySQL/MinIO，并在 `screen` 工具里调 screening 评分。
+- **screening 是旁路调用**：由 hr-tools 的 `screen` 工具 HTTP 调用 `POST /screen`；LLM 不可用返回 degraded（`judge_reason="deferred: LLM unavailable"`，HTTP 200），候选人只存快照不推进，等 daily_round 的「延期重判」再筛。
+- **Redis 用途**（键按账号分片，`services/pipeline/app/keys.py`）：登录请求 `pipeline:state:login_req`（单例 hash，TTL 30min）；登录态 `pipeline:state:login:{account_id}`；每日触达计数 `msg-touch:{account_id}:{YYYYMMDD}`；风控熔断 `cua:risk:paused:{account_id}`；另有第一代遗留的派发登记 `pipeline:dispatched:*`（只被人工队列反查读取）。
+- **状态机 11 态**（`packages/contracts` 的 `CandidateStatus`）：new → screened_pass / rejected_hard / rejected_llm → greeted → resume_requested → awaiting_resume → resume_received → hr_reviewed → closed（+ no_response）。
+- **多账号**：`accounts` 表 + `is_active`；**所有数据按 `account_id` 隔离**。换号只能走 `POST /api/hr/accounts/{id}/switch`（真的会去手机上退旧号、登新号）。
 
-## 2. 环境准备
+## 2. 部署拓扑（三台机器）
 
-### 2.1 Docker 数据底座
+| 机器 | 地址 | 跑什么 |
+|---|---|---|
+| Mac | `10.99.31.81`（用户 `outin`） | Pi + mobile-mcp + adb + 真手机；`agent/` 脚本；launchd 三个任务 |
+| CT104 | `10.99.40.99`（主机名 `openviking`） | MySQL / Redis / MinIO + pipeline:8000 + screening:8001 + hr-console:3000（全 systemd） |
+| 开发机（Windows） | 本机 | 开发、测试；唯一能 push GitHub 的机器 |
+
+其他已知事实（2026-10-14 记录，TODO：部署变更时复核）：
+
+- 手机经 **WiFi adb over TCP** 连到 Mac（不是 USB）。
+- CT104 的仓库路径 `/root/outin-hr`；Mac 的仓库在 `~/outin-hr`。
+- **发布流程**：开发机提交并 push → Mac `git pull` → CT104 `git pull` + `alembic upgrade head`（注意 §11 的 DATABASE_URL/CWD 坑）+ 重启 pipeline + 前端 `pnpm exec next build` + 重启 console。
+- **TODO：待确认**：CT104 上各服务的 systemd 单元名清单（使用记录中出现过 `hr-pipeline`、`hr-console`；screening 与 MySQL/Redis/MinIO 的单元名未见于仓库）；Mac 上三个 `com.hr-workbuddy.pi-*` plist 的内容（仓库内没有对应安装脚本）。
+
+## 3. 环境准备
+
+### 3.1 Python 环境（uv workspace）
+
+```bash
+uv sync --all-packages --all-groups
+```
+
+- 裸 `uv sync` 会修剪掉成员依赖（workspace 成员：`packages/contracts` + `services/{pipeline,screening}`）；`uv run` 不触发修剪。
+- 拉包慢时可用一次性镜像源 `$env:UV_DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"`（开发机）；uv.lock 已归一为 pypi.org，勿把镜像写进 lock。
+
+测试（在各自 service 目录跑；仓库根单跑 pytest 有跨服务收集冲突）：
+
+```bash
+cd packages/contracts && uv run pytest     # 零外部依赖
+cd services/screening && uv run pytest     # 零外部依赖（LLM 全 mock）
+cd services/pipeline && uv run pytest      # 需 MySQL + MinIO（测试库 hr_workbuddy_test）
+```
+
+首次建 pipeline 测试库（compose MySQL 容器在跑时）：`docker compose -f infra/docker-compose.yml exec mysql mysql -uroot -phr_root_dev_pw -e "CREATE DATABASE IF NOT EXISTS hr_workbuddy_test; GRANT ALL ON hr_workbuddy_test.* TO 'hr_user'@'%';"`
+
+### 3.2 数据底座
+
+- **生产**：CT104 上的 MySQL / Redis / MinIO（systemd；单元名 TODO 待确认）。
+- **开发机**：`infra/docker-compose.yml`（MySQL 8.4 + MinIO + Redis 7）。
 
 ```powershell
-# 起栈（已在跑则复用；本仓库用 `up -d` + 探活，见下方注记）
-docker compose -f infra/docker-compose.yml up -d
-
-# 冒烟验证 MySQL / MinIO / Redis
-uv run pytest infra/tests -m infra
-
-# 停栈；连数据卷一起清（开发重置用，慎）
-docker compose -f infra/docker-compose.yml down
-docker compose -f infra/docker-compose.yml down -v
+# 开发机起栈（MySQL 带 profile，裸 up 不启 MySQL！）
+docker compose -f infra/docker-compose.yml --profile docker-mysql up -d
+uv run pytest infra/tests -m infra    # 冒烟验证 MySQL / MinIO / Redis
+docker compose -f infra/docker-compose.yml down        # 停栈
+docker compose -f infra/docker-compose.yml down -v     # 连数据卷一起清（慎）
 ```
 
 注记（实测经验）：
 
-- 首次 `up -d --wait` 可能因 mysql 初始化自带 restart 周期超时退出 1——等约 30s 重跑即全 healthy（healthcheck 定义本身正确）。
-- `minio-init` 是一次性容器（建 `hr-workbuddy` 桶后退出 0），部分 compose 版本 `--wait` 会把它判为失败——用 `up -d` + `infra` 冒烟测试探活最稳（E2E 脚本同款手法）。
-- **镜像加速**（Docker Hub 直连不通时，daocloud 系可用；拉完 tag 成 compose 引用名即可，引用名不变）：
+- 首次 `up -d --wait` 可能因 mysql 初始化自带 restart 周期超时退出 1——等约 30s 重跑即全 healthy。
+- `minio-init` 是一次性容器（建 `hr-workbuddy` 桶后退出 0），部分 compose 版本 `--wait` 会把它判为失败——用 `up -d` + `infra` 冒烟测试探活最稳。
+- **镜像加速**（Docker Hub 直连不通时；拉完 tag 成 compose 引用名即可）：
 
 ```powershell
 docker pull docker.m.daocloud.io/library/mysql:8.4
@@ -71,43 +102,34 @@ docker pull quay.m.daocloud.io/quay.io/minio/mc:latest
 docker tag  quay.m.daocloud.io/quay.io/minio/mc:latest quay.io/minio/mc:latest
 ```
 
-- docker.io 的 `minio/minio`、`minio/mc` 自 2022 年 10 月停更（MinIO 官方迁往 quay.io），compose 已直接引用 `quay.io/minio/minio` + `quay.io/minio/mc`（镜像加速时 tag 成这两个引用名即可）。
+### 3.3 前端（pnpm 必须走 corepack）
 
-### 2.2 Python 环境（uv workspace）
-
-```powershell
-uv sync --all-packages    # 必须 --all-packages！
+```bash
+cd apps/hr-console && corepack pnpm install
+corepack pnpm dev        # 开发（:3000）
+corepack pnpm build && corepack pnpm start   # 生产/常驻
 ```
 
-- 裸 `uv sync` 会把 `.venv` 修剪到仅根 dev 组（丢 arq/apscheduler/fastapi 等成员依赖）；`uv run` 不触发该修剪。
-- 拉包慢时可用一次性镜像源 `$env:UV_DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"`；uv.lock 已归一为 pypi.org，勿把镜像写进 lock。
+根 `package.json` 用 `packageManager` pin 了 pnpm 版本——直接敲 `pnpm` 会因版本不符直接报错，一律走 `corepack pnpm`。
 
-### 2.3 .env 配置清单（仓库根 `.env`，git-ignored）
-
-从 `.env.example` 复制后填入真实值。代码实际读取的变量：
+### 3.4 .env 变量表（**实际被代码消费**的）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DATABASE_URL` | `mysql+pymysql://hr_user:hr_dev_pw@127.0.0.1:3306/hr_workbuddy` | pipeline 读写库（与 compose 默认一致） |
-| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 队列 / 注册表 / 令牌桶 / 登录态 |
+| `DATABASE_URL` | `mysql+pymysql://hr_user:hr_dev_pw@127.0.0.1:3306/hr_workbuddy` | pipeline / 脚本读写库 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 登录请求 / 登录态 / 配额桶 / 风控熔断 |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `127.0.0.1:9000` / `minioadmin` / `minioadmin` | 对象存储 |
-| `SCREENING_URL` | `http://127.0.0.1:8001` | pipeline 调 screening 的地址 |
-| `PIPELINE_URL` | `http://127.0.0.1:8000` | scheduler / cua-agent 回调地址 |
-| `CUA_DRIVER_MODE` | `mock` | **有效值仅 `mock`\|`real`**（`.env.example` 旧值 `local` 会触发 pydantic 校验错误，已修正为 `mock`） |
-| `CUA_BRAIN_BASE_URL` | `https://api.deepseek.com` | 视觉大脑 OpenAI 兼容端点 |
-| `CUA_BRAIN_API_KEY` | 空 | **DeepSeek key 只放本文件，绝不入库** |
-| `CUA_BRAIN_MODEL` | `deepseek-flash` | 实测支持 image 输入；`deepseek-v4-pro` 是纯文本模型，不可用作视觉大脑 |
-| `CUA_BRAIN_PRICE_PER_1K_TOKENS` | `0` | 成本账目单价占位 0——**待 T12 按视觉模型定价校准** |
-| `CUA_WORLD_PATH` | `worlds/default.json` | mock 模式 World 剧本路径 |
-| `CUA_E2E_INSTANT` | 不设 | `1` = 延时置 0 + 令牌桶直通，**仅 M1 E2E 用；真实冒烟/生产绝不设** |
-| `MSG_RATE_PER_HOUR` | `20` | 触达限频（spec §3） |
-| `WORK_WINDOW_START` / `WORK_WINDOW_END` | `08:00` / `20:00` | 工作窗口 `[start, end)` |
-| `DAILY_MSG_CAP` | `240` | 日触达上限，触顶停触达类派发 |
-| `INBOUND_INTERVAL_SECONDS` 等 5 项 | 300 / 600 / 3600 / 3600 / 1800 | inbound / sweep / login_health / reconcile / deferred 轮次间隔 |
-| `SCREENING_LLM_BASE_URL` / `_API_KEY` / `_MODEL` | `https://api.deepseek.com` / 空 / `deepseek-flash` | 简历评分文本模型 |
-| `ACCOUNT_SECRET_KEY` | 空 | 猎聘账号密码的加密主密钥（Fernet）。**只放本文件，绝不入库**。留空则账号密码功能不可用（错误码 503），登录核验等不受影响 |
+| `MINIO_BUCKET` | `hr-workbuddy` | 归档桶（备份/报告脚本同样读它） |
+| `SCREENING_URL` | `http://127.0.0.1:8001` | hr-tools 调 screening 的地址 |
+| `DAILY_RESUME_TARGET` | `50` | 总览页「日回收目标」展示用（不拦任何流程） |
+| `ACCOUNT_SECRET_KEY` | 空 | 账号密码 Fernet 主密钥（见 §3.5）；留空则建账号接口 503 |
+| `SCREENING_LLM_BASE_URL` / `SCREENING_LLM_API_KEY` / `SCREENING_LLM_MODEL` | `https://api.deepseek.com` / 空 / `deepseek-flash` | screening 评分 LLM（缺 key 时服务照常启动、评分走 degraded） |
 
-### 2.2 账号密码加密密钥（`ACCOUNT_SECRET_KEY`）
+Mac / `agent/` 侧另读（非 .env，直接环境变量）：`SCREENING_LLM_API_KEY`（run_round 给 Pi 用；未设则回退读仓库根 `.env` 的同名键）、`HR_PI_AGENT_DIR`（Pi 配置目录，默认 `~/.pi/agent`）、`HR_PI_CLI` / `HR_NODE` / `HR_ADB`（可执行文件路径覆盖）、`HR_JD_MAX_JOBS`（每次登录后最多抓几个 JD，默认 5）、`HR_AGREE_TERMS`（默认关闭：是否代点独立协议同意页）。
+
+**工作窗口 08:00–20:00、每日 100 次触达上限均写死在代码里**，不存在对应 env（见 §3.6）。
+
+### 3.5 账号密码加密密钥（`ACCOUNT_SECRET_KEY`）
 
 生成：
 
@@ -117,283 +139,240 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 要点：
 
-- **只有 pipeline 所在的机器需要它**（加密与解密都在 CT104）。Mac 侧目前不需要——
-  账号登录走的是验证码路径，Mac 不解密任何东西。等哪天启用「密码登录」
-  （Pi 直接输入密码，需 Mac 侧解密）再同步过去，**届时两处必须是同一个密钥**。
-- **密钥丢失 = 已存的密码不可恢复**。账号本身不受影响（重新填一次即可），但换号回滚
-  就没有旧号密码可用了——所以密钥要纳入备份。
+- **建账号（`POST /api/hr/accounts`）需要它**：手机号与密码都必填，密码经 Fernet 加密后入库；密钥缺失时接口返回 503（`CredentialCryptoError`）。
+- 密码在库里只有密文；接口只回 `phone_masked` 与 `has_password`，密文与明文都不外传。
+- **密钥丢失 = 已存的密码不可恢复**（账号本身不受影响，重填即可）。密钥要纳入备份。
 - 轮换用 `MultiFernet`（新密钥放最前，旧密文仍能解，逐个重加密后再摘掉旧密钥）。
-- 密码在库里只有 Fernet 密文；接口只回 `phone_masked` 与 `has_password`，**密文与明文都不外传**。
+- ⚠️ 待确认（见 §14）：登录方式目前只有短信验证码一条路（密码登录已停用，见 §7），`decrypt_secret` 目前只被测试使用——库里的密码当前没有实际消费方。
 
+### 3.6 `.env.example` 的遗留键（不要被误导）
 
-`.env.example` 中的 `LLM_DEFAULT_THRESHOLD` / `RESUME_TIMEOUT_HOURS` 当前**无代码消费**（阈值 70 与 72h 为代码内定值），保留占位。
+`.env.example` 仍列着一批**第一代架构**的键，当前**无任何代码消费**：`CUA_DRIVER_MODE`、`CUA_TASK_GAP_SECONDS`、`CUA_RETRY_DEFER_SECONDS`、`CUA_BRAIN_*`、`WORK_WINDOW_START/END`、`MSG_RATE_PER_HOUR`、`DAILY_MSG_CAP`、`LLM_DEFAULT_THRESHOLD`、`RESUME_TIMEOUT_HOURS`。工作窗口（08:00–20:00）写在 `agent/run_round.py`；每日上限（100）写在 `tools_mcp_server.DAILY_TOUCH_CAP`。脚本层同款残留：`scripts/deploy/run_service.sh` 里仍有 `scheduler`/`worker` 分支（对应服务已删除）。TODO：清理这两处，待排期。
 
-## 3. 服务启动（顺序）
+## 4. 服务运行
 
-1. 数据底座（§2.1 compose 栈）。
-2. **pipeline**（:8000，启动即 `alembic upgrade head`，幂等——schema 唯一 owner）：
+### 4.1 手动启动（任一台装了依赖的机器）
 
-```powershell
+```bash
+# pipeline :8000（启动即 alembic upgrade head，幂等；schema 唯一 owner）
 uv run uvicorn app.main:app --app-dir services/pipeline --host 127.0.0.1 --port 8000
-```
-
-3. **screening**（:8001）：
-
-```powershell
+# screening :8001（健康检查：GET /health）
 uv run uvicorn app.main:app --app-dir services/screening --host 127.0.0.1 --port 8001
+# hr-console :3000
+cd apps/hr-console && corepack pnpm start
 ```
 
-4. **scheduler**（APScheduler，阻塞进程）：
+pipeline 没有 `/health`，探活用 `GET /api/hr/overview`（会读生效账号；返回 503 表示没有生效账号，见 §11）或 `/docs`。
 
-```powershell
-cd services/scheduler; uv run python -m app.main
+### 4.2 Mac 侧轮次脚本（手动）
+
+```bash
+python3 agent/run_round.py main_round      # 只用标准库；闸门不过打印 [skip] 并退出 0
+python3 agent/run_round.py daily_round
+python3 agent/run_round.py backfill_round  # 人工触发
+python3 agent/login_watch.py               # 登录轮询器单次执行（launchd 每 20s 拉起的就是它）
+python3 agent/probe_jobs.py                # 职位管理页探查（只报告；要动必须显式 --tap x,y）
 ```
 
-5. **cua-agent arq worker**（宿主机；mock 无桌面依赖，**real 需交互式桌面会话**）：
+`run_round.py` 把 Pi 的 stdout 写到 `agent/.round_<name>.log`；超时：`login_round` 420s，其余 3600s。每轮结束从 Pi session jsonl 汇总 tokens/cost 写一条 `task_logs`（`outcome` 按真实退出码）。
 
-```powershell
-cd services/cua-agent
-$env:CUA_DRIVER_MODE = "mock"   # 或 "real"
-$env:PYTHONPATH = "$PWD"        # arq CLI 导入 app.worker 与 cwd 无关，必须显式给
-uv run arq app.worker.WorkerSettings
-```
+### 4.3 常驻（现状）
 
-**mock / real 切换**：
+- **Mac**：launchd 三个任务（`com.hr-workbuddy.pi-main` 每 300s、`com.hr-workbuddy.pi-login` 每 20s、`com.hr-workbuddy.pi-daily` 每天 19:50）。TODO：plist 内容与安装方式不在仓库内，待补。
+- **CT104**：pipeline / screening / hr-console 由 systemd 常驻（单元名 TODO，见 §2）。
+- 仓库内脚本：`scripts/deploy/install.sh` 会以 launchd 安装 pipeline/screening/backup 三件（2026-10-15 已删掉 scheduler/worker 分支；`uninstall.sh` 的循环里还留着两个旧名字，可忽略）。它与当前 CT104 systemd 形态的关系 TODO 待确认；`run_service.sh` 保留供手动调试。
 
-| 开关 | mock（默认） | real |
+## 5. 轮次与调度
+
+### 5.1 `run_round.py` 闸门顺序（跳过原因对照）
+
+| 顺序 | 闸门 | 跳过时打印 |
 |---|---|---|
-| `CUA_DRIVER_MODE` | `mock`：FakeLiepinDriver + MockBrain，行为由 `CUA_WORLD_PATH` 剧本决定，零外部 I/O | `real`：CuaLiepinDriver（PyPI `cua-driver` 0.30.4，SDK 自带进程内 runtime，不依赖已装桌面 exe）+ OpenAIBrain（.env 真实 key） |
-| 桌面会话 | 不需要 | 需要（真实猎聘企业版后台已登录） |
-| `CUA_E2E_INSTANT` | E2E 置 1（延时 0 + 桶直通） | **禁止置 1** |
+| 1 | 工作窗口 08:00–20:00（`backfill_round` / `login_round` 豁免） | `[skip] <name>: 工作窗口外（HH:MM）` |
+| 2 | 登录在途哨兵 `.login_in_flight` 新鲜（main/daily 让路，避免把登录页误判成掉登录） | `[skip] <name>: 有登录在途（手机停在登录页，跑本轮会误判成掉登录）` |
+| 3 | 当前生效账号名下**有 active 职位**（仅 main_round；**fail-open**：查不到一律放行） | `[skip] <name>: 当前账号名下没有已启用的职位（在前端补齐 JD 后自动恢复）` |
+| 4 | 空未读退避（仅 main_round；连续 2 个空轮 → 30 分钟内不启动 Pi） | `[skip] <name>: 空未读退避（连续空，30 分钟内不再启动 Pi）` |
+| 5 | 全局轮次锁 `.round.lock`（文件 + PID 存活；stale 3900s） | `[skip] <name>: 另一轮次正在运行（全局轮次锁）` |
 
-## 4. 真实账号冒烟（6 步）
+注意：第 3 步**刻意不碰** `.inbound_state.json`——「没职位」是配置问题，不是「今天没活干」，记进退避会把后续 30 分钟全挡掉。
 
-执行器：`services/cua-agent/scripts/smoke_real.py`（宿主机运行，仓库根执行；不带 `--step` 只打印清单退出 0，不执行任何动作；`send` 必须 `--candidate-liepin-id <id>` + `--yes` 双开关）。
+### 5.2 四个轮次
 
-前置：数据底座已起；`.env` 已填 DeepSeek key；`CUA_DRIVER_MODE=real`；桌面会话已登录猎聘企业版后台；已确认**自备测试候选人**的 liepin_user_id。
-
-| 步 | 操作 | 命令 / 预期 |
+| 轮次 | 触发 | 做什么 |
 |---|---|---|
-| ① 登录态 | 只跑 check_login 验证持久化 profile 登录态 | `$env:CUA_DRIVER_MODE = "real"; uv run python services/cua-agent/scripts/smoke_real.py --step login` → 预期 `check_login() → True`；打印「待 T12 校准」= 骨架未实现（预期失败），照实记录 |
-| ② 登出恢复 | 验证派发暂停 + 告警 + 扫码恢复（**人工步骤**，脚本不驱动；需全栈运行：scheduler + pipeline + real worker） | 桌面应用登出 → scheduler 日志出现 `[login] 请扫码登录：登录态失效，已暂停全部派发`（启动即首轮，之后每小时一轮）→ 派发暂停 → 扫码重新登录 → 下一轮自动解除。期间可用 `--step verify` 观察 `pipeline:state:login` 键变化 |
-| ③ 读简历 | 对自备测试候选人 read_resume（截图 + 7 字段，**不发消息**） | `uv run python services/cua-agent/scripts/smoke_real.py --step read --candidate-liepin-id <测试候选人ID>` → 打印 MinimalResume 7 字段 + 截图字节数；确认零 out 消息 |
-| ④ 发消息 | **仅对测试候选人** send_message（截图校验 + 合并话术文本正确） | `uv run python services/cua-agent/scripts/smoke_real.py --step send --candidate-liepin-id <测试候选人ID> --yes [--text 文本] [--screenshot-png after.png]` → 话术 `{name}/{title}` 已填充、发送成功、`--screenshot-png` 提供时 BrainClient verify 通过；不传 `--text` 时只读直查 MySQL 渲染岗位话术 |
-| ⑤ 核对账目 | 延时 / 令牌桶 / TaskLog token 落账（只读） | `uv run python services/cua-agent/scripts/smoke_real.py --step verify` → 延时 10-60s（触达）/5-15s（读）、`msg-touch:{YYYYMMDDHH}` ≤ 20、`task_logs` 最近行 tokens/cost 与 verify 用量一致、`CUA_E2E_INSTANT` 未设 |
-| ⑥ 记录 | 把 ①-⑤ 输出（时间/账号/候选人/结果）记入本文末附录 | 手工粘贴 |
+| `main_round` | launchd 每 300s | 先 `quota_status()`：**remaining>0 → outbound 打招呼**（单轮 ≤35 卡，不碰未读）；**remaining==0 → inbound 处理未读**（单轮 ≤10 会话）。轮末必须输出机器可读行 `@@RESULT@@ inbound=N outbound=M`（供退避判定） |
+| `daily_round` | launchd 每天 19:50 | 72h 关闭 + 追附件（只读）→ 登录检查（未登录 `risk_set()` 报告转人工 / 已登录 `risk_clear()`）→ 配额对账（只报告）→ **延期重判**（`status=new` 且 judge_reason 含 deferred 的 jc 重新 screen）→ 新职位检测（手机读职位列表，与库对比，新职位补录 JD） |
+| `backfill_round` | **人工**（TODO：触发方式未定） | `list_backfill_candidates()` → 逐个补下载真实 PDF（全程零触达，单轮 ≤20） |
+| `login_round` | **人工兜底**，不再自动拉起 | 确定性序列跑不通时（如猎聘改版、锚点失配）由人叫 Pi 看一眼；正常登录路径见 §7 |
 
-注意：①②③⑤ 均零触达；只有 ④ 真实触达且带双开关。**每个候选人一生只允许 1 条 out 消息（决策 3），冒烟候选人不可复用重发。**
+### 5.3 锁 / 哨兵 / 退避文件（都在 `agent/` 下）
 
-## 5. 日常运维
+| 文件 | 语义 | 自愈 |
+|---|---|---|
+| `.round.lock` | 全局轮次锁：内容为持有 PID；有效 = 进程存活 且 mtime 新鲜（<3900s） | 崩溃残留锁因 PID 不存活自动失效 |
+| `.login_in_flight` | 登录在途哨兵：`login_watch.py` 每次轮询重写；run_round 只见文件、读不了 Redis | 最长 2400s 后自动失效（防轮询器挂掉把主线永久堵死） |
+| `.inbound_state.json` | 空未读计数 `{empty_streak, last_empty_ts}` | 30 分钟后自动恢复；有新产出即清零 |
+| `.round_<name>.log` | 本轮 Pi 的 stdout | 每轮覆盖 |
 
-### 5.1 工作窗口与轮次
+## 6. 配额、限频与风控
 
-- 工作窗口默认 `08:00–20:00`（`[start, end)`，20:00 整点起停止派发）；窗口外调度照常触发但零派发。
-- 五轮次：inbound 5min、awaiting_resume_sweep 10min、login_health 1h、daily_quota_reconcile 1h、deferred_sweep 30min；服务启动即各跑首轮（不延迟一个 interval）。
-- 轮次间隔、窗口、日上限均可在 .env 覆盖。
+### 6.1 每日 100 次与职位均分
 
-### 5.2 配额对账与限频
+- 每日打招呼总额 **100**（`DAILY_TOUCH_CAP`，Redis 键 `msg-touch:{account_id}:{YYYYMMDD}`，86400s 窗口）。
+- **按职位均分**：每职位日配额 = `floor(100/N)`（N = 当前账号 active 职位数）。`job_quota_status()` 给出每职位今日已打数，Pi 优先给「已打 < 配额 且还有候选人」的职位打招呼；某职位满配额或候选人耗尽则让给其他职位。
+- inbound 的响应性触达（回未读、索要简历）走 `gated_tap(counts_daily=False)`——**只过风控熔断，不计入每日 100**。
+- 旧的 20 条/小时令牌桶与 240 条/天配额已随第一代删除，代码里没有对应闸门。
 
-- **20 条/小时**：Redis Lua 令牌桶 `msg-touch:{YYYYMMDDHH}`；worker 在触达前做权威检查，桶耗尽即把任务 `_defer_by` 重排到下一小时窗口（不失败、不烧重试预算）。
-- **240 条/天**：scheduler 每小时对账当日 out 计数；触顶 → 告警日志 + 停止触达类派发（deferred_sweep 与 awaiting_resume_sweep 的 CHECK_ATTACHMENT 入队均跳过）。已知披露：inbound 链（LIST_UNREAD→READ_RESUME→SEND_MESSAGE）由 pipeline 编排入队，在 scheduler 配额闸半径外——M2 动态阈值/配额联调时补。
-- 回落（当日计数 < 上限）自动恢复派发。
+### 6.2 `gated_tap` 闸门（触达点击的唯一合法通道）
 
-### 5.3 72h 关闭语义
+`gated_tap(x, y, touch=True)`：服务端先过 **风控熔断**；`counts_daily=True`（主动打招呼）再扣每日 100 桶。任一不过**不执行 tap**，返回 `executed=false` + 原因——此时 Pi 必须停手报告，**严禁换 `mobile_tap` 绕过**。读操作（浏览、进详情、切 tab）用 `touch=False` 直接点。
 
-- `awaiting_resume` 且 `resume_requested_at` 严格早于 now-72h → `no_response → closed`（恰好 72h 不关）。
-- 巡检由 awaiting_resume_sweep 每 10min 委托 pipeline（`POST /internal/sweeps/stale-awaiting`）。
-- **不催促、不追发**（决策 3）：72h 无附件直接关闭，out 消息始终恰 1 条。
+### 6.3 风控熔断（按账号）与恢复
 
-### 5.4 登录健康
+- 键：`cua:risk:paused:{account_id}`（**按账号分片**；旧文档写成全局 `cua:risk:paused` 已过时）。
+- 触发：Pi dump 到「账号行为异常 / 猎聘安全中心 / 图形验证码 / 滑块」→ 立即停止全部操作 → `risk_set()` → 报告转人工，**绝不尝试绕过**。
+- 影响：该账号所有 `touch=True` 点击被拒；`risk_check()` 为 paused 时 pi 的轮次应停止触达。
+- **恢复流程**：人工在手机上完成安全验证并确认页面恢复正常后 `risk_clear()`（或前端页面按 §11 的按键指引清除）。观察期内以低密度恢复（先只读，再逐步放宽）。
+- 2026-10-15 实测：猎聘「账号密码登录」点登录会弹滑块验证码——这正是密码登录被停用的原因（见 §7）。
 
-- login_health_round 每轮入队 CHECK_LOGIN 并查最近结果（Redis `pipeline:state:login`）；失效 → 暂停全部派发 + 告警「请扫码登录」；扫码恢复后自动解除。暂停期间仍持续入队 CHECK_LOGIN（探测恢复路径）。
+### 6.4 工作窗口
 
-### 5.5 E2E 重跑（mock，一条命令）
+08:00–20:00（`[start, end)`，写死在 `run_round.py`）。窗口外 main/daily 直接跳过；`backfill_round`（只读）与 `login_round`（人工即时动作，晚上换号是常态）豁免。
 
-```powershell
-uv run python scripts/run_m1_e2e.py          # 一条命令跑全部（剧本 A + 剧本 B）
-uv run pytest tests/e2e -m e2e -v            # pytest 包装（同一套逻辑）
+## 7. 登录与换号（跨机器流程）
+
+### 7.1 正常路径（不经 LLM）
+
+```
+HR 在前端点「切换账号/登录」 → pipeline 写 Redis（`pipeline:state:login_req`，kind=switch|login, phase=pending）
+→ Mac 上 login_watch.py（launchd 每 20s）轮询到 → 跑 flows.py 确定性序列（phone.py adb 原语，锚点查 login_map.json）
+→ kind=switch 先 flows.logout() 退出旧号，再 flows.login_code(手机号)（点「下一步」，验证码自动发出→phase=awaiting_code）
+→ HR 在自己手机读到验证码，填进前端（POST …/login-request/code；TTL 5 分钟）
+→ login_watch 原子取码 → flows.submit_code() → 成功：mark_account_logged_in（写登录态 + 切 is_active）
+→ 自动扫该账号在招职位 sync_scanned_jobs（抓不到 JD 的落 draft）→ 抓 JD flows.fetch_jds（≤HR_JD_MAX_JOBS 个，只读详情页）
+→ phase=success（前端显示：扫到/更新了多少职位、JD 抓到几个、几个已自动启用）
 ```
 
-注意：E2E 会 TRUNCATE pipeline 各表、`FLUSHDB` Redis、删除 MinIO snapshots/resumes 前缀对象——**仅在开发库运行**。
+设计要点：
 
-### 5.6 常见故障表
+- **登录页没有「获取验证码」按钮**（点「下一步」验证码自动发出；实测 2026-10-15）；手机号是预填的，输入前必须清空（`phone.type_into` 已处理）。
+- **密码登录已停用**（实测弹滑块）：接口对 `method=password` 直接 400；唯一可用路径是验证码。
+- **登录成功 ≠ 扫职位成功**：扫描/抓 JD 失败只回一句 `notice`（例如「登录成功，但职位没扫到…」），不会把成功打成失败——重来要再消耗一条短信验证码。
+- **相位 `scanning_jobs` 必须是非终态**：扫描要动手机一分钟左右，靠 `.login_in_flight` 哨兵保持新鲜，拦住 main_round 抢手机。
+- **抢占**：用户当场发起的登录比定时轮次更急——若轮次正在跑，login_watch 会**硬抢占**（SIGTERM → 等 10s → SIGKILL 进程树），并写一条 `outcome=preempted` 的 `task_logs` 供事后核对（⚠️ 可能打断一次「已点出去但还没落账」的触达 → 下一轮可能重复打招呼；「一人一消息」在这条路径上无法保证，人需按 preempted 记录核对）。
+- 失败时前端会给「登回 <旧号名>」入口（`from_account_id`）；换号失败且旧号已退出 = **手机上现在没有账号**，需人工介入。
+
+### 7.2 相位表（`pipeline:state:login_req`）
+
+| 相位 | 含义 | 谁推进 |
+|---|---|---|
+| `pending` | 前端发起，等 Mac 拉起 | login_watch 读到即动手 |
+| `logging_out` | （仅 switch）正在退出旧号 | login_watch |
+| `dispatched` | 正在操作手机（输号、发验证码） | login_watch |
+| `awaiting_code` | 验证码已发出，等人工填 | HR 填码后 `submit_code` 仍回此相位，等 login_watch 取 |
+| `scanning_jobs` | 登录已成，正在扫职位/抓 JD（非终态，防抢手机） | login_watch |
+| `success` / `failed` / `cancelled` / `expired` | 终态 | — |
+
+约束：整个请求 TTL 30 分钟（超时由 login_watch 置 `expired`）；自动尝试上限 `MAX_ATTEMPTS=3`（超限置 `failed`，避免无限空跑）；验证码一次性（Lua 原子取码，TTL 300s）。
+
+### 7.3 失败排查
+
+- 看前端向导文案（相位 + error/notice 双通道：`failed` 是红条结论，其余是黄条过程说明）。
+- 看 Mac 日志：login_watch 的 stdout（launchd 日志，TODO：路径未见于仓库；手动跑即终端输出）。
+- 看 Redis：`HGETALL pipeline:state:login_req`（含 phase/attempts/error）。
+- 锚点失配（App 改版）→ login_watch 停手并把「屏上看到了什么」写进 error；处理方式是让 Pi 跑 `login_round`（人工兜底）重新校准 `login_map.json`，或按需重探锚点。
+
+### 7.4 已知缺口
+
+- **`POST /api/hr/accounts/login-request/resend`（重发验证码）目前没有消费者**：它只 `bump_resend()`（`resend_seq+1`），而 login_watch 与 login_round 都不会去点「重发」。TODO：要么补消费者，要么摘掉按钮。
+
+## 8. 业务闭环（Pi 侧规则，权威版见 `agent/system-prompt.md` + `agent/rounds.md`）
+
+### 8.1 main_round · outbound（打招呼，`remaining>0` 时）
+
+`job_list_active()` → 顶部职位 tab 选定职位（按 title 对应取 job_id，不要写死 job 1）→ 该职位「推荐」tab，耗尽切「最新」→ 逐卡：读简历 → `candidate_get_or_create`（source=recommended）→ `jc_get_or_create` → `risk_check` → `screen` 评分 → 双查一人一消息 → `gated_tap(touch=True)` 点「立即沟通」（**计入每日 100**）→ 每打 3-5 个批量 dump 验证上屏 → `interaction_log(out)` → `state_transition` → `tasklog_add`。跳过已触达者（`candidate_has_out_message=true`）。`rate_limited` → 立即停打招呼、转 inbound。
+
+### 8.2 main_round · inbound（未读消息，`remaining==0` 时）
+
+消息页「未读」tab（只处理未读；已处理自动变已读）→ 逐会话（≤10）：读简历 7 字段 → `candidate_get_or_create`（source=inbound，**主键 `liepin_user_id` 用抓取时间戳** `ts_YYYYMMDD_HHMMSS`）→ 读详情页「沟通职位」模糊匹配 `job_list_active`（匹配不到 → `job_upsert` 录入后拿新 id）→ `risk_check` → `screen` 评分 →
+
+- **已带附件简历**（会话有附件气泡[文件名] 或 详情页有「附件简历」区+文件名）：头像 → 资料页 → 划到底 → 附件简历 → PDF 查看器（右上角有「转发」）→ `download_attachment(...)` 下载**真实 PDF** 归档 → `interaction_log(in, attachment)` + `state_transition(receive_resume)`。**跳过触达**（对方已发简历）。
+- **无附件**：判定拒绝 → `reject_hard/reject_llm`；通过 → 双查 → `gated_tap(touch=True, counts_daily=False)` 索要简历（**不计每日 100**）→ 验证上屏 → 先 `interaction_log(out)` 再 `state_transition(request_resume/await_resume)`。
+
+### 8.3 附件与「在线简历 ≠ 附件」（防重复踩坑）
+
+判定「有附件」的**唯一依据**是：会话里有附件气泡（文件名）或详情页有「附件简历」区+文件名。「看简历」打开的**在线简历**（带「在线」标签）不是附件。无附件时严禁 `receive_resume` / `interaction_log(msg_type='attachment')`——工具会因缺附件归档证据（`candidate.attachment_keys`，仅由 `download_attachment` 写入）**直接拒绝**；截图归档（`snapshot_put`）不写该证据。
+
+### 8.4 审计与顺序铁律
+
+触达 → 验证 → `interaction_log` → `state_transition` → `tasklog_add`，顺序不可颠倒（触达类事件（greet/request_resume/await_resume）在该 jc 无 out 流水时会被工具拒绝；`interaction_log` 对第二条 out 也会拒绝）。
+
+### 8.5 72h 关闭
+
+`awaiting_resume` 且 `resume_requested_at` **严格早于** now-72h → `no_response → closed`（恰好 72h 不关）。由 daily_round 第 1 步调 `close_stale_awaiting()` 执行；零追发（一人一消息）。
+
+## 9. 数据模型与迁移
+
+- 六张业务表：`accounts` / `jobs` / `candidates` / `job_candidate` / `interactions` / `review_overrides`；外加 `task_logs`（成本与事件落账）。
+- `jobs.status`：`active`（参与打招呼）/ `draft`（扫到但 JD 不足 30 字或未确认读完整——**工具层不可见，不参与任何招聘动作**；在前端补 JD 后启用）。
+- `candidates.liepin_user_id`：**账号内唯一**（`uq_candidate_account_liepin`），主键值为抓取时间戳。
+- 迁移：`services/pipeline/alembic/versions/`，**当前 head `0012`**。schema 唯一 owner 是 Alembic（pipeline 启动即 `upgrade head`）；`alembic check` 由 `services/pipeline/tests/test_migrations.py` 守卫（模型与迁移逐列一致，含 server_default）。
+
+## 10. 日常巡检
+
+- **前端总览**：漏斗计数、今日触达/回传、日回收目标进度、告警条（登录态 / 风控熔断 / 今日转人工）。
+- **账号与登录**：账号页看生效账号；登录向导看相位；`/api/hr/alerts` 看 `login` / `risk_paused` / `quota_used_today` / `manual_today`。
+- **成本**：日报（`/api/hr/daily`）逐日 tokens/cost（**全系统口径**，不按账号拆）；`task_logs` 里 main/daily 轮次 token 汇总的 `outcome` 反映真实成败。
+- **转人工队列**：`/api/hr/manual-queue`（failed_needs_manual 落账 + 派发登记反查上下文）→ ack 注记。
+- **Pi 会话**：`~/.pi/agent/sessions/`（jsonl）；token 汇总靠它，排查「成本不落账」先看它。
+- 常用手工检查：`redis-cli GET cua:risk:paused:{id}`、`redis-cli HGETALL pipeline:state:login_req`、`redis-cli GET msg-touch:{id}:{YYYYMMDD}`。
+
+## 11. 常见故障表
 
 | 现象 | 排查 / 处置 |
 |---|---|
-| docker 镜像拉取失败/卡住 | 国内直连 Docker Hub 不通：走 §2.1 daocloud 加速 pull + tag |
-| 首次 `up -d --wait` 超时退出 1 | mysql 首次初始化自带 restart 周期：等约 30s 重跑；或改用 `up -d` + infra 冒烟探活 |
-| `--wait` 报 minio-init exited(0) | 一次性容器属预期：用 `up -d` + `uv run pytest infra/tests -m infra` 探活 |
-| 端口占用（3306/6379/9000/9001/8000/8001） | `netstat -ano \| findstr :8000` 找 PID → `taskkill /PID <pid> /F` |
-| `ModuleNotFoundError: arq / apscheduler / pydantic_settings` | venv 被裸 `uv sync` 修剪过：`uv sync --all-packages` |
-| worker 起不来 / arq 队列无人消费 | 检查 `PYTHONPATH`（arq CLI 导入 app.worker 需要，见 §3）；Redis 可达；`CUA_DRIVER_MODE` 取值合法（mock\|real，勿写 local） |
-| scheduler 日志 `[login] 请扫码登录…` 且派发暂停 | 登录态失效：桌面应用扫码重新登录，下一轮自动解除；状态键 `pipeline:state:login` |
-| screening 返回 `judge_reason="deferred: LLM unavailable"`（降级） | 检查 .env `SCREENING_LLM_*`（key/模型名）；候选人不推进，deferred_sweep 30min 自动重判 |
-| worker 日志大脑不可用 → 任务 deferred 重判（60s） | 检查 .env `CUA_BRAIN_*`；模型必须是 `deepseek-flash`（`deepseek-v4-pro` 不支持 image 输入）。**另一已知原因（已修）**：T12 前 `response_format` 用 json_schema，DeepSeek 现拒（400 `This response_format type is unavailable now`）——已改 `json_object` + 解析容忍代码围栏 |
-| 页面出现「账号行为异常」+ 图形验证码（安全验证页） | **立即停止全部自动化**（停 worker + 排空 arq 队列，防继续操作被控账号）；人工在桌面完成安全验证（绝不自动绕过）。2026-10-06 实测触发背景：连续高频真实校准（多任务连跑 + 失败任务快速重试 + 反复切页/重载，1 小时内数百次操作）。**已内置防线（2026-10-06；同日二次事件后加固）**：驱动检测风控页→立即 failed_needs_manual  不重试 + **写全局熔断标志 `cua:risk:paused`**（队列其余任务零操作直接跳过转人工，不再逐个试探）；重试默认延后 60s（`CUA_RETRY_DEFER_SECONDS`）；任务间隔默认 30s（`CUA_TASK_GAP_SECONDS`；E2E instant 自动置 0）。**恢复流程**： 人工完成安全验证并确认页面恢复正常后清除熔断标志：`redis-cli -h 127.0.0.1 DEL cua:risk:paused`；观察期内（实测同日二次触发：阈值显著降低）建议静置 ≥24h 后以超低密度恢复（任务间隔 ≥120s、单批 ≤3 个操作） |
-| worker 疑似「吞队列」：队列只减、无无处理日志或处理即崩 | **环境错误 + 僵尸特性（2026-10-06 晚实测）**：任务级异常不会杀死 arq worker——配错的 worker 会循环吞掉整个队列（每个任务失败但不落 pipeline 账）。核查三项：① **cwd 必须是仓库根**（`env_file=".env"` 相对 cwd；从 `services/cua-agent` 子目录启动会缺 `CUA_BRAIN_API_KEY` 而任务级崩溃）；② `CUA_DRIVER_MODE=real`（缺省为 mock，会去找不存在的 `worlds/default.json`）；③ `PYTHONPATH=services/cua-agent`。处理：先 `pkill -9 -f "arq app.worker"` 清僵尸，修环境后把未完成任务重新入队 |
-| 跑完 E2E 后真实批次的 MinIO 归档消失 | E2E `reset_state` 会清空 bucket 内 `snapshots/` 与 `resumes/` 全部对象（含生产库模式下的真实归档）。**跑 E2E 前对 MinIO 一并做备份，或选无真实归档的时段**；DB 记录（object_key）不受影响，平台侧原件仍在，必要时重跑下载任务补归档（2026-10-06 晚实测：本批 PDF×10 + 截图×10 被清） |
-| worker 日志「窗口不可达（off_space_or_ax_unresolved）」 | 窗口 AX 面不可解析（风控/登录跳转或用户切屏的伴生状态）：任务已转 failed_needs_manual（保守化：不自动重试；不触发全局熔断）。确认桌面与浏览器窗口恢复后重跑该任务 |
-| 任务 evidence 出现 `llm_fallback` / `fallback_exhausted` | 读取链（check_login/list_unread/read_resume/check_attachment）定位失败触发 LLM 视觉兜底：`llm_fallback`=兜底诊断与动作（用量计入 brain_tokens 账目）；`fallback_exhausted`=兜底执行后仍失败已转人工（不重试）。发送类/下载类不兜底；兜底动作全程不绕过风控检测（撞风控页同样触发全局熔断） |
-| real 模式驱动方法抛 NotImplementedError | **已不适用**：T12（2026-10-06）完成 7 个页面方法校准；2026-10-07 完成第 8 个 `list_recommended`（推荐页逐卡开预览提取「简历编号」；入口/结构/出口均实测）；若再现说明代码回退 |
-| 回调 `404 {"detail":"Not Found"}`；E2E 卡在 read_resume「max retries 4 exceeded」 | **本机代理环境变量**：`HTTP_PROXY`/`HTTPS_PROXY` 指向本地代理时，httpx（默认 `trust_env=True`）会把 `127.0.0.1` 的内网回调也发给代理，被拦成 404（实测特征：同一连接首请求 200、其后全 404；`http.client` 与新建连接均正常）。服务侧已用 `trust_env=False` 绕过硬编码内网调用；自建脚本请设 `NO_PROXY=127.0.0.1,localhost,::1`（或 `set HTTP_PROXY=` 清空）。排查命令：`echo $env:HTTP_PROXY` |
+| 轮次不启动，`[skip]` 有明确原因 | 按 §5.1 对照表逐条核：窗口外 / 登录在途 / 无 active 职位 / 空退避 / 锁被占——五条各有对应文件（§5.3）与恢复路径 |
+| 「没有生效账号」503 / `NoActiveAccountError` | 前端账号页尚无生效账号（或 `is_active` 全 false）：去账号页选一个（走 `switch`/`login`），不要直接改库 |
+| 登录卡在 awaiting_code 超时 | 请求 TTL 30 分钟 → `expired`；验证码 TTL 300s、只能取一次；重新发起即可（`force=true` 覆盖在途请求） |
+| `attempts>=3` 判 failed | login_watch 尝试 3 次未推进即停；看 error 文案（多含屏上所见），修锚点/换人工 |
+| 换号失败且旧号已退 | 「手机上现在没有账号」——前端有「登回 <旧号>」入口；必须人工/系统把某个号登回去（§7.3） |
+| 主线被 `.login_in_flight` 挡住 | 最长 2400s 自愈；确认轮询器在跑（`ps`/launchd），需要立即恢复可手动删该文件（确认手机不在登录页） |
+| 风控熔断（`risk_paused=true`） | 人工在手机完成安全验证 → 清 `cua:risk:paused:{account_id}`（或前端操作）→ 低密度恢复；恢复前勿启动触达轮次 |
+| 风控页再现（图形验证码/滑块） | **立即停止全部自动化**，绝不尝试绕过；按 §6.3 处置 |
+| `.round.lock` 残留 | 锁自愈条件：PID 不存活或 mtime >3900s；都满足则下一轮自动接管。手动删前先 `ps` 确认没有 Pi/node 在跑 |
+| `.inbound_state.json` 退避中但系统在干活 | 文件里看 `empty_streak`/`last_empty_ts`；30 分钟自动恢复。注意：无 active 职位的跳过**不**记退避 |
+| 轮次跑完但成本没落账 / 报 `uv` 或 pi 找不到 | `run_round.py` 用 `uv run --package hr-workbuddy-pipeline` 写 `task_logs`、用探测到的 pi/node 起 Pi——launchd 的 PATH 很窄：确认 `uv` 在 PATH、pi 在 `HR_PI_CLI` 或 Homebrew 常见路径（代码已探测 `/opt/homebrew/bin/pi`、`/usr/local/bin/pi`） |
+| adb 掉线（手机连不上） | adb 走 WiFi：`adb connect <手机IP>:5555`；`phone.py` 会按 `HR_ADB` → Homebrew → `~/Library/Android/sdk` → Windows 路径依次探测。掉线时所有真机动作都会 AdbError |
+| screening 返回 `judge_reason="deferred: LLM unavailable"` | 检查 `.env` 的 `SCREENING_LLM_*`（key/模型名/base_url）；候选人只存快照不推进，**daily_round 的延期重判**会重新 `screen`（不再有 30min 自动巡检） |
+| pipeline 起不来 / alembic 报 `Access denied for user 'hr_user'@'127.0.0.1'` | **CWD 坑**：`env_file=".env"` 按 CWD 解析。在 CT104 从 `services/pipeline` 跑 alembic/脚本时先 `export DATABASE_URL=$(grep '^DATABASE_URL=' <仓库>/.env \| cut -d= -f2-)`；同理任何读 `app.*` 的脚本要先 chdir 到仓库根 |
+| 内网调用返回 404（首请求 200、其后全 404） | **代理环境变量**：`HTTP_PROXY/HTTPS_PROXY` 经 httpx `trust_env` 把 127.0.0.1 交给代理。服务侧已 `trust_env=False`；自建脚本设 `NO_PROXY=127.0.0.1,localhost,::1` |
+| `ModuleNotFoundError: fastapi / pydantic_settings / mcp` | venv 被裸 `uv sync` 修剪过：`uv sync --all-packages --all-groups` |
+| docker 镜像拉取失败/卡住 | 国内直连 Docker Hub 不通：走 §3.2 daocloud 加速 pull + tag |
+| 端口占用（3306/6379/9000/8001/8000/3000） | `netstat -ano \| findstr :8000` 找 PID → `taskkill /PID <pid> /F`（Windows）；Mac/Linux 用 `lsof -i :8000` |
+| 前端 `pnpm` 报版本错 | 走 `corepack pnpm`（根 `package.json` pin 了版本） |
+| 手工改了库/表结构导致 `alembic check` 失败 | schema 唯一 owner 是 Alembic：回滚手工改动，改模型 + 写迁移，跑 `cd services/pipeline && uv run pytest tests/test_migrations.py` |
 
-### 5.7 两路径流程差异（2026-10-06 策略）
+## 12. 备份与脚本
 
-- **inbound（主动咨询者）**：读在线简历 → **先探附件**（读后分流）：
-  - **已有简历** → **回执 `resume_ack`**（零岗位名；派发前做候选人级一人一消息检查——已触达则跳过回执）+ **直接下载入库**（硬规则不拦收：PDF → MinIO + MySQL）→ 收到后补 LLM 评分
-  - **无简历** → 硬规则 → 通过者直索要（`direct_request`，零岗位名）→ 72h 等待 → 收到 PDF 入库 → 收到后补评分（写 match_score/judge_reason 供 HR；补评分失败仅记标记不重试，M3 人工关注）
-- **outbound（推荐人，M2）**：分层判定通过者打招呼+索要（`greet_request`，含岗位名），未通过判定者零触达（触达成本）。**2026-10-06 已实现**：`outbound_round`（间隔/每轮上限/爬坡参数）→ `LIST_RECOMMENDED`（推荐人页读取）→ 建档（source=recommended）→ 两层判定 → 打招呼 → 72h 等回传；**默认关闭**（`OUTBOUND_ENABLED=false`）——待 W7 真实页面校准后开启（校准清单：`docs/superpowers/plans/2026-10-06-liepin-m2.md` §7）。
-- **话术零岗位名（2026-10-06 晚事故修订）**：会话「沟通职位」可能与库内岗位错位（实测：回执误写「产品经理」而候选人在聊「海外ToB渠道销售（出海品牌）」）→ inbound 双向话术（回执/直索要）不引用 {title}；outbound greet 仍带 {title}（主动触达须说明来意岗位）。
+- `scripts/backup.py`：`mysqldump`（全库 → `backups/db/*.sql.gz`）+ MinIO 全量（→ `backups/minio/<ts>/`），各留最近 14 份。读 `DATABASE_URL` / `MINIO_*` 环境变量；`scripts/deploy/install.sh backup` 会装成 Mac 上的 launchd 日历任务（每日 21:30，工作窗外）——实际部署形态 TODO 待确认。
+- `scripts/hr_report.py`：只读通道——候选人清单 / `--stats` 日报漏斗 / `--fetch all|<jc>` 拉快照+PDF 到 `exports/`。
+- `infra/worlds/*.json`：第一代 mock 剧本，已无消费者（保留占位）。
 
-## 6. 已知限制（上线前门禁）
+## 13. 安全红线
 
-以下三项为历史已知缺陷，**当前状态**如下（2026-10-06 更新）：
+- **一人一消息**：每 job_candidate 终身至多 1 条 out（打招呼/索要按平台原生动作）；发送后任何异常转人工，**不自动重发**。候选人的「终身一条消息」按候选人级（跨岗位）双查兜底。
+- **触达只能走 `gated_tap(touch=True)`**；延时、每日 100、工作窗口是风控约束，不是可选项。
+- **风控即停**：风控/验证页出现立即停手 + `risk_set()` + 转人工，绝不绕过。
+- **数据本地**：简历 PDF 与快照只存本地 MinIO；在线简历只存 7 个最小字段快照（姓名/liepin_user_id/学历/年限/城市/薪资/经历摘要）；密钥只在 `.env`（git-ignored），任何提交文件不得含 key。
+- **封号风险**：使用者知晓并接受猎聘协议封号风险，使用专门招聘子账号承担；绕过限频/窗口会显著提高风控画像。
+- **真机试错禁令**：一切探查遵循 `probe_jobs.py` 的原则——人决定点哪，机器只负责看；「发职位」空白表单误提交 = 真的对外发布职位。
 
-1. **同一任务可能被重试重发**：【已修，Eb4f934】发送类任务失败后一律 `failed_needs_manual`（`post_send_failure` 证据），arq 不再同 payload 重跑；真实发送的重复窗口关闭。
-2. **非 awaiting_resume 状态到达的简历附件被静默丢弃**：【已修，2026-10-06】迟到附件“只存不推进”（新状态直收入库路径 `new→resume_received` 也纳入受理范围）。
-3. **「终身一条消息」按 job_candidate 粒度**：【已全域化，2026-10-06】候选人级一人一消息预检已覆盖全部 SEND 派发点（推荐人建档、screening pass、回执派发三处）+ 结果侧 jc 级兜底；跨岗位去重生效。
+## 14. 待确认清单（写稿时未能从代码/仓库取证）
 
-## 7. 安全红线
-
-- **一人一消息（决策 3）**：每 job_candidate 终身至多 1 条 out（greet_request 合并打招呼+索要），无催促无追发。冒烟仅对自备测试候选人；`smoke_real.py --step send` 必须 `--candidate-liepin-id` + `--yes` 双开关。
-- **零触达原则**：一切验证优先 mock（M1 E2E 全 mock）；真实触达前脚本打印全文与风险提示；`CUA_E2E_INSTANT=1`（延时 0 + 桶直通）**严禁**出现在真实冒烟/生产——延时、20/hr、工作窗口是风控约束不是摆设。
-- **数据本地不外传**：简历 PDF 与快照仅存本地 MinIO；在线简历仅存 7 最小字段快照（姓名/liepin_user_id/学历/年限/城市/薪资/经历摘要）；真实密钥仅 `.env`（git-ignored），任何提交文件不得含 key。
-- **封号风险（决策 10）**：使用者知晓并接受猎聘协议封号风险，使用专门招聘子账号承担；任何绕过限频/延时/窗口的操作都会显著提高风控画像。
-
-## 8. 常驻部署与备份（上线硬化，2026-10-06）
-
-- **常驻守护（launchd）**：`scripts/deploy/install.sh` 安装四服务（pipeline/screening/scheduler/worker），
-  `KeepAlive` 崩溃自动拉起、`RunAtLoad` 登录即起；环境由 `run_service.sh` 固化
-  （cwd=仓库根、NO_PROXY、CUA_DRIVER_MODE=real、PYTHONPATH——僵尸 worker 教训的对策）；
-  日志在 `.run/logs/`；卸载：`scripts/deploy/uninstall.sh`。
-  前置：Docker（redis/minio）+ MySQL 已运行。worker 依赖交互式桌面会话——锁屏期间任务转人工，恢复后自动继续。
-- **备份**：`scripts/backup.py`（mysqldump → `backups/db/*.sql.gz` + MinIO 全量 → `backups/minio/<ts>/`，
-  各保留最近 14 份）。建议上线后每日 21:30（工作窗外）跑：launchd 或 crontab 均可。
-- **E2E 数据面隔离**：E2E 跑在测试库 `hr_workbuddy_test` + bucket `hr-workbuddy-e2e` + Redis `/1`；
-  指向生产库会直接拒跑（`E2E_ALLOW_PROD=1` 可强行绕过，勿在生产批次期间使用）。
-- **HR 查看通道（M3 前凑合）**：`scripts/hr_report.py`——候选人清单（默认）/ `--stats` 每日漏斗与
-  索要→回传转化率 / `--fetch all|<jc>` 拉取快照+PDF 到 `exports/`（只读脚本）。
-
-## 附录：冒烟结果记录
-
-> 每次真实账号冒烟按日期追加一行；①-⑤ 逐行记录输出结论（含「待 T12 校准」的预期失败）。
-
-| 日期 | 执行人 | 步骤 | 命令/操作 | 结果 | 备注 |
-|---|---|---|---|---|---|
-| 2026-10-06 | Qoder(T12) | ① 登录态 | `smoke_real.py --step login` | **通过**：`check_login() → True`（首次扫描 2.1s / 缓存 0.2s） | macOS 迁移后重校：窗口判据=地址栏含 liepin.com；登录锚点=后台导航 |
-| 2026-10-06 | Qoder(T12) | ② 登出/恢复 | （未执行） | 待办 | 需全栈运行 + 人工扫码配合（本地登出→告警→扫码恢复） |
-| 2026-10-06 | Qoder(T12) | ③ 读简历 | `--step read --candidate-liepin-id e37fdde092f5Yc6f103cf422b` | **通过**：截图 1,062,579B + 7 字段全对（梁女士/硕士/工作2年/佛山/11-22k×12薪/摘要全文） | 零触达；liepin_user_id 真实来源=批量预览页「简历编号」 |
-| 2026-10-06 | Qoder(T12) | ④ 发消息 | `--step send --candidate-liepin-id e37fdde092f5Yc6f103cf422b --yes --text "您好 梁女士，⋯发一份简历吗？"` | **通过**：消息上屏（16:02，截图目视确认）；输入读回校验+发送后上屏校验全过 | 唯一真实触达；梁女士的一人一消息额度已消耗，不可对其重发 |
-| 2026-10-06 | Qoder(T12) | ⑤ 账目核对 | `--step verify` | **通过（配置面）**：real / 20条·小时 / `CUA_E2E_INSTANT` 未设 / 延时区间正确 / 工作窗口 08:00–20:00 | 本小时无 `msg-touch:*` 键（直连脚本不经 worker 延时/桶）；worker 级延时·桶·TaskLog 待全栈真实链路验证 |
-| 2026-10-06 | Qoder(T12) | 联调切片（附加） | 手工入队 CHECK_LOGIN（模拟 scheduler）→ pipeline + real worker | **通过（全链）**：worker `outcome=success`（19.7s=延时~12s+执行）；`/internal/state/login` → `is_login=true`；`task_logs` 落账 tokens=1176 / duration=7.78s | 期间发现并修复：DeepSeek 拒 json_schema（400）→ 大脑改 `json_object`（单测 57 绿）；附件链同步实测：check_attachment=True、download_attachment 得 322,966B PDF |
-| 2026-10-06 | Qoder(T12) | inbound 全链（附加） | 手工入队 LIST_UNREAD →  真实 worker 链（screening 用拒绝桩保零触达） | **部分完成后遇风控停机**：LIST_UNREAD 成功（建档 8 位真实候选人）；2 个 READ_RESUME 成功（其余遇风控） ；**触发猎聘风控（账号行为异常验证码）→ 立即停机** | 零触达保持（interactions 未增）；处置与恢复建议见 `.scratch/liepin_calib/risk_control_incident.md`；恢复前需人工完成安全验证 + 控制操作密度 |
-| 2026-10-06 | Qoder(T12) | 策略回溯批次（check-first 分流） | 重开 10 人（终态→new）→ 逐个入队 CHECK_ATTACHMENT → 真实 worker（120s 间隔）级联：有简历→回执+下载入库 / 无→硬规则→直索要 | **通过（10/10）**：全部 resume_received（补评分 15-55 落账）；共 9 条回执真实发出；梁女士仅入库不回执（候选人级一人一消息拦截生效）；零风控、队列/熔断键终态清零 | 硬规则已剔除年限（保留 min_education=本科）。事故与修复：①僵尸 worker（mock 缺 world + 任务级崩溃不退出，循环吞 10 个任务）→ pkill 后带正确环境重入队；②**话术错位事故**：已发 5 条回执含「产品经理」岗位名（会话实际「海外ToB渠道销售（出海品牌）」，库内岗位为 M1 演示岗）→ 修订为**话术零岗位名**并撤销未发 4 条重入队；已发 5 条按一人一消息不可撤回；③E2E 验证后 MinIO 真实归档被清（PDF×10+截图×10，DB 记录完整，需要时补下载） |
-
-| 2026-10-07 | Qoder(T12) | 第三次风控（终判：深夜波次 + 累计过载） | 检出：08:05 校准任务侧只读探针（窗口不可达自停）+ 用户晨检发现验证页；驱动实测抛 `RiskControlDetectedError` | **账号第三次进入安全验证**；当夜（10-06 23:25→00:24）曾以 120s 间隔连跑探针+补归档 20 任务（含批量页连续 10 次下载）| **纪律升级（第四次起执行）**：①深夜操作永久禁止（仅 [08:00,20:00) 窗口内）②单批 ≤3 操作、≥120s 间隔 ③连续两次风控后自动强制静置 ≥24h，第三次后 ≥48h ④风控后恢复首日仅只读、单任务人工目视。证据：TCC 授权记录、`desktop_fail.png`、0 条任务落账（校准运行未产生账号操作） |
-- **HR 工作台（M3 最小可用，2026-10-07）**：`apps/hr-console`（Next.js 16 + Tailwind 4）。
-  启动：`cd apps/hr-console && pnpm install && pnpm dev`（:3000）或 `pnpm build && pnpm start`；
-  `/api/*` 由 next.config rewrites 代理至 pipeline:8000；入口=本机 localhost（spec §7-6）。
-  页面：总览（漏斗/日报/阈值调参）、候选人（两级详情抽屉/复核推翻/手动重跑）、人工队列（ack/重跑）。
-  注意：本机 pnpm 由 corepack pin 为 11.7.0（根 `package.json` packageManager；
-  pnpm 12.4.2 缺 `pnpm.cjs` 会导致 shim 崩溃）。
-
-## 第四次账号行为验证（2026-10-07 13:31）——已处置
-
-- **现象**：批量预览简历页（**昨日 batch token 链接**）被 read 回退路径第三次访问后，
-  跳转「账号行为异常」安全验证页（图形验证码，需人工完成）
-- **当日账号动作盘点**：12:2x 三点只读（验证恢复后）；13:06「立即沟通」实测 1 点
-  （真实触达 艾先生）；13:18「向TA索要」实测 1 点（真实触达 唐女士）；
-  13:2x-13:33 list/read 校准（多次预览开合 + 批量页重访）
-- **根因**：① 批量页（showbatchresumelist）属敏感页，旧 batch token 反复访问触发行为判定；
-  ② 推荐人 read 走"批量页优先"属设计错误（推荐人不在批量页，白白踩敏感页）
-- **修复（代码层，已提交）**：推荐人 read 直连推荐页（`prefer_recommend`，由
-  `context.source` 驱动）；`_goto_recommend` 覆盖层自愈（列表锚点缺席→整页重载）；
-  多标签窗口按标签栏标题聚焦猎聘标签（不再依赖 Cmd+1）；`request_resume` 收尾整页重载
-- **处置纪律**：验证完成前零操作；完成后**静置 ≥48h**（第四次强化口径）；期间仅本地工程
-- **待人工**：请在浏览器完成图形验证码
-- **真实触达记录（不可撤回）**：艾先生 13:06（默认招呼）/ 唐女士 13:18（招呼+索要请求）
-
-## 恢复窗口 SOP（第四次事件后，≥48h 静置结束起）
-
-前提：静置期满（最早 10-09 13:31 后）、工作窗口 [08:00,20:00) 内、风险标志为空。
-逐步执行，每操作点 ≥180s；任一点异常（验证页再现/元素异常）→ 立即停机、延期下一窗口。
-
-- Step 1（1 点只读）：打开推荐页，确认无「账号行为异常」页 → 截图存证
-- Step 2（1 点只读）：read 新路径复验——`prefer_recommend=True` 直连推荐页读 1 人
-  （7 字段 + 截图）；不得再访问批量页
-- Step 3（≤2 发送）：受控首批——内部 API 入队 LIST_RECOMMENDED(limit=2) → 真实 worker
-  全链（read → 两层判定 → 向TA索要 → awaiting）；发送前后截图；发送名单与系统文案
-  执行前列出
-- Step 4：汇报 + 定 OUTBOUND 观察期节奏（轮次/限额/是否开自动）
-- 铁律：批量页（showbatchresumelist）为敏感页——除 inbound 正常单次流程外不得回访；
-  旧 batch token 链接禁止再次打开
-
-## 常驻部署现状（2026-10-07 分批安装）
-
-- **已常驻（launchd 直连解释器）**：`com.hr-workbuddy.{pipeline,screening,worker}` +
-  `com.hr-workbuddy.backup`（每日 21:30 日历任务，DB+MinIO，各留 14 份）
-- **scheduler 暂缓**：它会启动后 5min 内自动跑 `inbound_round`（账号操作）——
-  仅在账号恢复窗口进入阶段 2（观察期）后执行 `bash scripts/deploy/install.sh scheduler`
-- **console**：仍手工 `cd apps/hr-console && pnpm start`（:3000）
-- 重装/补装：`bash scripts/deploy/install.sh [服务名...]`（默认 pipeline screening worker backup）
-- 查看：`launchctl list | grep hr-workbuddy`；日志：`.run/logs/<名>.{out,err}.log`
-- **跑 E2E 前必须先让出 8000**：
-  `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
-  跑完后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.pipeline.plist`
-- 手动立跑一次备份：`DATABASE_URL=... MINIO_BUCKET=hr-workbuddy .venv/bin/python scripts/backup.py`
-
-## 五号事件：E2E 隔离竞态（2026-10-07 13:45，同日修复）
-
-- **现象**：跑 E2E 时卡在剧本 A（LP001 未达 resume_received）；排查发现 E2E 全量任务
-  实际落在 **Redis /0**——shell 环境残留 `REDIS_URL=redis://localhost:6379`（无库号=
-  /0）被脚本 `os.environ.get("REDIS_URL")` 拾取；**常驻 real worker（/0）抢到
-  E2E 的 download 任务，以真实模式试跑 3 次**（均因猎聘窗口不可达失败，**零账户操作**）
-- **修复（脚本层硬件门禁，已提交）**：
-  1. E2E 改用专用变量 `E2E_REDIS_URL`（默认 /1）；解析库号，**指向 /0 直接拒跑**
-  2. 新增前置 `ensure_no_launchd_agents()`：pipeline/screening/worker/scheduler
-     任一常驻在线即拒跑并打印 bootout/bootstrap 命令
-  3. 事故残局清理：/0 队列与派发键已清、常驻 worker 已重启（内存重试态清零）
-- **E2E 标准流程（更新）**：先下线常驻三件 → 跑 E2E → 恢复三件：
-  `for s in pipeline screening worker; do launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hr-workbuddy.$s.plist; done`
-  （跑完 bootstrap 同队列；备份 job 无需下线）
-- **纪律附录**：任何脚本/终端会话不得导出 `REDIS_URL`/`DATABASE_URL` 等生产变量；
-  E2E 只经专用变量注入
-
-## 首批实发批（2026-10-07 午后）实战教训
-
-- **推荐列表轮换极快**：候选会在 10-30 分钟内滑出可视区甚至整列消失——
-  扫描/读取/发送必须"紧咬"（同一轮内 ≤3 分钟完成），慢一步即失联
-- **无附件候选人无「向TA索要」**：预览页只有附件区才有该按钮；已加降级链
-  （→「立即沟通」平台招呼），但个别预览两键皆无（疑懒加载，待专项取证）
-- **杀 worker 会产生僵尸重试**：arq 在 SIGTERM 收尾时把在途任务"will be run
-  again"退回 arq:queue——pkill 后必须 `ZREM arq:queue <job>` + 清 `arq:job:*`
-  `arq:retry:*`，否则新 worker 会捡起死任务反复操作浏览器
-- **并发禁忌**：worker 在跑时严禁脚本再动同一浏览器（互踩导致"已扫 0 张卡"类
-  状态紊乱）
-- 过线待发悬置：赵女士 78 / 谈先生 65（均 resume_requested；因轮换/无按钮未发出），
-  次日优先补发或另选
-- JD 草案（销售版）+ 阈值 55 已生效；launchd worker 待 TCC（辅助功能+录屏）授权
-
-## 触达与回收策略（2026-10-07 改版，生效）
-
-- **发送门槛 = 硬规则**：硬过 → 即发「向TA索要」（原生问候+简历同意请求一体）；
-  无附件者降级「立即沟通」。**LLM 评分不再拦发送**，仅记录分档（高低分参考排序/日报）
-- **硬拒者**：不发、不轮询（终态）
-- **回收**：附件到达一律回执+下载入库（不拒收）；**日回收目标 50 份**
-  （`overview.today.received_target`；控制台总览有进度条）
-- **达标后运营视图**：候选人页「仅达标分档」开关（`/api/hr/candidates?min_score=X`），
-  数据不丢弃
-- **存量说明**：改版前产生的 rejected_llm（hard_pass 且低分：罗/刘/钱/许）按新策
-  应释放重筛→发送；连同赵/谈悬置，一并列入次日补发清单
-
-## 里程碑：首笔真实「向TA索要」发出（2026-10-07 16:15）
-
-- **郝先生**：沟通列表实证「我想要一份你的简历，你是否同意？」16:15 [未读] ✓
-  （首笔真实简历请求送达；账目已补记：interaction out/greet_request + awaiting_resume）
-- **踩坑与修复**：发送成功后 request_resume 内整页重载 → 后置 verify_success
-  （截图+LLM）取不到「对方暂未回复」证据 → 必误判 failed——已修复为保留现场
-  （提交 7305b23）；同类发送今后应正常落 success + 账目
-- **轮换仍是最大敌人**：赵溪海（74 分）读取后 4 分钟发送即失联（已扫 10 卡含翻页）；
-  待发窗口极窄——发送应在读取后 ≤1 分钟内触发（gap 调优待做）
-- 待处理悬挂：赵溪海（resume_requested 未发）；艾先生 14:58 已回简历+附件（等
-  inbound 巡轮按标准流程回执入库——下次跑 inbound_round 时自然拾取）
+1. CT104 的 systemd 单元名清单（含 MySQL/Redis/MinIO）与安装形态；Mac 上三个 `com.hr-workbuddy.pi-*` plist 的内容与安装方式（仓库内无脚本）。
+2. `backfill_round` 的触发方式（仓库内无定时任务；rounds.md 按轮次写，疑人工）。
+3. `POST /accounts/login-request/resend` 无消费者（§7.4）。
+4. `accounts.password_enc` 在「密码登录停用」之后的实际用途（代码注释称"换号失败时的回滚保障"，但当前登录路径只认验证码；`decrypt_secret` 目前只被测试引用）。
+5. 文档/提示词间的数字漂移（以代码为准，待统一）：hr-tools 工具数 = 代码 32 个 `@mcp.tool()`；`agent/system-prompt.md` 写 28（未列 `login_map_get`/`login_fill_phone`/`adb_selftest`/`list_backfill_candidates` 这 4 个登录/回填工具）；`docs/architecture/` 写 26。另：`rounds.md` 写「心跳每 2 分钟」，而 launchd 任务为每 300 秒。
+6. `docs/architecture/` 成文于 2026-10-14——其中的调度一节（Windows 任务计划 `hr-pi-main`/`hr-pi-daily`）与风控键写法（无账号分片）已被现状取代，建议按本文档更新。
+7. `.env.example` 与 `scripts/deploy/run_service.sh` 的第一代遗留键/分支待清理（§3.6）；`scripts/deploy/uninstall.sh` 循环里还留着 scheduler/worker。

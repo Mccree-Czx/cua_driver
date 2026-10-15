@@ -1,0 +1,85 @@
+// hr_workbuddy · inbound（主动咨询者）单候选人闭环 —— 当前态（main @ 4a7f939）
+// 证据：agent/system-prompt.md §四、agent/rounds.md §1、services/pipeline/tools_mcp_server.py
+// 说明：实线 = 正常路径；虚线 = 异常/停止路径。读取类操作无需 gated_tap，触达类必须 gated_tap(touch=True)。
+digraph inbound_flow {
+  rankdir=TB;
+  compound=true;
+  graph [fontname="Microsoft YaHei", labelloc="t",
+         label="inbound 单候选人闭环（main_round · 单轮 ≤10 会话 · 全局轮次锁串行）",
+         nodesep=0.35, ranksep=0.45, bgcolor="white"];
+  node [fontname="Microsoft YaHei", shape=box, style="rounded,filled",
+        fillcolor="#F7FAFF", color="#5B8FF9", fontsize=11];
+  edge [fontname="Microsoft YaHei", color="#7F8C9B", fontsize=10];
+
+  subgraph cluster_sched {
+    label="外部调度（Windows 任务计划程序）";
+    style="dashed,rounded"; color="#999999";
+    sched [label="hr-pi-main\n每 2 分钟触发\n（hr-pi-daily 19:50）", shape=box, fillcolor="#F0F0F0", color="#999999"];
+    runner [label="run_round.py\n工作窗口门(08:00-20:00) · 全局轮次锁 · 空轮退避 · token 落账",
+            shape=box, fillcolor="#F0F0F0", color="#999999"];
+    sched -> runner [label="触发"];
+  }
+
+  start [label="Pi 打开猎聘（手机）→ 消息页 → 未读 tab"];
+  pick [label="取 1 个未读会话\n（单轮 ≤10，超出留待下一轮）"];
+  read [label="进详情：dump 提取简历 7 字段\n（name / 学历 / 年限 / 城市 / 薪资 / 简介）"];
+  ident [label="candidate_get_or_create（ts_ 时间戳 ID）\n→ 更新快照 → 读「沟通职位」匹配 jc\n（匹配不到先 job_upsert 录入）"];
+  score [label="risk_check（熔断即停）→ screen 评星 1-5"];
+  branch [label="有附件简历？\n（会话附件气泡[文件名]\n或 详情页「附件简历」区）", shape=diamond, fillcolor="#FFF7E6", color="#FA8C16"];
+
+  subgraph cluster_attach {
+    label="分支一 · 已带附件 ⇒ 直收（零触达）";
+    style="rounded"; color="#52C41A";
+    pdf [label="头像 → 资料页 → 划到底 → 附件简历\n→ PDF 查看器（右上角有「转发」按钮）",
+         fillcolor="#F6FFED", color="#52C41A"];
+    dl [label="download_attachment\n真实 PDF 归档 MinIO\n（写 attachment_keys 证据）",
+        fillcolor="#F6FFED", color="#52C41A"];
+    inlog [label="interaction_log(in, attachment)\n→ state_transition(receive_resume)",
+           fillcolor="#F6FFED", color="#52C41A"];
+  }
+
+  attach_fail [label="非 PDF / 无入口 ⇒ 如实报告「未找到附件」\n不推进 receive_resume（工具会拒绝）",
+               shape=note, fillcolor="#FFF1F0", color="#F5222D", fontsize=10];
+
+  subgraph cluster_request {
+    label="分支二 · 无附件 ⇒ 索要简历（响应性触达，不计每日 100）";
+    style="rounded"; color="#FA8C16";
+    guard [label="① ensure_one_message（jc 级）\n② candidate_has_out_message（人级）\n任一不过 ⇒ 停止该分支",
+           fillcolor="#FFF7E6", color="#FA8C16"];
+    tap [label="gated_tap(touch=True, counts_daily=False)\n服务端双闸门：风控熔断 + 每日限频\n不通过则物理上点不出去",
+         fillcolor="#FFF7E6", color="#FA8C16"];
+    verify [label="每 3-5 个批量 dump 验证上屏\n（漏发标「可能未发送」：不补发、不重试）",
+            fillcolor="#FFF7E6", color="#FA8C16"];
+    outlog [label="先 interaction_log(out)\n→ 再 state_transition(greet/request_resume/await_resume)\n（顺序颠倒会被工具拒绝）",
+            fillcolor="#FFF7E6", color="#FA8C16"];
+  }
+
+  log [label="tasklog_add 成本落账\n（tokens / cost / duration）", fillcolor="#F9F0FF", color="#722ED1"];
+  report [label="输出 @@RESULT@@ inbound=N outbound=M\n（供调度脚本判定空轮退避）", shape=note, fillcolor="#FAFAFA", color="#8C8C8C"];
+  risk [label="任一 dump 出现风控页 / 验证码\n⇒ 立即停止全部操作 → risk_set() → 转人工",
+        fillcolor="#FFF1F0", color="#F5222D"];
+
+  runner -> start [label="启动 Pi（pi -p + system-prompt + 轮次指令）"];
+  start -> pick;
+  pick -> read;
+  read -> ident;
+  ident -> score;
+  score -> branch [label="硬规则/评分通过"];
+  score -> risk [label="熔断已激活", style=dashed, color="#F5222D"];
+
+  branch -> pdf [label="有附件", color="#52C41A"];
+  pdf -> dl;
+  dl -> inlog;
+  pdf -> attach_fail [label="无入口 / 点开不是 PDF", style=dashed, color="#F5222D"];
+
+  branch -> guard [label="无附件且通过", color="#FA8C16"];
+  guard -> tap [label="双查通过"];
+  tap -> verify [label="executed=true"];
+  tap -> risk [label="rate_limited / 发现验证页", style=dashed, color="#F5222D"];
+  verify -> outlog [label="确认上屏"];
+
+  inlog -> log;
+  outlog -> log;
+  log -> report;
+  risk -> report [label="转人工报告（已发生的事实）", style=dashed, color="#F5222D"];
+}
