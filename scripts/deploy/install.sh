@@ -1,10 +1,17 @@
 #!/bin/bash
-# 安装 launchd 常驻守护（服务：pipeline / screening / scheduler / worker / backup）。
+# 安装 launchd 常驻守护（服务：pipeline / screening / backup）。
 #
-# 用法（2026-10-07 起支持分批）：
-#   bash install.sh                 # 默认：pipeline screening worker backup
-#   bash install.sh scheduler       # 单独补装 scheduler（会 5min 内自动跑 inbound_round
-#                                   # —— 账号操作！仅在账号恢复窗口开启后安装）
+# 用法：
+#   bash install.sh                 # 默认：pipeline screening backup
+#   bash install.sh pipeline        # 只装某一个
+#
+# ★ 2026-10-15 修订：删掉了 scheduler 与 worker。
+#   它们是**第一代架构**的常驻服务（APScheduler 编排 + arq worker + 桌面 CUA 驱动），
+#   随 commit aeacfe5「Pi 全权内核重构」一起删掉了，`services/` 下现在只剩
+#   pipeline 与 screening。这个脚本当时没跟着改，于是它会去装两个**不存在的服务**：
+#   worker 跑的是 `arq app.worker.WorkerSettings`（模块早已不存在），
+#   scheduler 的 PYTHONPATH 指向 `services/scheduler`（目录也没了）。
+#   谁照着 README 跑一遍安装，就会得到两个反复重启失败的常驻进程。
 #
 # 2026-10-07 修订：plist 直连 venv 解释器（不经 /bin/bash）。
 #   背景：launchd 拉起的 bash 无「桌面文件夹」访问权（TCC），四服务 exit 126；
@@ -47,14 +54,7 @@ write_plist() {
   local label="com.hr-workbuddy.$name"
   local plist="$AGENTS_DIR/$label.plist"
   local extra_env=""
-  case "$name" in
-    scheduler) extra_env="    <key>PYTHONPATH</key><string>$REPO/services/scheduler</string>" ;;
-    worker)
-      extra_env="    <key>PYTHONPATH</key><string>$REPO/services/cua-agent</string>
-    <key>CUA_DRIVER_MODE</key><string>real</string>
-    <key>CUA_TASK_GAP_SECONDS</key><string>30</string>"
-      ;;
-  esac
+  # scheduler / worker 两个分支随第一代架构一起删掉了（2026-10-15），见文件头说明。
   {
     echo '<?xml version="1.0" encoding="UTF-8"?>'
     echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -122,9 +122,7 @@ write_backup_plist() {
 # —— 服务选择（分批安装）——
 SERVICES=("$@")
 if [ ${#SERVICES[@]} -eq 0 ]; then
-  # scheduler 默认排除：它会 5min 内自动跑 inbound_round（账号操作）——
-  # 仅当账号恢复窗口开启后，显式 `bash install.sh scheduler` 补装
-  SERVICES=(pipeline screening worker backup)
+  SERVICES=(pipeline screening backup)
 fi
 
 for svc in "${SERVICES[@]}"; do
@@ -135,17 +133,11 @@ for svc in "${SERVICES[@]}"; do
     screening)
       write_plist screening "$PY" -m uvicorn app.main:app --app-dir "$REPO/services/screening" --host 127.0.0.1 --port 8001 --log-level info
       ;;
-    scheduler)
-      write_plist scheduler "$PY" -m app.main
-      ;;
-    worker)
-      write_plist worker "$PY" -m arq app.worker.WorkerSettings
-      ;;
     backup)
       write_backup_plist
       ;;
     *)
-      echo "未知服务：$svc（可选：pipeline screening scheduler worker backup）" >&2
+      echo "未知服务：$svc（可选：pipeline screening backup）" >&2
       exit 1
       ;;
   esac
@@ -158,4 +150,3 @@ echo "若服务日志出现 Operation not permitted：将该二进制拖入"
 echo "「系统设置 → 隐私与安全性 → 完全磁盘访问权限」并开启。"
 echo "查看状态：launchctl list | grep hr-workbuddy"
 echo "日志目录：$REPO/.run/logs/"
-echo "注意：worker 依赖交互式桌面会话（Chrome 窗口）——锁屏/注销期间任务转人工，登录后自动恢复。"

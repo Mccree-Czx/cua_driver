@@ -331,6 +331,42 @@ def _resolve_pi_cli() -> str:
 
 PI_CLI = _resolve_pi_cli()
 
+
+def _resolve_node() -> str:
+    """定位 node 可执行文件。
+
+    ★ 和 `_resolve_pi_cli` 同一个理由，**不能赌 PATH**：launchd 会给一份 PATH，
+      但手动排障、非交互 ssh、cron 拿到的 PATH 里常常没有 Homebrew。
+      原先这里写的是字面量 `"node"`，于是**手动跑会直接 FileNotFoundError 抛栈**
+      ——而手动跑恰恰是出问题时才会做的事，等于在最需要它的时刻坏掉。
+
+    （`phone.py` 的 `_ADB_CANDIDATES` 也是同一套思路，注释里写着同样的话。）
+    """
+    candidates = [os.environ.get("HR_NODE"), shutil.which("node")]
+    candidates += [
+        "/opt/homebrew/bin/node",  # Apple Silicon Homebrew
+        "/usr/local/bin/node",     # Intel Homebrew
+        str(Path.home() / ".npm-global/bin/node"),
+    ]
+    for exe in candidates:
+        if exe and Path(exe).exists():
+            return str(exe)
+    # 再试一层：PI_CLI 一定在某个 node 安装的 node_modules 里，
+    # 顺着它的祖先目录找 `bin/node`（Homebrew 的全局包与 node 同前缀）。
+    # 限定 6 层，别一路走到根目录。
+    here = Path(PI_CLI).parent
+    for _ in range(6):
+        cand = here / "bin" / "node"
+        if cand.exists():
+            return str(cand)
+        if here.parent == here:
+            break
+        here = here.parent
+    return "node"  # 实在找不到就退回 PATH，让报错保持原样
+
+
+NODE = _resolve_node()
+
 PROVIDER = "deepseek"
 MODEL = "deepseek-flash"
 
@@ -427,7 +463,7 @@ def main() -> int:
         prompt = extract_round_prompt(name)
         timeout = ROUND_TIMEOUTS.get(name, DEFAULT_ROUND_TIMEOUT)
         cmd = [
-            "node", str(PI_CLI),
+            NODE, str(PI_CLI),
             "--provider", PROVIDER,
             "--model", MODEL,
             "--api-key", API_KEY,
