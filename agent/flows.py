@@ -588,7 +588,18 @@ def fetch_jds(
 
         visited += 1
         phone.tap(_card_tap_point(card["bounds"]), pause=3)
+
+        # ★ 详情页是**冷加载**的：点完立刻 dump，可能只拿到「努力加载中…」那一屏，
+        #   上面还没有「职位介绍」——于是一个正常的详情页被误判成 wrong_page。
+        #   实测（2026-10-15）：4 个职位里**稳定只有第 1 个**失败，正是 App 还没把
+        #   第一个详情页渲染出来的那一次；后 3 个都因为有前一次的预热而正常。
+        #   所以这里给一个**有界等待**（最多 4 次 × 2 秒），而不是一锤子买卖。
         detail = phone.dump()
+        for _ in range(4):
+            if phone.find_exact(detail, _JD_LABEL):
+                break
+            time.sleep(2)
+            detail = phone.dump()
         _guard_risk(detail, "职位详情页")
 
         if not phone.find_exact(detail, _JD_LABEL):
