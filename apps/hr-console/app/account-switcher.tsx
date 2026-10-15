@@ -134,7 +134,7 @@ function AccountManager({
   onChanged: () => Promise<void>;
 }) {
   const [editingId, setEditingId] = useState<number | null>(null);
-  const [loginFor, setLoginFor] = useState<Account | null>(null);
+  const [loginFor, setLoginFor] = useState<{ account: Account; intent: "login" | "switch" } | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -158,8 +158,8 @@ function AccountManager({
     setMsg(null);
   }
 
-  function startLogin(a: Account) {
-    setLoginFor(a);
+  function startLogin(a: Account, intent: "login" | "switch") {
+    setLoginFor({ account: a, intent });
     setEditingId(null);
     setErr(null);
     setMsg(null);
@@ -228,14 +228,36 @@ function AccountManager({
                 <span>手机号：{a.phone_masked ?? "未登记"}</span>
                 <span>密码：{a.has_password ? "已存（加密）" : "未存"}</span>
               </div>
-              <Button
-                size="small"
-                disabled={!a.phone_masked}
-                title={a.phone_masked ? "让系统在手机上登录这个号" : "先补录手机号才能登录"}
-                onClick={() => startLogin(a)}
-              >
-                登录
-              </Button>
+              {a.is_active ? (
+                // 手机上登着的就是它——给「切换」会白退出一次、还白费一条短信
+                <Button size="small" disabled title="手机上现在登着的就是它">
+                  当前生效
+                </Button>
+              ) : (
+                <>
+                  <Button
+                    size="small"
+                    type="primary"
+                    disabled={!a.phone_masked}
+                    title={
+                      a.phone_masked
+                        ? "退出手机上当前的账号，再登录它"
+                        : "先补录手机号才能切换"
+                    }
+                    onClick={() => startLogin(a, "switch")}
+                  >
+                    切换到此账号
+                  </Button>
+                  <Button
+                    size="small"
+                    disabled={!a.phone_masked}
+                    title="手机上已经登出时用这个——它不会替你退出旧号"
+                    onClick={() => startLogin(a, "login")}
+                  >
+                    仅登录
+                  </Button>
+                </>
+              )}
               <Button size="small" onClick={() => startEdit(a)}>
                 补录凭据
               </Button>
@@ -247,7 +269,8 @@ function AccountManager({
       {loginFor ? (
         <div className="account-manager-section">
           <LoginWizard
-            account={loginFor}
+            account={loginFor.account}
+            intent={loginFor.intent}
             onClose={() => setLoginFor(null)}
             onChanged={onChanged}
           />

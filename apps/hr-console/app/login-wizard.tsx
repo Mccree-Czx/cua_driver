@@ -7,6 +7,7 @@ import { CheckCircleOutlined } from "@ant-design/icons";
 type Phase =
   | "idle"
   | "pending"
+  | "logging_out" // 切换时：正在退出旧号
   | "dispatched"
   | "awaiting_code"
   | "verifying"
@@ -17,10 +18,12 @@ type Phase =
 
 type Progress = {
   phase: Phase;
+  kind?: "login" | "switch" | null;
   method?: "password" | "code" | null;
-  mode?: "auto" | "manual" | null;
   account_id?: number | null;
   account_name?: string | null;
+  from_account_id?: number | null;
+  from_account_name?: string | null;
   phone_masked?: string | null;
   resend_seq?: number;
   error?: string | null;
@@ -47,10 +50,13 @@ type AccountLite = {
  */
 export default function LoginWizard({
   account,
+  intent = "login",
   onClose,
   onChanged,
 }: {
   account: AccountLite;
+  /** login = 手机已在登录页时只登录；switch = 先退出旧号再登录目标号 */
+  intent?: "login" | "switch";
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
@@ -108,20 +114,26 @@ export default function LoginWizard({
   async function retry() {
     // 「重试」要**真的重新发起请求**——只重置本地状态的话，外部那条还是 failed，
     // 下一次轮询立刻又把它拉回来，点了等于没点（2026-10-15 就踩了这个）。
-    const mode = progress.mode ?? "auto";
     phaseRef.current = "idle";
     setProgress({ phase: "idle" });
     setCode("");
     setErr(null);
-    await post(`/api/hr/accounts/${account.id}/login`, {
-      method: "code",
-      mode,
-      force: true, // 覆盖那条已失败的旧请求
-    });
+    await start();
   }
 
-  async function start(method: "password" | "code", mode: "auto" | "manual") {
-    await post(`/api/hr/accounts/${account.id}/login`, { method, mode });
+  /** 切换失败后手机上是没号的。这个按钮用同一条流程登回旧号——不假装自动回滚，
+   *  而是给一个明确的一键入口（登回旧号同样要人工填码，没有"自动"可言）。 */
+  async function backToSource() {
+    const id = progress.from_account_id;
+    if (!id) return;
+    phaseRef.current = "idle";
+    setProgress({ phase: "idle" });
+    await post(`/api/hr/accounts/${id}/switch`, { method: "code", force: true });
+  }
+
+  async function start() {
+    const path = intent === "switch" ? "switch" : "login";
+    await post(`/api/hr/accounts/${account.id}/${path}`, { method: "code" });
   }
 
   const phase = progress.phase;
@@ -143,58 +155,67 @@ export default function LoginWizard({
 
       {shown === "idle" && (
         <>
-          <Alert
-            type="warning"
-            showIcon
-            message="开始之前请先确认"
-            description={
-              <>
-                手机上登录新号 = 旧号会被登出。<b>系统不会自动登出，也不会在失败后把旧号登回来</b>
-                ——请先确认你手上能登回当前这个生产号（密码已存在系统里）。
-                然后在猎聘 App 里手动退出当前账号，再点下面的按钮。
-              </>
-            }
-          />
-          <Checkbox checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)}>
-            我已在手机上退出当前账号，并确认能登回它
-          </Checkbox>
+          {intent === "switch" ? (
+            <>
+              <Alert
+                type="warning"
+                showIcon
+                message="这一步会先退出手机上当前登着的账号"
+                description={
+                  <>
+                    系统会：<b>退出当前账号 → 登录「{account.name}」</b>。
+                    退出是<b>不可逆</b>的——如果新号没登上，手机上就没有账号了，
+                    流水线会停摆到你重新登回。失败时下面会给一个「登回原账号」的入口。
+                  </>
+                }
+              />
+              <Checkbox checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)}>
+                我确认要退出当前账号，并切换到「{account.name}」
+              </Checkbox>
+            </>
+          ) : (
+            <>
+              <Alert
+                type="warning"
+                showIcon
+                message="开始之前请先在手机上退出当前账号"
+                description={
+                  <>
+                    这个按钮<b>只负责登录</b>，不会替你退出旧号。
+                    请在猎聘 App 里手动退出，停在登录页，再点下面的按钮。
+                    （想一步到位就用账号列表里的「切换到此账号」。）
+                  </>
+                }
+              />
+              <Checkbox checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)}>
+                我已在手机上退出当前账号，并停在登录页
+              </Checkbox>
+            </>
+          )}
           <div className="account-form">
             <Button
               type="primary"
               disabled={!confirmed}
               loading={busy}
-              onClick={() => void start("code", "auto")}
+              onClick={() => void start()}
             >
-              验证码登录（系统操作手机）
-            </Button>
-            {/* 置灰而不是删掉：让用户看得到「这条路为什么不能走」，而不是以为我们忘了做 */}
-            <Button
-              disabled
-              title="点「登录」会弹滑块验证码，实测走不通（2026-10-15）"
-            >
-              密码登录（已停用）
+              {intent === "switch" ? "开始切换" : "登录此账号"}
             </Button>
           </div>
           <p className="account-form-hint">
-            系统会在手机上打开猎聘、输好手机号、发出验证码，
-            <b>然后这里会弹出输入框让你填</b>。
+            系统会在手机上操作到「验证码已发送」，
+            <b>然后这里会弹出输入框让你填验证码</b>。
             <br />
-            密码登录已停用——猎聘的账号密码登录点下去会弹滑块验证，走不通。
+            密码登录已停用——猎聘的账号密码登录点下去会弹滑块验证，实测走不通。
           </p>
-          <Button size="small" type="text" disabled={!confirmed} onClick={() => void start("code", "manual")}>
-            改用手动模式（系统不碰手机，由我或脚本操作）
-          </Button>
         </>
       )}
 
       {shown === "pending" && (
-        <Step
-          text={
-            progress.mode === "manual"
-              ? "手动模式：请在手机上退出旧号并停在登录页，然后由操作者驱动…"
-              : "正在手机上打开猎聘…"
-          }
-        />
+        <Step text={intent === "switch" ? "正在开始切换…" : "正在手机上打开猎聘…"} />
+      )}
+      {shown === "logging_out" && (
+        <Step text={`正在退出当前账号${progress.from_account_name ? `「${progress.from_account_name}」` : ""}…`} />
       )}
       {shown === "dispatched" && <Step text="正在输入手机号并发出验证码…" />}
       {shown === "verifying" && <Step text="已收到验证码，正在提交…" />}
@@ -268,6 +289,14 @@ export default function LoginWizard({
         />
       )}
 
+      {/* 切换失败且已退出旧号 → 手机上没号了。给一个明确的一键入口，
+          而不是让用户对着「失败」两个字猜下一步。 */}
+      {progress.from_account_id && done && shown !== "success" && (
+        <Button size="small" type="primary" danger loading={busy} onClick={() => void backToSource()}>
+          登回「{progress.from_account_name ?? `账号 ${progress.from_account_id}`}」
+        </Button>
+      )}
+
       {err && <Alert type="error" showIcon message={err} />}
 
       {shown !== "idle" && !done && (
@@ -295,11 +324,12 @@ function Step({ text }: { text: string }) {
 
 function phaseLabel(phase: Phase): string {
   const map: Record<string, string> = {
-    failed: "登录失败",
+    failed: "没成功",
     cancelled: "已取消",
-    expired: "登录请求已超时",
+    expired: "请求已超时",
+    logging_out: "退出旧号时出错",
   };
-  return map[phase] ?? "登录未完成";
+  return map[phase] ?? "未完成";
 }
 
 async function detailOf(resp: Response): Promise<string> {

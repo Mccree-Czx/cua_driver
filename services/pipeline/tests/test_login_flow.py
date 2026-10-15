@@ -20,6 +20,7 @@ from app.deps import get_login_request
 from app.keys import login_state_key
 from app.login_request import RedisLoginRequest
 from app.main import app
+from conftest import DEFAULT_ACCOUNT_ID
 
 import tools_mcp_server as tools
 
@@ -200,26 +201,6 @@ def test_api_rejects_disabled_password_login(client, made):
     assert "滑块" in resp.json()["detail"]
 
 
-def test_api_records_driver_mode(client, made):
-    """mode 决定谁驱动手机：auto = Pi，manual = 轮询器一律不碰。
-
-    两种模式下前端完全一样；区别只在 login_watch 会不会拉起轮次。
-    """
-    acct = _new_account(client, made)
-    client.post(
-        f"/api/hr/accounts/{acct['id']}/login",
-        json={"method": "code", "mode": "manual"},
-    )
-    assert client.get("/api/hr/accounts/login-request").json()["mode"] == "manual"
-
-
-def test_api_rejects_unknown_mode(client, made):
-    acct = _new_account(client, made)
-    resp = client.post(
-        f"/api/hr/accounts/{acct['id']}/login",
-        json={"method": "code", "mode": "carrier_pigeon"},
-    )
-    assert resp.status_code == 422, resp.text
 
 
 def test_api_returns_method(client, made):
@@ -228,6 +209,53 @@ def test_api_returns_method(client, made):
     body = client.get("/api/hr/accounts/login-request").json()
     assert body["method"] == "code"
     assert body["notice"] is None
+
+
+# —— 一键切换（2026-10-15 用户拍板）——
+
+
+def test_switch_records_from_account(client, made, session):
+    """switch 要记下「从哪个号切过来」——登录失败时前端靠它给出「登回旧号」入口。"""
+    acct = _new_account(client, made)
+    resp = client.post(f"/api/hr/accounts/{acct['id']}/switch")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "switch"
+    assert body["from_account_id"] == DEFAULT_ACCOUNT_ID
+    assert body["from_account_name"]  # 前端要显示「登回 <旧号名>」
+
+    polled = client.get("/api/hr/accounts/login-request").json()
+    assert polled["kind"] == "switch"
+    assert polled["from_account_id"] == DEFAULT_ACCOUNT_ID
+
+
+def test_switch_to_the_active_account_is_rejected(client, made):
+    """切到自己会白退出一次、还白费一条短信——直接拒。"""
+    resp = client.post(f"/api/hr/accounts/{DEFAULT_ACCOUNT_ID}/switch")
+    assert resp.status_code == 400, resp.text
+    assert "已经是当前生效账号" in resp.json()["detail"]
+
+
+def test_switch_requires_target_phone(client, made, session):
+    acct = _new_account(client, made)
+    session.execute(
+        models.Account.__table__.update()
+        .where(models.Account.id == acct["id"])
+        .values(phone=None)
+    )
+    session.commit()
+    resp = client.post(f"/api/hr/accounts/{acct['id']}/switch")
+    assert resp.status_code == 400, resp.text
+    assert "手机号" in resp.json()["detail"]
+
+
+def test_login_kind_defaults_to_login(client, made):
+    """普通登录不该被当成切换——否则会去退出一个本来就不该动的号。"""
+    acct = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{acct['id']}/login")
+    body = client.get("/api/hr/accounts/login-request").json()
+    assert body["kind"] == "login"
+    assert body["from_account_id"] is None
 
 
 def test_method_defaults_to_code(client, made):

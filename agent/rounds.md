@@ -81,7 +81,11 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 ### 4a. 怎么做
 
 1. `login_map_get()` 拿锚点。**`stale=true` 就停手**，报告「锚点过期，需重新探查」。
-2. `login_req_get()` 拿相位（`pending` = 要发出验证码；`awaiting_code` = 要提交人工填的码）。
+2. `login_req_get()` 拿相位与类型：
+   - `kind=switch` → **先退出手机上登着的号**（`from_account_id` 是它），再登录目标号。
+     这是不可逆的那一半——退出成功而登录失败，**手机上就没有账号了**，报告里必须写清。
+   - `kind=login` → 手机已在登录页，直接登录目标号。
+   - 相位 `pending` = 要发出验证码；`awaiting_code` = 要提交人工填的码。
 3. 按 `login_map.json` 的锚点走；**对照 `agent/flows.py` 里的同一条序列**，
    你那一步与它不一致时，以实测屏幕为准，并在汇报里指出差异。
 4. 任何一步不符预期 → `login_req_set("failed", ...)`，**写清屏幕上看到了什么**，

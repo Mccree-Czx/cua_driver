@@ -28,9 +28,10 @@ CODE_TTL_SECONDS = 300  # 验证码有效期（短信验证码一般 5 分钟）
 MAX_ATTEMPTS = 3  # 拉起次数上限。轮询器 20 秒一轮，不设上限会在卡死时无限烧 token
 
 PHASE_PENDING = "pending"  # 前端发起，等 Mac 拉起
-PHASE_DISPATCHED = "dispatched"  # Pi 已开始操作手机
+PHASE_LOGGING_OUT = "logging_out"  # 正在退出旧号（只有 switch 会经过）
+PHASE_DISPATCHED = "dispatched"  # 正在操作手机（输手机号、发验证码）
 PHASE_AWAITING_CODE = "awaiting_code"  # 验证码已发送，等人工填
-PHASE_VERIFYING = "verifying"  # Pi 拿到码，正在提交
+PHASE_VERIFYING = "verifying"  # 拿到码，正在提交
 PHASE_SUCCESS = "success"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
@@ -40,6 +41,14 @@ TERMINAL_PHASES = frozenset(
     {PHASE_SUCCESS, PHASE_FAILED, PHASE_CANCELLED, PHASE_EXPIRED}
 )
 
+# 本次要做的事：
+#   login  —— 手机已经在登录页，只登录目标号
+#   switch —— 手机上登着别的号：**先退出它，再登录目标号**
+# 两者的后半段完全一样，所以用同一个状态机、同一套驱动，只在开头分叉。
+KIND_LOGIN = "login"
+KIND_SWITCH = "switch"
+LOGIN_KINDS = frozenset({KIND_LOGIN, KIND_SWITCH})
+
 # 登录方式（用户在前端选）：
 #   password —— 已**停用**（2026-10-15）：实测猎聘的账号密码登录点下去会弹滑块验证码，
 #               走不通。字段保留是为了把这条结论钉在数据模型里，而不是悄悄删掉。
@@ -48,15 +57,6 @@ METHOD_PASSWORD = "password"
 METHOD_CODE = "code"
 LOGIN_METHODS = frozenset({METHOD_PASSWORD, METHOD_CODE})
 DISABLED_METHODS = frozenset({METHOD_PASSWORD})
-
-# 谁驱动手机：
-#   auto   —— Mac 上的 login_watch.py 拉起 Pi 轮次去操作手机
-#   manual —— **轮询器一律不碰手机**，由操作者驱动（脚本或人工）。
-#             前端在两种模式下完全一样：照常显示进度、照常弹验证码框。
-#             存在的意义：接口不可用时仍能换号；也是运维手动接管的正当入口。
-MODE_AUTO = "auto"
-MODE_MANUAL = "manual"
-LOGIN_MODES = frozenset({MODE_AUTO, MODE_MANUAL})
 
 # 该拉起 Pi 的相位。pending = 发起，awaiting_code = 人工已填码。
 LAUNCHABLE_PHASES = frozenset({PHASE_PENDING, PHASE_AWAITING_CODE})
@@ -71,7 +71,7 @@ redis.call('HSET', KEYS[1], 'code_consumed_at', ARGV[1])
 return code
 """
 
-_INT_FIELDS = ("account_id", "resend_seq", "attempts")
+_INT_FIELDS = ("account_id", "from_account_id", "resend_seq", "attempts")
 _FLOAT_FIELDS = ("code_expires_at", "code_consumed_at", "expires_at", "updated_at")
 
 
@@ -100,7 +100,7 @@ def _parse(raw: dict[str, str]) -> dict[str, Any]:
     out["error"] = raw.get("error") or ""
     out["notice"] = raw.get("notice") or ""
     out["method"] = raw.get("method") or METHOD_CODE
-    out["mode"] = raw.get("mode") or MODE_AUTO
+    out["kind"] = raw.get("kind") or KIND_LOGIN
     return out
 
 
@@ -138,20 +138,26 @@ class RedisLoginRequest:
     # —— 写 ——
 
     def start(
-        self, account_id: int, method: str = METHOD_CODE, mode: str = MODE_AUTO
+        self,
+        account_id: int,
+        method: str = METHOD_CODE,
+        kind: str = KIND_LOGIN,
+        from_account_id: int | None = None,
     ) -> dict[str, Any]:
-        """发起一次登录。会**覆盖**在途的旧请求——同一时刻只能有一个。"""
+        """发起一次登录/切换。会**覆盖**在途的旧请求——同一时刻只能有一个。"""
         if method not in LOGIN_METHODS:
             raise ValueError(f"未知登录方式：{method}")
-        if mode not in LOGIN_MODES:
-            raise ValueError(f"未知驱动模式：{mode}")
+        if kind not in LOGIN_KINDS:
+            raise ValueError(f"未知类型：{kind}")
         now = time.time()
         key = login_req_key()
         payload = {
             "request_id": uuid.uuid4().hex,
             "account_id": account_id,
             "method": method,
-            "mode": mode,
+            "kind": kind,
+            # 只在 switch 时有值：要退出的那个号。登录失败时前端靠它给出「登回旧号」入口。
+            "from_account_id": from_account_id or 0,
             "phase": PHASE_PENDING,
             "code": "",
             "code_expires_at": 0,

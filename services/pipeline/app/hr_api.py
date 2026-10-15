@@ -270,7 +270,9 @@ def hr_account_activate(
 
 
 def _login_payload(
-    req: dict[str, Any] | None, account: models.Account | None = None
+    req: dict[str, Any] | None,
+    account: models.Account | None = None,
+    from_account: models.Account | None = None,
 ) -> dict[str, Any]:
     """给前端的登录进度。**不含验证码本身**——前端刚提交过，回显没有意义。"""
     if req is None:
@@ -280,14 +282,30 @@ def _login_payload(
         "account_id": req.get("account_id"),
         "account_name": account.name if account else None,
         "phone_masked": _mask_phone(account.phone) if account else None,
+        "kind": req.get("kind"),
+        # 切换失败时前端要靠它给出「登回 <旧号名>」入口——手机上没号了，
+        # 光说「失败」用户不知道下一步该干什么。
+        "from_account_id": req.get("from_account_id") or None,
+        "from_account_name": from_account.name if from_account else None,
         "method": req.get("method"),
-        "mode": req.get("mode"),
         "phase": req.get("phase"),
         "resend_seq": req.get("resend_seq", 0),
         "error": req.get("error") or None,
         "notice": req.get("notice") or None,
         "expires_at": req.get("expires_at"),
     }
+
+
+def _accounts_in_request(
+    session: Session, req: dict[str, Any]
+) -> tuple[models.Account | None, models.Account | None]:
+    target = session.get(models.Account, req["account_id"])
+    source = (
+        session.get(models.Account, req["from_account_id"])
+        if req.get("from_account_id")
+        else None
+    )
+    return target, source
 
 
 @router.get("/accounts/login-request")
@@ -299,21 +317,39 @@ def hr_login_request_get(
     req = store.get()
     if req is None:
         return {"phase": "idle"}
-    account = session.get(models.Account, req["account_id"])
-    return _login_payload(req, account)
+    target, source = _accounts_in_request(session, req)
+    return _login_payload(req, target, source)
 
 
 class LoginStart(BaseModel):
-    """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。
-
-    method: 目前只支持 code——password 已停用（见 hr_login_start 里的说明）。
-    mode:   auto = Mac 的轮询器拉起 Pi 操作手机；manual = 轮询器不碰手机，由操作者驱动。
-            前端在两种模式下完全一样，都要弹验证码框。
-    """
+    """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。"""
 
     force: bool = False
     method: Literal["password", "code"] = "code"
-    mode: Literal["auto", "manual"] = "auto"
+
+
+def _reject_if_in_flight(store: Any, force: bool) -> None:
+    in_flight = store.active()
+    if in_flight is not None and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"已有一个登录在进行中（账号 {in_flight['account_id']}，"
+            f"阶段 {in_flight['phase']}）——一部手机同一时刻只能登一个号",
+        )
+
+
+def _reject_disabled_method(method: str, account: models.Account) -> None:
+    if method == "password":
+        # 2026-10-15 实测：猎聘的「账号密码登录」填完点下去会弹滑块验证码，走不通。
+        # 这里给明确原因，而不是让前端猜为什么按钮点了没反应。
+        raise HTTPException(
+            status_code=400,
+            detail="猎聘已不支持账号密码登录（点登录会弹滑块验证，实测走不通），请改用验证码登录",
+        )
+    if not account.phone:
+        raise HTTPException(
+            status_code=400, detail="该账号没有登记手机号，无法登录——请先在账号管理里补录"
+        )
 
 
 @router.post("/accounts/{account_id}/login")
@@ -323,7 +359,7 @@ def hr_login_start(
     session: Session = Depends(get_session),
     store: Any = Depends(get_login_request),
 ) -> dict[str, Any]:
-    """发起登录：系统将代你在手机上打开猎聘、输手机号、点「下一步」发出验证码。
+    """登录：手机**已经在登录页**时用这个。
 
     前置条件由前端确认（手机上得先退出旧号），这里只校验数据面。
     """
@@ -331,26 +367,51 @@ def hr_login_start(
     account = session.get(models.Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
-    if not account.phone:
-        raise HTTPException(
-            status_code=400, detail="该账号没有登记手机号，无法登录——请先在账号管理里补录"
-        )
-    if opts.method == "password":
-        # 2026-10-15 实测：猎聘的「账号密码登录」填完点下去会弹滑块验证码，走不通。
-        # 这里给明确原因，而不是让前端猜为什么按钮点了没反应。
+    _reject_disabled_method(opts.method, account)
+    _reject_if_in_flight(store, opts.force)
+    req = store.start(account_id, opts.method, kind="login")
+    return _login_payload(req, account)
+
+
+@router.post("/accounts/{account_id}/switch")
+def hr_account_switch(
+    account_id: int,
+    body: LoginStart | None = None,
+    session: Session = Depends(get_session),
+    store: Any = Depends(get_login_request),
+) -> dict[str, Any]:
+    """一键切换：**先退出手机上登着的号，再登录目标号**。
+
+    这是**不可逆**动作——退出成功而登录失败，手机上就没有账号了。所以：
+    - 前端必须先强制确认
+    - 失败态必须给出「登回 <旧号名>」入口（payload 里的 from_account_*）
+    """
+    opts = body or LoginStart()
+    target = session.get(models.Account, account_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    if target.is_active:
+        # 切到自己会白退出一次、还白费一条短信——这条先判，与目标有没有手机号无关
         raise HTTPException(
             status_code=400,
-            detail="猎聘已不支持账号密码登录（点登录会弹滑块验证，实测走不通），请改用验证码登录",
+            detail=f"「{target.name}」已经是当前生效账号了，不需要切换",
         )
-    in_flight = store.active()
-    if in_flight is not None and not opts.force:
+    _reject_disabled_method(opts.method, target)
+    current = (
+        session.execute(select(models.Account).where(models.Account.is_active.is_(True)))
+        .scalars()
+        .first()
+    )
+    if current is None:
         raise HTTPException(
-            status_code=409,
-            detail=f"已有一个登录在进行中（账号 {in_flight['account_id']}，"
-            f"阶段 {in_flight['phase']}）——一部手机同一时刻只能登一个号",
+            status_code=400,
+            detail="当前没有生效账号，没有可退出的旧号——请直接用「登录」",
         )
-    req = store.start(account_id, opts.method, opts.mode)
-    return _login_payload(req, account)
+    _reject_if_in_flight(store, opts.force)
+    req = store.start(
+        account_id, opts.method, kind="switch", from_account_id=current.id
+    )
+    return _login_payload(req, target, current)
 
 
 class LoginCode(BaseModel):

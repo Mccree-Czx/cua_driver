@@ -73,12 +73,14 @@ import run_round  # noqa: E402  同目录的轮次运行器（借用它的锁判
 import flows  # noqa: E402  确定性驱动：登录/退出的固定序列
 import phone  # noqa: E402  adb 原语与锚点匹配
 from app.login_request import (  # noqa: E402
+    KIND_SWITCH,
     LAUNCHABLE_PHASES,
     MAX_ATTEMPTS,
-    MODE_AUTO,
     PHASE_AWAITING_CODE,
+    PHASE_DISPATCHED,
     PHASE_EXPIRED,
     PHASE_FAILED,
+    PHASE_LOGGING_OUT,
     PHASE_PENDING,
     PHASE_SUCCESS,
     TERMINAL_PHASES,
@@ -139,13 +141,6 @@ def main() -> int:
 
     _write_sentinel(req)
 
-    # 人工模式：轮询器**一律不碰手机**，由操作者驱动（脚本或人工）。
-    # 但上面的哨兵照常维护——手动模式下手机同样会停在登录页，
-    # main_round 跑起来照样会误判成「掉登录」。
-    # 前端在两种模式下完全一样：照常显示进度、照常弹验证码框。
-    if req["mode"] != MODE_AUTO:
-        return 0
-
     if req["phase"] not in LAUNCHABLE_PHASES:
         # verifying：流程正在跑，等它自己推进
         return 0
@@ -190,26 +185,53 @@ def _account_phone(account_id: int) -> str | None:
 
 
 def _drive_login(store, req: dict) -> int:
-    """phase=pending：输手机号 → 勾协议 → 点「下一步」把验证码发出去。
+    """phase=pending：把手机操作到「验证码已发送」。
 
-    这一步跑的是确定性脚本，**不经过 LLM**——所以 DeepSeek 接口挂了也照样能登录，
-    而且秒级完成、每步 dump 可核对。
+    `kind=switch` 时**先退出手机上登着的号**再登录目标号——这是不可逆的那一半，
+    所以两种失败的措辞必须分开：旧号没退掉 vs 旧号退了但新号没登上，
+    用户该做的事完全不同（前者手机上还有号，后者没有）。
     """
     number = _account_phone(req["account_id"])
     if not number:
         return _fail(store, f"账号 {req['account_id']} 没有登记手机号，无法登录")
 
+    is_switch = req.get("kind") == KIND_SWITCH and bool(req.get("from_account_id"))
+    logged_out = False
+
+    if is_switch:
+        store.set_phase(PHASE_LOGGING_OUT, "")
+        print(f"[login_watch] 切换：先退出账号 {req['from_account_id']}")
+        try:
+            flows.logout(agree=AGREE_TERMS)
+        except flows.FlowMismatch as exc:
+            return _fail(
+                store, f"切换停在「退出旧号」这一步：{exc}。手机上应该还登着原账号。"
+            )
+        except phone.AdbError as exc:
+            return _fail(store, f"切换时 adb 出错：{exc}。手机上应该还登着原账号。")
+        logged_out = True
+        print("[login_watch] 旧号已退出")
+
     print(f"[login_watch] 驱动登录：账号 {req['account_id']}，手机尾号 {number[-4:]}")
+    store.set_phase(PHASE_DISPATCHED, "")
     try:
         flows.login_code(number, agree=AGREE_TERMS)
     except flows.FlowMismatch as exc:
+        if logged_out:
+            return _fail(store, f"{_NO_ACCOUNT_HINT}｜{exc}")
         return _fail(store, f"{exc}")
     except phone.AdbError as exc:
-        return _fail(store, f"adb 出错：{exc}")
+        hint = f"{_NO_ACCOUNT_HINT}｜" if logged_out else ""
+        return _fail(store, f"{hint}adb 出错：{exc}")
 
     store.set_phase(PHASE_AWAITING_CODE, "")
     print("[login_watch] 验证码已发出 → 前端应弹出输入框")
     return 0
+
+
+# 切换失败时的关键提示：退出成功之后登录失败，手机上就是**没有账号**的。
+# 只说「失败」的话用户不知道下一步该干什么。
+_NO_ACCOUNT_HINT = "已退出旧号，但新号没登进去——手机上现在没有账号，请重新切换到某个账号或人工登录"
 
 
 def _drive_submit(store, req: dict) -> int:
@@ -222,6 +244,9 @@ def _drive_submit(store, req: dict) -> int:
     try:
         flows.submit_code(code)
     except flows.FlowMismatch as exc:
+        # 切换时走到这里，退出已经成功了 —— 手机上是没有账号的
+        if req.get("kind") == KIND_SWITCH and req.get("from_account_id"):
+            return _fail(store, f"{_NO_ACCOUNT_HINT}｜{exc}")
         return _fail(store, f"{exc}")
     except phone.AdbError as exc:
         return _fail(store, f"adb 出错：{exc}")
