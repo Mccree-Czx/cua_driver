@@ -439,6 +439,17 @@ def _goto_job_list(step: str) -> str:
     xml = phone.dump()
     _guard_risk(xml, "进职位页")
     _guard_publish_form(xml)
+
+    # ★ 猎聘会**记住「职位」tab 上次停在哪一页**：实测切回去时直接落在某个职位的
+    #   「职位详情页」上，而不是「招聘中」列表（2026-10-15 真机第一次跑 fetch_jds 就栽这儿）。
+    #   详情页上当然看不到「招聘中/发职位」两个标记，所以这里先按一次 BACK 回列表。
+    if phone.find_exact(xml, _JD_LABEL) and not all(
+        marker in " ".join(phone.texts(xml)) for marker in _JOB_PAGE_MARKERS
+    ):
+        phone.back()
+        xml = phone.dump()
+        _guard_publish_form(xml)
+
     joined = " ".join(phone.texts(xml))
     if not all(marker in joined for marker in _JOB_PAGE_MARKERS):
         raise FlowMismatch(step, "没进到职位管理页（看不到「招聘中/发职位」）", phone.texts(xml))
