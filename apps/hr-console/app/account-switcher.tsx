@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Button, Input, Modal, Tag } from "antd";
+import { Button, Checkbox, Input, message, Modal, Popconfirm, Tag } from "antd";
 import { PlusOutlined, SettingOutlined, WarningOutlined } from "@ant-design/icons";
 import LoginWizard from "./login-wizard";
 
@@ -11,6 +11,8 @@ type Account = {
   is_active: boolean;
   phone_masked: string | null;
   has_password: boolean;
+  /** 非空即已软删除：列表里默认不显示，勾「显示已删除」才看得到，可恢复。 */
+  deleted_at: string | null;
 };
 
 /**
@@ -34,7 +36,9 @@ export default function AccountSwitcher() {
 
   const load = useCallback(async () => {
     try {
-      const resp = await fetch("/api/hr/accounts");
+      // 带上已删除的：列表里藏不藏由管理弹窗的开关决定。
+      // 已删除的账号不可能同时是生效账号（删除接口会拒），所以 activeId 不受影响。
+      const resp = await fetch("/api/hr/accounts?include_deleted=1");
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       setAccounts(data.items ?? []);
@@ -114,6 +118,8 @@ function AccountManager({
   const [loginFor, setLoginFor] = useState<{ account: Account; intent: "login" | "switch" } | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [busy, setBusy] = useState(false);
+  // 已软删除的账号默认藏起来——那就是「删除」的效果。勾上才显示，好恢复。
+  const [showDeleted, setShowDeleted] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -123,6 +129,34 @@ function AccountManager({
     setForm(EMPTY);
     setErr(null);
     setMsg(null);
+  }
+
+  async function remove(id: number) {
+    setBusy(true);
+    try {
+      const resp = await fetch(`/api/hr/accounts/${id}`, { method: "DELETE" });
+      if (!resp.ok) throw new Error(await detailOf(resp));
+      message.success("已删除（数据保留，随时可恢复）");
+      await onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore(id: number) {
+    setBusy(true);
+    try {
+      const resp = await fetch(`/api/hr/accounts/${id}/restore`, { method: "POST" });
+      if (!resp.ok) throw new Error(await detailOf(resp));
+      message.success("已恢复");
+      await onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   function startEdit(a: Account) {
@@ -193,9 +227,18 @@ function AccountManager({
   return (
     <div className="account-manager">
       <div className="account-manager-section">
-        <div className="account-manager-heading">已有账号</div>
+        <div className="account-manager-heading">
+          已有账号
+          <Checkbox
+            checked={showDeleted}
+            onChange={(e) => setShowDeleted(e.target.checked)}
+            style={{ marginLeft: 12, fontWeight: 400, fontSize: 13 }}
+          >
+            显示已删除
+          </Checkbox>
+        </div>
         <div className="account-list">
-          {accounts.map((a) => (
+          {accounts.filter((a) => showDeleted || !a.deleted_at).map((a) => (
             <div className="account-row" key={a.id}>
               <div className="account-row-main">
                 <span className="account-row-name">{a.name}</span>
@@ -205,7 +248,14 @@ function AccountManager({
                 <span>手机号：{a.phone_masked ?? "未登记"}</span>
                 <span>密码：{a.has_password ? "已存（加密）" : "未存"}</span>
               </div>
-              {a.is_active ? (
+              {a.deleted_at ? (
+                <>
+                  <Tag>已删除</Tag>
+                  <Button size="small" type="primary" onClick={() => void restore(a.id)}>
+                    恢复
+                  </Button>
+                </>
+              ) : a.is_active ? (
                 // 手机上登着的就是它——给「切换」会白退出一次、还白费一条短信
                 <Button size="small" disabled title="手机上现在登着的就是它">
                   当前生效
@@ -235,9 +285,25 @@ function AccountManager({
                   </Button>
                 </>
               )}
-              <Button size="small" onClick={() => startEdit(a)}>
-                补录凭据
-              </Button>
+              {!a.deleted_at && (
+                <>
+                  <Button size="small" onClick={() => startEdit(a)}>
+                    补录凭据
+                  </Button>
+                  <Popconfirm
+                    title={`删除「${a.name}」？`}
+                    description="只是从列表里藏起来——它名下的职位、候选人、沟通历史一条都不会动，随时可以恢复。"
+                    okText="删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => void remove(a.id)}
+                  >
+                    <Button size="small" danger>
+                      删除
+                    </Button>
+                  </Popconfirm>
+                </>
+              )}
             </div>
           ))}
         </div>

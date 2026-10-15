@@ -353,3 +353,69 @@ def test_alerts_minimal(client):
     assert body["risk_paused"] is False
     assert body["quota_used_today"] >= 0
     assert body["manual_today"] >= 0
+
+
+# —— 账号软删除（2026-10-15）——
+
+
+def _acct_count(session, acct_id: int) -> tuple[int, int, int]:
+    """该账号名下的 (jobs, candidates, job_candidate) 行数。"""
+    from sqlalchemy import func, select
+
+    out = []
+    for model in (models.Job, models.Candidate, models.JobCandidate):
+        out.append(
+            session.scalar(
+                select(func.count()).select_from(model).where(model.account_id == acct_id)
+            )
+            or 0
+        )
+    return tuple(out)  # type: ignore[return-value]
+
+
+def _new_account_via_api(client, session, name: str) -> int:
+    from uuid import uuid4
+
+    resp = client.post(
+        "/api/hr/accounts",
+        json={"name": name, "phone": "139" + f"{uuid4().int % 10**8:08d}", "password": "pw"},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["id"]
+
+
+def test_soft_delete_hides_but_keeps_every_row(client, session):
+    """★ 这条是「软」这个字的全部意义：藏起来，但**一行数据都不动**。
+
+    真删除做不到——指向 accounts 的四个外键没有 ondelete（MySQL 默认 RESTRICT），
+    有数据的账号直接删会报外键冲突。而账号名下的数据量差别极大。
+    """
+    job_id = _new_job(client)
+    _seed_jc(session, job_id, status="new", name="软删测试者")
+    session.commit()
+
+    acct_id = DEFAULT_ACCOUNT_ID  # conftest 里测试统一用它
+    before = _acct_count(session, acct_id)
+    assert before[0] > 0 and before[1] > 0, "前提：这个账号名下得有数据"
+
+    # 生效账号不能删 —— 先确认这条守卫
+    assert client.delete(f"/api/hr/accounts/{acct_id}").status_code == 409
+
+    # 建个干净账号来删
+    ghost = _new_account_via_api(client, session, f"待删-{uuid4().hex[:6]}")
+    assert client.delete(f"/api/hr/accounts/{ghost}").status_code == 200
+
+    ids = [a["id"] for a in client.get("/api/hr/accounts").json()["items"]]
+    assert ghost not in ids, "删了还出现在默认列表里"
+    ids_all = [
+        a["id"] for a in client.get("/api/hr/accounts?include_deleted=1").json()["items"]
+    ]
+    assert ghost in ids_all, "include_deleted=1 也看不到，那就没法恢复了"
+
+    # 恢复
+    assert client.post(f"/api/hr/accounts/{ghost}/restore").status_code == 200
+    ids = [a["id"] for a in client.get("/api/hr/accounts").json()["items"]]
+    assert ghost in ids
+
+    # ★ 数据一行没动
+    assert _acct_count(session, acct_id) == before

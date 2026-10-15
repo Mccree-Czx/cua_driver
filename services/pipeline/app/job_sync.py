@@ -192,7 +192,11 @@ def active_job_count() -> int:
     （与 `_write_token_summary` 同一个手法）。职位数决定这轮有没有活可干。
     """
     with SessionLocal() as session:
-        account_id = session.scalar(select(Account.id).where(Account.is_active.is_(True)))
+        account_id = session.scalar(
+            select(Account.id).where(
+                Account.is_active.is_(True), Account.deleted_at.is_(None)
+            )
+        )
         if account_id is None:
             return 0
         return len(

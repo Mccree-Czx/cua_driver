@@ -38,7 +38,9 @@ def get_active_account(session=Depends(get_session)) -> Account:
     """
     acct = (
         session.execute(
-            select(Account).where(Account.is_active.is_(True)).order_by(Account.id)
+            select(Account)
+            .where(Account.is_active.is_(True), Account.deleted_at.is_(None))
+            .order_by(Account.id)
         )
         .scalars()
         .first()

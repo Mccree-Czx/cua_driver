@@ -86,6 +86,25 @@ class Account(Base):
     # Fernet 密文，明文永不落库；解密见 app/crypto.decrypt_secret
     password_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
     credential_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ★ **软删除**（2026-10-15）：非空 = 已删除。列表里藏起来，**数据一条不动**。
+    #
+    #   为什么不做真删除：指向 accounts 的四个外键都没有 ondelete（MySQL 默认
+    #   RESTRICT），有数据的账号直接删会报外键冲突；而账号名下的数据量差别极大
+    #   （id=1 有 1885 候选人 + 1407 条 jc + 两个带真 JD 的职位）。一键下去会毁掉
+    #   历史的按钮，不该存在。
+    #
+    #   为什么用 deleted_at 而不是 is_deleted：多留一个「什么时候删的」，
+    #   而且 NULL/非 NULL 比 0/1 更难被写错。
+    #
+    #   ★ **代价**：`uq_accounts_phone` 是普通唯一约束（MySQL 不支持部分索引），
+    #     所以软删的账号**仍占着它的手机号**——之后用同一个号新建会被拒。
+    #     新建接口撞上唯一约束时会去查是不是已删除的账号，把话说清楚。
+    #
+    #   ★ 每一处「解析生效账号」的查询都要带上 `.deleted_at.is_(None)`：
+    #     deps.get_active_account / tools_mcp_server._active_account_id /
+    #     job_sync.active_job_count / hr_api 的 /accounts 列表。
+    #     漏一处就是「这个号明明删了却还在算配额」。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )

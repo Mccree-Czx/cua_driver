@@ -102,6 +102,8 @@ def _account_out(acct: models.Account) -> dict[str, Any]:
         "is_active": acct.is_active,
         "phone_masked": _mask_phone(acct.phone),
         "has_password": bool(acct.password_enc),
+        # 软删除（2026-10-15）：非空即已删除。前端据此显示「已删除 / 恢复」。
+        "deleted_at": acct.deleted_at.isoformat(timespec="seconds") if acct.deleted_at else None,
     }
 
 
@@ -156,15 +158,67 @@ def _encrypt_password(raw: str) -> str:
 
 
 @router.get("/accounts")
-def hr_accounts(session: Session = Depends(get_session)) -> dict[str, Any]:
+def hr_accounts(
+    include_deleted: bool = Query(False, description="是否带上已软删除的账号"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     """账号列表 + 哪个生效。
 
     唯一不依赖 get_active_account 的端点——它正是前端用来发现「没有生效账号」
     并提示用户去选的地方，所以自己不能先被 503 挡住。
+
+    默认**不返回已软删除的账号**（那就是「删除」的效果）；管理弹窗勾「显示已删除」
+    时带 `include_deleted=1`，好让它们能被恢复。
     """
-    rows = session.execute(select(models.Account).order_by(models.Account.id)).scalars().all()
+    stmt = select(models.Account).order_by(models.Account.id)
+    if not include_deleted:
+        stmt = stmt.where(models.Account.deleted_at.is_(None))
+    rows = session.execute(stmt).scalars().all()
     active = next((a.id for a in rows if a.is_active), None)
     return {"active_id": active, "items": [_account_out(a) for a in rows]}
+
+
+@router.delete("/accounts/{account_id}")
+def hr_account_delete(
+    account_id: int, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """**软删除**账号：列表里藏起来，数据一条不动，可恢复。
+
+    ★ 为什么不做真删除：指向 accounts 的四个外键都没有 ondelete（MySQL 默认
+      RESTRICT），有数据的账号直接删会报外键冲突。而账号名下的数据量差别极大
+      （id=1 有 1885 候选人 + 1407 条 jc 历史），**一键下去会毁掉历史的按钮不该存在**。
+
+    ★ 不能删「生效账号」：`is_active` 是整套账号隔离的锚点，把它藏起来，
+      `_active_account_id()` 就失去基准。要删先切到别的号。
+    """
+    target = session.get(models.Account, account_id)
+    if target is None or target.deleted_at is not None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    if target.is_active:
+        raise HTTPException(
+            status_code=409,
+            detail="不能删除当前生效账号——请先切换到别的账号再删",
+        )
+    target.deleted_at = datetime.now()
+    session.commit()
+    return {"ok": True, "id": account_id, "deleted_at": target.deleted_at.isoformat(timespec="seconds")}
+
+
+@router.post("/accounts/{account_id}/restore")
+def hr_account_restore(
+    account_id: int, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    """恢复一个被软删除的账号。它名下的数据从来没动过，所以恢复是完整的。
+
+    ★ 这里**必须**能查到已删除的账号——它就是干这个的。（写这版时差点顺手把
+      「已删除按不存在处理」那句也贴进来，那会让恢复永远不可用。）
+    """
+    target = session.get(models.Account, account_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
+    target.deleted_at = None
+    session.commit()
+    return {"ok": True, **_account_out(target)}
 
 
 class AccountCreate(BaseModel):
@@ -196,6 +250,20 @@ def hr_account_create(
         session.commit()
     except IntegrityError as exc:
         session.rollback()
+        # ★ 软删除的账号**仍占着它的手机号**（uq_accounts_phone 是普通唯一约束，
+        #   MySQL 不支持部分索引）。不说清楚的话，用户会对着「该手机号已登记过账号」
+        #   发呆——他明明在列表里看不到那个号。
+        ghost = session.execute(
+            select(models.Account).where(
+                models.Account.phone == acct.phone, models.Account.deleted_at.isnot(None)
+            )
+        ).scalars().first()
+        if ghost is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该手机号属于一个**已删除**的账号「{ghost.name}」——"
+                       "请先恢复它，或换一个手机号",
+            ) from exc
         raise HTTPException(status_code=409, detail="该手机号已登记过账号") from exc
     session.refresh(acct)
     return _account_out(acct)
@@ -235,6 +303,20 @@ def hr_account_patch(
         session.commit()
     except IntegrityError as exc:
         session.rollback()
+        # ★ 软删除的账号**仍占着它的手机号**（uq_accounts_phone 是普通唯一约束，
+        #   MySQL 不支持部分索引）。不说清楚的话，用户会对着「该手机号已登记过账号」
+        #   发呆——他明明在列表里看不到那个号。
+        ghost = session.execute(
+            select(models.Account).where(
+                models.Account.phone == acct.phone, models.Account.deleted_at.isnot(None)
+            )
+        ).scalars().first()
+        if ghost is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该手机号属于一个**已删除**的账号「{ghost.name}」——"
+                       "请先恢复它，或换一个手机号",
+            ) from exc
         raise HTTPException(status_code=409, detail="该手机号已登记过账号") from exc
     session.refresh(acct)
     return _account_out(acct)
@@ -355,7 +437,9 @@ def hr_login_start(
     """
     opts = body or LoginStart()
     account = session.get(models.Account, account_id)
-    if account is None:
+    if account is None or account.deleted_at is not None:
+        # 已软删除的账号按「不存在」处理：否则手机能登上它，而库里所有按账号过滤的
+        # 查询都看不见它——正是 2026-10-15 修过的那类「库和手机不一致」。
         raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
     _reject_disabled_method(opts.method, account)
     _reject_if_in_flight(store, opts.force)
@@ -378,7 +462,9 @@ def hr_account_switch(
     """
     opts = body or LoginStart()
     target = session.get(models.Account, account_id)
-    if target is None:
+    if target is None or target.deleted_at is not None:
+        # 已软删除的账号按「不存在」处理：否则手机能登上它、而库里所有按账号过滤的
+        # 查询都看不见它——正是 2026-10-15 修过的那类「库和手机不一致」。
         raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
     if target.is_active:
         # 切到自己会白退出一次、还白费一条短信——这条先判，与目标有没有手机号无关
@@ -388,7 +474,12 @@ def hr_account_switch(
         )
     _reject_disabled_method(opts.method, target)
     current = (
-        session.execute(select(models.Account).where(models.Account.is_active.is_(True)))
+        session.execute(
+            select(models.Account).where(
+                models.Account.is_active.is_(True),
+                models.Account.deleted_at.is_(None),
+            )
+        )
         .scalars()
         .first()
     )

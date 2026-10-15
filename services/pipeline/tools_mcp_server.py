@@ -143,7 +143,9 @@ def _active_account_id(session) -> int:
     取不到账号时直接抛错而不是猜一个——猜错会把候选人档案与配额记到别的号头上。
     """
     acct = session.execute(
-        select(Account.id).where(Account.is_active.is_(True)).order_by(Account.id)
+        select(Account.id)
+        .where(Account.is_active.is_(True), Account.deleted_at.is_(None))
+        .order_by(Account.id)
     ).scalars().first()
     if acct is None:
         raise NoActiveAccountError("没有生效的猎聘账号，请先在前端账号页选择一个")
