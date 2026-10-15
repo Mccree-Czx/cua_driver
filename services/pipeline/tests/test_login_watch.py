@@ -103,15 +103,23 @@ def test_awaiting_code_submits_the_claimed_code(watch):
     assert not (tmp_path / ".login_in_flight").exists()
 
 
-def test_awaiting_code_without_a_code_fails(watch):
-    """没填码就没什么可提交的——落 failed，别耗着。"""
+def test_awaiting_code_without_a_code_just_waits(watch):
+    """`awaiting_code` 但还没码 = **在等人填**，什么都不做。
+
+    ★ 这条以前断言的是「落 failed」——那正是 2026-10-15 真机第一次跑一键切换时
+      踩到的坑：轮询器一看到 awaiting_code 就动手，claim_code 拿到 None，
+      于是把一次正常等待判成「验证码不可用」。**每次登录都会这样死**。
+      `awaiting_code` 同时表示「在等人」和「码已就绪」两种状态，判据必须是
+      「有没有码」（`needs_action`），不是光看相位。
+    """
     store, calls, tmp_path = watch
     store.start(account_id=7)
     store.set_phase("awaiting_code")
 
     assert login_watch.main() == 0
     assert calls == []
-    assert store.get()["phase"] == PHASE_FAILED
+    assert store.get()["phase"] == "awaiting_code"   # 还在等，没被判死
+    assert store.get()["attempts"] == 0               # 也不该白烧一次尝试
 
 
 def test_flow_mismatch_fails_with_reason(watch, monkeypatch):

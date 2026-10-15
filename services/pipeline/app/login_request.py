@@ -58,8 +58,28 @@ METHOD_CODE = "code"
 LOGIN_METHODS = frozenset({METHOD_PASSWORD, METHOD_CODE})
 DISABLED_METHODS = frozenset({METHOD_PASSWORD})
 
-# 该拉起 Pi 的相位。pending = 发起，awaiting_code = 人工已填码。
+# 该拉起驱动的相位。
+#
+# ⚠ **光看相位不够**：`awaiting_code` 同时表示两种状态——「在等人填码」和「码已就绪」。
+# 轮询器若一看到 awaiting_code 就动手，会在码到来之前抢先提交，
+# 拿到 None 之后把请求判成「验证码不可用」——**每次登录都会这样死**。
+# （2026-10-15 真机第一次跑一键切换就栽在这儿。）
+# 所以判据是 `needs_action()`，不是相位集合。
 LAUNCHABLE_PHASES = frozenset({PHASE_PENDING, PHASE_AWAITING_CODE})
+
+
+def needs_action(req: dict[str, Any] | None) -> bool:
+    """轮询器该不该动手。
+
+    - `pending` → 要发出验证码
+    - `awaiting_code` **且已经有码** → 要提交它
+    - `awaiting_code` 但还没码 → 在等人，什么都不做（这正是绝大多数时间）
+    """
+    if req is None or req["phase"] not in LAUNCHABLE_PHASES:
+        return False
+    if req["phase"] == PHASE_AWAITING_CODE:
+        return bool(req["code"])
+    return True
 
 # 原子取码：HGET 与标记已消费必须在一条命令里完成，否则两次启动可能拿到同一个码。
 # Redis 的 Lua 脚本是原子的。

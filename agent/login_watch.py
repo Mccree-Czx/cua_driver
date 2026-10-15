@@ -76,7 +76,6 @@ import flows  # noqa: E402  确定性驱动：登录/退出的固定序列
 import phone  # noqa: E402  adb 原语与锚点匹配
 from app.login_request import (  # noqa: E402
     KIND_SWITCH,
-    LAUNCHABLE_PHASES,
     MAX_ATTEMPTS,
     PHASE_AWAITING_CODE,
     PHASE_DISPATCHED,
@@ -88,6 +87,7 @@ from app.login_request import (  # noqa: E402
     TERMINAL_PHASES,
     RedisLoginRequest,
     mark_account_logged_in,
+    needs_action,
 )
 
 SENTINEL = run_round.LOGIN_IN_FLIGHT_FILE
@@ -229,8 +229,9 @@ def main() -> int:
 
     _write_sentinel(req)
 
-    if req["phase"] not in LAUNCHABLE_PHASES:
-        # verifying：流程正在跑，等它自己推进
+    if not needs_action(req):
+        # pending 之外，只有「awaiting_code 且已经有码」才动手。
+        # ★ awaiting_code 但没码 = 在等人填 —— 此时动手会拿到 None 并把请求判失败。
         return 0
 
     if req["attempts"] >= MAX_ATTEMPTS:
