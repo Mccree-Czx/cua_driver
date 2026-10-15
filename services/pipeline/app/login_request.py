@@ -40,7 +40,15 @@ TERMINAL_PHASES = frozenset(
     {PHASE_SUCCESS, PHASE_FAILED, PHASE_CANCELLED, PHASE_EXPIRED}
 )
 
-# 该拉起 Pi 的相位。pending = 第一段，awaiting_code = 第二段。
+# 登录方式（用户在前端选）：
+#   password —— 全自动，不需要人；前提是密码已存且正确
+#   code     —— 无需密码，但要人工从自己手机上读一次验证码
+# 密码失败会自动降级到 code，并在 notice 里说明原因（不静默换路）。
+METHOD_PASSWORD = "password"
+METHOD_CODE = "code"
+LOGIN_METHODS = frozenset({METHOD_PASSWORD, METHOD_CODE})
+
+# 该拉起 Pi 的相位。pending = 发起，awaiting_code = 人工已填码。
 LAUNCHABLE_PHASES = frozenset({PHASE_PENDING, PHASE_AWAITING_CODE})
 
 # 原子取码：HGET 与标记已消费必须在一条命令里完成，否则两次启动可能拿到同一个码。
@@ -80,6 +88,8 @@ def _parse(raw: dict[str, str]) -> dict[str, Any]:
         out[field] = float(raw.get(field) or 0)
     out["code"] = raw.get("code") or ""
     out["error"] = raw.get("error") or ""
+    out["notice"] = raw.get("notice") or ""
+    out["method"] = raw.get("method") or METHOD_CODE
     return out
 
 
@@ -116,13 +126,16 @@ class RedisLoginRequest:
 
     # —— 写 ——
 
-    def start(self, account_id: int) -> dict[str, Any]:
+    def start(self, account_id: int, method: str = METHOD_CODE) -> dict[str, Any]:
         """发起一次登录。会**覆盖**在途的旧请求——同一时刻只能有一个。"""
+        if method not in LOGIN_METHODS:
+            raise ValueError(f"未知登录方式：{method}")
         now = time.time()
         key = login_req_key()
         payload = {
             "request_id": uuid.uuid4().hex,
             "account_id": account_id,
+            "method": method,
             "phase": PHASE_PENDING,
             "code": "",
             "code_expires_at": 0,
@@ -131,6 +144,7 @@ class RedisLoginRequest:
             "attempts": 0,
             "expires_at": now + LOGIN_TTL_SECONDS,
             "error": "",
+            "notice": "",
             "updated_at": now,
         }
         pipe = self._redis.pipeline()
@@ -140,10 +154,24 @@ class RedisLoginRequest:
         pipe.execute()
         return payload
 
-    def set_phase(self, phase: str, error: str = "") -> None:
+    def set_phase(self, phase: str, note: str = "") -> None:
+        """推进相位。`note` 按相位分流，两者互斥。
+
+        `error` 是「这次登录失败了」的结论，前端红着脸显示；`notice` 是
+        「密码没成功，已改用验证码」这类过程说明，是黄条不是红条。混在一个字段里，
+        前端就只能靠相位猜语气，迟早猜错。
+        """
+        field, other = (
+            ("error", "notice") if phase == PHASE_FAILED else ("notice", "error")
+        )
         self._redis.hset(
             login_req_key(),
-            mapping={"phase": phase, "error": error, "updated_at": str(time.time())},
+            mapping={
+                "phase": phase,
+                field: note,
+                other: "",
+                "updated_at": str(time.time()),
+            },
         )
 
     def submit_code(self, code: str) -> None:

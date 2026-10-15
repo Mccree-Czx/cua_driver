@@ -7,10 +7,13 @@
 """
 from __future__ import annotations
 
+import html
 import io
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,12 +24,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# 必须先锚定工作目录再导入 app.*：pydantic-settings 的 env_file=".env" 是**按 CWD**
+# 解析的，而本 server 由 Pi 拉起，Pi 的工作目录不是我们说了算。赌错的症状很隐蔽——
+# 工具照样能跑，只是 DATABASE_URL/REDIS_URL 静默退回到默认值，连到本机那个空库。
+# 与 login_watch.py 同一处理。本文件其余路径全是绝对的（/sdcard、__file__、tempdir），
+# 所以 chdir 不会碰坏别的东西。
+os.chdir(Path(__file__).resolve().parents[2])
+
 import redis as redis_lib
 from mcp.server.mcpserver import MCPServer
 from PIL import Image, ImageChops
 from sqlalchemy import func, select
 
 from app.config import get_settings
+from app.crypto import CredentialCryptoError, decrypt_secret
 from app.db import SessionLocal
 from app.keys import login_state_key, msg_touch_key, risk_pause_key
 from app.login_request import (
@@ -52,9 +63,33 @@ from hr_workbuddy.rate_limit import TokenBucket
 
 mcp = MCPServer("hr-tools")
 
-# 优先用 mobile-use 同款硬编码位置（已部署），否则回退 PATH
-_ADB_SDK = os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe")
-ADB = _ADB_SDK if os.path.exists(_ADB_SDK) else "adb"
+def _resolve_adb() -> str:
+    """定位 adb 可执行文件。
+
+    原先是把 Windows 的 `%LOCALAPPDATA%\\Android\\Sdk\\...` 硬编码进常量——在 Mac 上
+    那个路径根本不展开，只能回退到 PATH 里的 `adb`。而 launchd 拉起时 PATH 未必带
+    Homebrew（run_round._resolve_pi_cli() 已经踩过同一个坑）。按「部署时的实际位置」
+    逐個探测，比赌 PATH 稳。
+
+    可用 HR_ADB 覆盖（换机器/换安装方式时不必改代码）。
+    """
+    candidates = [
+        os.environ.get("HR_ADB"),
+        # macOS + brew cask（当前部署形态：/opt/homebrew/bin/adb 是符号链接）
+        "/opt/homebrew/bin/adb",
+        # macOS 官方 SDK 默认位置
+        str(Path.home() / "Library/Android/sdk/platform-tools/adb"),
+        # Windows（旧的部署形态，保留兼容）
+        os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
+        shutil.which("adb"),
+    ]
+    for exe in candidates:
+        if exe and Path(exe).exists():
+            return str(exe)
+    return "adb"  # 交给 PATH，失败时报错更直白
+
+
+ADB = _resolve_adb()
 
 _RESUME_CONTENT_TYPES = {
     "pdf": "application/pdf",
@@ -557,14 +592,146 @@ def risk_clear() -> dict:
 
 
 @mcp.tool()
-def login_req_get() -> dict:
-    """读当前登录请求。**每轮开头先调这个**，按 phase 决定做什么。
+def adb_selftest() -> dict:
+    """自检：本进程能不能真的驱动手机。
 
-    返回 {phase, account_id, account_name, phone, resend_seq, attempts, error}。
+    存在意义：命令行里 `adb devices` 跑得通，**不代表 Pi 拉起的 MCP 进程里也跑得通**
+    ——PATH、工作目录、adb 路径探测都可能不同。换号这类不可逆操作开跑之前，先用它
+    确认这条路是通的，避免「探测阶段全绿、真动手时才发现连不上」。
+    """
+    try:
+        out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "adb_path": ADB, "devices": [], "reason": type(exc).__name__}
+    devices = [
+        line.split("\t")[0]
+        for line in out.stdout.splitlines()[1:]
+        if "\t" in line and line.split("\t")[1].strip() == "device"
+    ]
+    return {
+        "ok": bool(devices),
+        "adb_path": ADB,
+        "devices": devices,
+        "reason": "" if devices else (out.stdout + out.stderr).strip()[:200],
+    }
+
+
+def _type_into_focused(text: str) -> dict:
+    """把文本敲进手机**当前焦点的输入框**。定位（点哪个框）不归它管。
+
+    必须走 shlex.quote：`adb shell` 会把命令字符串交给设备端的 sh 重新解析，
+    裸拼就是命令注入——而密码里出现 `& | ; $ 反引号` 一点都不罕见。
+    空格还要先换成 `%s`，那是 `input text` 自己的转义；不换的话设备端 sh 会把
+    它当成参数分隔符，`input text` 只拿到第一个词。
+    """
+    payload = shlex.quote(text.replace(" ", "%s"))
+    try:
+        result = subprocess.run(
+            [ADB, "shell", "input", "text", payload],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "reason": "input_failed"}
+    if result.returncode != 0:
+        return {"ok": False, "reason": "input_failed"}
+    return {"ok": True}
+
+
+def _focused_edittext_text() -> str | None:
+    """当前焦点输入框里的文本；找不到返回 None。
+
+    只认 EditText：dump 里 SearchView 排在它前面，而 SearchView 的 `text`
+    **永远是空串**——按类名一起匹配会永远读到空（实测踩过这个坑）。
+    """
+    xml = _ui_dump()
+    for node in re.findall(r"<node\b[^>]*>", xml):
+        if 'class="android.widget.EditText"' not in node:
+            continue
+        match = re.search(r'text="([^"]*)"', node)
+        return html.unescape(match.group(1)) if match else ""
+    return None
+
+
+def _login_account(account_id: int | None) -> tuple[int | None, str]:
+    """解析要操作的账号，返回 (id, 错误原因)。"""
+    if account_id is None:
+        req = RedisLoginRequest().get()
+        if req is None:
+            return None, "no_request"
+        account_id = req["account_id"]
+    with SessionLocal() as session:
+        acct = session.get(Account, account_id)
+        if acct is None:
+            return None, "no_account"
+        return acct.id, ""
+
+
+@mcp.tool()
+def login_fill_phone(account_id: int | None = None) -> dict:
+    """把账号绑定的手机号敲进手机**当前焦点的输入框**。
+
+    先自己 tap 到手机号输入框，再调本工具。省略 account_id 时用当前登录请求
+    指向的账号。手机号是纯数字，能回读校验。
+    """
+    acct_id, err = _login_account(account_id)
+    if err:
+        return {"ok": False, "reason": err}
+    with SessionLocal() as session:
+        phone = session.get(Account, acct_id).phone or ""
+    if not phone:
+        return {"ok": False, "reason": "no_phone"}
+    typed = _type_into_focused(phone)
+    if not typed["ok"]:
+        return {"ok": False, "reason": typed["reason"]}
+    # 数字框的 text 可读，回读校验是真的校验
+    return {"ok": True, "typed_len": len(phone), "verified": _focused_edittext_text() == phone}
+
+
+@mcp.tool()
+def login_fill_password(account_id: int | None = None) -> dict:
+    """把账号密码敲进手机**当前焦点的输入框**。
+
+    **本工具永不接受密码作为参数**——这是刻意的，不是省事。Pi 的完整输出会落进
+    `.round_login_round.log`，任何进过 LLM 上下文的东西都会留在那里；密码只在本
+    工具内部解密后直接交给 adb，明文既不进上下文也不进日志。
+
+    只回**长度**，永不回内容。密码框是 `password=true`，uiautomator 读回来的
+    text 恒为空，所以密码无法回读校验——`verified` 恒为 false，这是设计而非缺陷。
+    失败时回 {ok: false, reason}，reason ∈ {no_request, no_account, no_password,
+    key_missing, decrypt_failed, input_failed}。**不要把返回值转述进汇报。**
+    """
+    acct_id, err = _login_account(account_id)
+    if err:
+        return {"ok": False, "reason": err}
+    with SessionLocal() as session:
+        enc = session.get(Account, acct_id).password_enc
+    if not enc:
+        return {"ok": False, "reason": "no_password"}
+    try:
+        password = decrypt_secret(enc)
+    except CredentialCryptoError:
+        return {"ok": False, "reason": "key_missing"}
+    except Exception:  # noqa: BLE001  解密失败不该把异常栈漏给 LLM
+        return {"ok": False, "reason": "decrypt_failed"}
+    typed = _type_into_focused(password)
+    if not typed["ok"]:
+        return {"ok": False, "reason": typed["reason"]}
+    return {"ok": True, "typed_len": len(password), "verified": False}
+
+
+@mcp.tool()
+def login_req_get() -> dict:
+    """读当前登录请求。**每轮开头先调这个**，按 phase 与 method 决定做什么。
+
+    返回 {phase, method, account_id, account_name, phone, resend_seq, attempts, notice}。
     phase:
-      pending       → 打开猎聘，把手机号填进登录页，点「获取验证码」
+      pending       → 按 method 操作手机：password 走账号密码页；code 走到「验证码已发送」
       awaiting_code → 调 login_req_claim_code() 取人工填的码，填进去并提交
     其它相位（dispatched/verifying/success/failed/…）都不该由本工具驱动。
+    method:
+      password → 全自动；失败要**在同一轮内降级**到 code 路径并写明原因
+      code     → 需要人工填码
     """
     with SessionLocal() as session:
         req = RedisLoginRequest().get()
@@ -573,12 +740,14 @@ def login_req_get() -> dict:
         acct = session.get(Account, req["account_id"])
         return {
             "phase": req["phase"],
+            "method": req["method"],
             "account_id": req["account_id"],
             "account_name": acct.name if acct else None,
             "phone": acct.phone if acct else None,
+            "has_password": bool(acct and acct.password_enc),
             "resend_seq": req["resend_seq"],
             "attempts": req["attempts"],
-            "error": req["error"] or None,
+            "notice": req["notice"] or None,
         }
 
 
@@ -588,9 +757,12 @@ def login_req_set(phase: str, note: str = "") -> dict:
       dispatched     已开始操作手机
       awaiting_code  已点「获取验证码」，等人工在前端填码
       verifying      已拿到码，正在提交
-      success        登录成功（本工具会顺带把该账号写为登录态）
+      success        登录成功（本工具会顺带把该账号写为登录态并设为生效账号）
       failed         失败，note 里写可读原因
     只有这几个值合法——写别的会被拒，避免提示词跑偏写出谁也不认识的相位。
+
+    `note` 按相位分流：`failed` 时它是 error（红条，结论），其余相位它是 notice
+    （黄条，过程说明）。「密码登录失败已改用验证码」就属于后者——**不静默换路**。
     """
     allowed = {
         PHASE_DISPATCHED,
@@ -642,6 +814,45 @@ def login_req_claim_code() -> dict:
     if code:
         return {"code": code}
     return {"code": None, "reason": "没有可用的验证码（未填、已用过或已过期）"}
+
+
+def _login_map_path() -> Path:
+    """从本文件向上找 agent/login_map.json。
+
+    不用数 parents 层数：数错一层不会报错，只会静默返回 map_missing，
+    到时候排查的是「探查没做」而不是「路径写错了」。
+    """
+    for base in Path(__file__).resolve().parents:
+        candidate = base / "agent" / "login_map.json"
+        if candidate.exists():
+            return candidate
+    return Path(__file__).resolve().parents[2] / "agent" / "login_map.json"
+
+
+LOGIN_MAP_STALE_DAYS = 90
+
+
+@mcp.tool()
+def login_map_get() -> dict:
+    """读登录界面的实测锚点表（`agent/login_map.json`）。
+
+    锚点存文件而不是写进指令：猎聘一升级锚点就会变，改 JSON 不该等于改提示词。
+    返回值里带 `age_days` 与 `stale`——**stale 为 true 时不要照着点**，先重新探查。
+    """
+    try:
+        data = json.loads(_login_map_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"ok": False, "reason": "map_missing"}
+    age_days = None
+    try:
+        probed = datetime.fromisoformat(data["probe"]["at"])
+        age_days = (datetime.now() - probed).days
+    except (KeyError, ValueError, TypeError):
+        pass
+    data["ok"] = True
+    data["age_days"] = age_days
+    data["stale"] = age_days is not None and age_days > LOGIN_MAP_STALE_DAYS
+    return data
 
 
 @mcp.tool()

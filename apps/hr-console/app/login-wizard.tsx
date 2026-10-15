@@ -17,17 +17,24 @@ type Phase =
 
 type Progress = {
   phase: Phase;
+  method?: "password" | "code" | null;
   account_id?: number | null;
   account_name?: string | null;
   phone_masked?: string | null;
   resend_seq?: number;
   error?: string | null;
+  notice?: string | null;
 };
 
 const POLL_MS = 3000;
 const TERMINAL: Phase[] = ["success", "failed", "cancelled", "expired"];
 
-type AccountLite = { id: number; name: string; phone_masked: string | null };
+type AccountLite = {
+  id: number;
+  name: string;
+  phone_masked: string | null;
+  has_password: boolean;
+};
 
 /**
  * 登录向导（批次 2）。
@@ -104,6 +111,10 @@ export default function LoginWizard({
     setErr(null);
   }
 
+  async function start(method: "password" | "code") {
+    await post(`/api/hr/accounts/${account.id}/login`, { method });
+  }
+
   const phase = progress.phase;
   const done = TERMINAL.includes(phase);
   const mine = progress.account_id === account.id;
@@ -138,20 +149,48 @@ export default function LoginWizard({
           <Checkbox checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)}>
             我已在手机上退出当前账号，并确认能登回它
           </Checkbox>
-          <Button
-            type="primary"
-            disabled={!confirmed}
-            loading={busy}
-            onClick={() => void post(`/api/hr/accounts/${account.id}/login`)}
-          >
-            开始登录
-          </Button>
+          <div className="account-form">
+            <Button
+              type="primary"
+              disabled={!confirmed || !account.has_password}
+              loading={busy}
+              title={
+                account.has_password ? undefined : "该账号还没存密码，请先在账号管理里补录"
+              }
+              onClick={() => void start("password")}
+            >
+              密码登录（全自动）
+            </Button>
+            <Button disabled={!confirmed} loading={busy} onClick={() => void start("code")}>
+              验证码登录（要填一次码）
+            </Button>
+          </div>
+          <p className="account-form-hint">
+            密码登录不用你管，但前提是密码已存且没改过；验证码登录不需要密码，
+            代价是你要从自己手机上读一次码填进来。
+            <b>密码登录失败会自动改用验证码，并告诉你原因。</b>
+          </p>
         </>
       )}
 
       {shown === "pending" && <Step text="正在手机上打开猎聘…" />}
-      {shown === "dispatched" && <Step text="正在输入手机号并获取验证码…" />}
+      {shown === "dispatched" && (
+        <Step
+          text={
+            progress.method === "password"
+              ? "正在用密码登录…"
+              : "正在输入手机号并获取验证码…"
+          }
+        />
+      )}
       {shown === "verifying" && <Step text="已收到验证码，正在提交…" />}
+
+      {/* 过程说明（黄条）：例如「密码登录失败，已改用验证码」。
+          与 error 分开——error 是失败的结论，这是「换路了，告诉你一声」。
+          只在属于本账号的请求上显示，别把别人的进度提示挂到自己头上。 */}
+      {mine && progress.notice && !done && (
+        <Alert type="warning" showIcon message={progress.notice} />
+      )}
 
       {shown === "awaiting_code" && (
         <>

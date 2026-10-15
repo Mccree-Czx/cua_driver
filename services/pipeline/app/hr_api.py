@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import string
 from datetime import datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
@@ -41,6 +42,12 @@ PRESIGN_MINUTES = 15  # spec §6：预签名 URL ≤15 分钟
 DAILY_MAX_DAYS = 90
 MANUAL_QUEUE_MAX = 200
 REVIEW_FROM = {CandidateStatus.RESUME_RECEIVED.value, CandidateStatus.HR_REVIEWED.value}
+
+# 能敲进手机的密码字符集。实测依据见 _encrypt_password 的 docstring——
+# 唯一被排除的可打印 ASCII 是双引号。
+TYPEABLE_PASSWORD_CHARS = frozenset(
+    string.ascii_letters + string.digits + string.punctuation.replace('"', "") + " "
+)
 
 
 def _today_start() -> datetime:
@@ -115,13 +122,31 @@ def _clean_phone(raw: str) -> str:
 def _encrypt_password(raw: str) -> str:
     """校验并加密密码。
 
-    不限制字符集：密码要原样送进猎聘，任何「为你好」的过滤都可能让用户存下
-    一个自己都登不上去的密码。特殊字符的输入问题在 Pi 那一侧解决。
+    **字符集限制是实测出来的物理限制，不是稳妥起见**：手机是 Android 10 + 华为，
+    `adb shell input text` 是唯一可用的输入通道（用户选择不装 ADBKeyboard）。逐个
+    字符实测（2026-10-14）的结论是——`string.punctuation` 里除双引号外的 28 个符号
+    都能原样敲进去，**双引号无论是单引号包裹、双引号包裹还是反斜杠转义，都是
+    返回码 0、无报错、静默丢弃**；中文等非 ASCII 完全不行；空格可以，但要靠 `%s`
+    转义（所以密码里出现字面量 `%s` 会被当成空格）。
+
+    不合规的密码存进库也永远敲不进手机，换号会在最后一步失败——所以宁可在创建时
+    就拒绝，并把原因直接写给用户看。
     """
     if not raw:
         raise HTTPException(status_code=400, detail="密码不能为空")
     if len(raw) > 128:
         raise HTTPException(status_code=400, detail="密码过长（上限 128 字符）")
+    bad = sorted({c for c in raw if c not in TYPEABLE_PASSWORD_CHARS})
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"密码含系统敲不进手机的字符：{''.join(bad)}"
+            "（双引号与中文都不行）。换号时这些字符会导致登录失败，请换一个密码。",
+        )
+    if "%s" in raw:
+        raise HTTPException(
+            status_code=400, detail="密码不能包含 %s——输入到手机时它会被当成空格"
+        )
     try:
         return encrypt_secret(raw)
     except CredentialCryptoError as exc:
@@ -255,9 +280,11 @@ def _login_payload(
         "account_id": req.get("account_id"),
         "account_name": account.name if account else None,
         "phone_masked": _mask_phone(account.phone) if account else None,
+        "method": req.get("method"),
         "phase": req.get("phase"),
         "resend_seq": req.get("resend_seq", 0),
         "error": req.get("error") or None,
+        "notice": req.get("notice") or None,
         "expires_at": req.get("expires_at"),
     }
 
@@ -276,9 +303,13 @@ def hr_login_request_get(
 
 
 class LoginStart(BaseModel):
-    """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。"""
+    """force=True 时覆盖在途请求（比如上一次卡住了，用户主动重启）。
+
+    method 由用户在前端选：password = 全自动（前提是密码已存），code = 人工填一次码。
+    """
 
     force: bool = False
+    method: Literal["password", "code"] = "code"
 
 
 @router.post("/accounts/{account_id}/login")
@@ -288,10 +319,11 @@ def hr_login_start(
     session: Session = Depends(get_session),
     store: Any = Depends(get_login_request),
 ) -> dict[str, Any]:
-    """发起登录：系统将代你在手机上打开猎聘、输手机号、点「获取验证码」。
+    """发起登录：系统将代你在手机上打开猎聘、输手机号、（密码或验证码）并提交。
 
     前置条件由前端确认（手机上得先退出旧号），这里只校验数据面。
     """
+    opts = body or LoginStart()
     account = session.get(models.Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
@@ -299,14 +331,19 @@ def hr_login_start(
         raise HTTPException(
             status_code=400, detail="该账号没有登记手机号，无法登录——请先在账号管理里补录"
         )
+    if opts.method == "password" and not account.password_enc:
+        raise HTTPException(
+            status_code=400,
+            detail="该账号没有存密码，无法用密码登录——请先补录，或改用验证码登录",
+        )
     in_flight = store.active()
-    if in_flight is not None and not (body and body.force):
+    if in_flight is not None and not opts.force:
         raise HTTPException(
             status_code=409,
             detail=f"已有一个登录在进行中（账号 {in_flight['account_id']}，"
             f"阶段 {in_flight['phase']}）——一部手机同一时刻只能登一个号",
         )
-    req = store.start(account_id)
+    req = store.start(account_id, opts.method)
     return _login_payload(req, account)
 
 

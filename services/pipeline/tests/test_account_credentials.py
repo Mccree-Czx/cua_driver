@@ -39,7 +39,7 @@ def _phone() -> str:
     return "139" + f"{uuid4().int % 10**8:08d}"
 
 
-def _create(client, made, *, name="测试号", phone=None, password="Passw0rd!#中文"):
+def _create(client, made, *, name="测试号", phone=None, password="Passw0rd!#abc"):
     resp = client.post(
         "/api/hr/accounts",
         json={"name": name, "phone": phone or _phone(), "password": password},
@@ -117,6 +117,37 @@ def test_create_rejects_empty_password(client):
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.parametrize(
+    "password,must_mention",
+    [
+        ('has"quote', "双引号"),
+        ("中文密码", "双引号与中文"),
+        ("pct%shere", "%s"),
+    ],
+)
+def test_create_rejects_untypeable_password(client, password, must_mention):
+    """实测结论固化成规则：双引号与中文敲不进手机，含字面量 %s 会变成空格。
+
+    这类密码存进库也永远登不上——必须在创建时就拦住，而不是等换号时失败。
+    """
+    resp = client.post(
+        "/api/hr/accounts", json={"name": "坏密码", "phone": _phone(), "password": password}
+    )
+    assert resp.status_code == 400, resp.text
+    assert must_mention in resp.json()["detail"]
+
+
+def test_create_accepts_the_full_typeable_symbol_set(client, made, session):
+    """除双引号外的可打印 ASCII 全部要能通过——别把规则收得比实测更紧。"""
+    import string
+
+    password = string.ascii_letters + string.digits + string.punctuation.replace('"', "") + " "
+    assert '"' not in password
+    created = _create(client, made, password=password)
+    row = session.get(models.Account, created["id"])
+    assert decrypt_secret(row.password_enc) == password
+
+
 def test_list_masks_phone_and_hides_password(client, made):
     phone = _phone()
     created = _create(client, made, phone=phone)
@@ -150,11 +181,11 @@ def test_patch_only_touches_provided_fields(client, made, session):
 def test_patch_updates_password(client, made, session):
     created = _create(client, made, password="OldPass-1")
     resp = client.patch(
-        f"/api/hr/accounts/{created['id']}", json={"password": "NewPass-2!#中文"}
+        f"/api/hr/accounts/{created['id']}", json={"password": "NewPass-2!#abc"}
     )
     assert resp.status_code == 200, resp.text
     row = session.get(models.Account, created["id"])
-    assert decrypt_secret(row.password_enc) == "NewPass-2!#中文"
+    assert decrypt_secret(row.password_enc) == "NewPass-2!#abc"
 
 
 def test_patch_rejects_phone_taken_by_another_account(client, made):

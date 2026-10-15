@@ -155,6 +155,74 @@ def test_start_overwrites_stale_request(store):
     assert req["phase"] == "pending"
 
 
+# —— 登录方式（2026-10-15 用户拍板：向导上二选一，密码失败自动降级）——
+
+
+def test_start_records_method(store):
+    assert store.start(account_id=7, method="password")["method"] == "password"
+    assert store.get()["method"] == "password"
+
+
+def test_start_rejects_unknown_method(store):
+    with pytest.raises(ValueError):
+        store.start(account_id=7, method="carrier_pigeon")
+
+
+def test_note_goes_to_notice_unless_failed(store):
+    """note 按相位分流：failed 是红条（结论），其余是黄条（过程说明）。
+
+    「密码登录失败已改用验证码」属于后者。混进 error 会让前端把它渲染成一次失败，
+    用户会以为登录挂了——其实只是换了个方式继续。
+    """
+    store.start(account_id=7, method="password")
+    store.set_phase("awaiting_code", "密码登录失败，已改用验证码")
+    req = store.get()
+    assert req["notice"] == "密码登录失败，已改用验证码"
+    assert req["error"] == ""
+
+    store.set_phase("failed", "验证码错误")
+    req = store.get()
+    assert req["error"] == "验证码错误"
+    assert req["notice"] == ""  # 落终态失败时，过程提示要让位给结论
+
+
+def test_api_rejects_password_login_without_stored_password(client, made, session):
+    acct = _new_account(client, made)
+    session.execute(
+        models.Account.__table__.update()
+        .where(models.Account.id == acct["id"])
+        .values(password_enc=None)
+    )
+    session.commit()
+    resp = client.post(
+        f"/api/hr/accounts/{acct['id']}/login", json={"method": "password"}
+    )
+    assert resp.status_code == 400, resp.text
+    assert "没有存密码" in resp.json()["detail"]
+
+
+def test_api_returns_method(client, made):
+    acct = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{acct['id']}/login", json={"method": "password"})
+    body = client.get("/api/hr/accounts/login-request").json()
+    assert body["method"] == "password"
+    assert body["notice"] is None
+
+
+def test_method_defaults_to_code(client, made):
+    """不传 method 时走验证码——不需要密码的那条路，作为默认更安全。"""
+    acct = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{acct['id']}/login")
+    assert client.get("/api/hr/accounts/login-request").json()["method"] == "code"
+
+
+@pytest.mark.parametrize("bad", ["carrier_pigeon", "PASSWORD", ""])
+def test_api_rejects_unknown_method(client, made, bad):
+    acct = _new_account(client, made)
+    resp = client.post(f"/api/hr/accounts/{acct['id']}/login", json={"method": bad})
+    assert resp.status_code == 422, resp.text
+
+
 # —— 接口守卫 ——
 
 
@@ -241,6 +309,21 @@ def test_login_req_set_rejects_unknown_phase(client, made, hr_tools_on_test_redi
     acct = _new_account(client, made)
     client.post(f"/api/hr/accounts/{acct['id']}/login")
     assert tools.login_req_set("乱写的相位")["ok"] is False
+
+
+def test_fill_tools_never_accept_a_password_parameter():
+    """把设计约束变成可执行约束。
+
+    密码只能由工具内部解密后直接投递给 adb。一旦有人给这些工具加了密码入参，
+    Pi 就会把明文放进上下文——而它的完整 stdout 会落进 `.round_login_round.log`，
+    等于把密码写进磁盘。这条断言就是为了在那一天拦住它。
+    """
+    import inspect
+
+    forbidden = {"password", "secret", "pwd", "passwd", "credential", "token"}
+    for fn in (tools.login_fill_phone, tools.login_fill_password):
+        leaked = set(inspect.signature(fn).parameters) & forbidden
+        assert not leaked, f"{fn.__name__} 出现了可传入的凭据参数：{leaked}"
 
 
 def test_success_writes_login_state_and_activates(client, made, session, hr_tools_on_test_redis):

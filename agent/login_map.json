@@ -1,0 +1,56 @@
+{
+  "_说明": "猎聘 App 登录相关界面的实测锚点。存成文件而不是写进 rounds.md：App 升级只改这里，提示词保持稳定 = 缓存友好、Pi 不易跑偏。坐标基于 1080x2244。",
+  "app": {
+    "package": "com.lietou.mishu",
+    "version_code": 13120,
+    "screen": "1080x2244"
+  },
+  "probe": {
+    "at": "2026-10-14",
+    "by": "adb 直接探查（只 dump 与导航，未输入任何字符）",
+    "note": "探查时生产号恰好自然过期，因此登录页无需登出即可看到——这次探查没有让任何账号承担风险"
+  },
+
+  "switch_account_exists": null,
+  "switch_account_note": "未知：需登录状态下进「我的→设置」才能看。若存在，换号可完全绕过登出。",
+
+  "logout_path": null,
+  "logout_requires_2fa": null,
+  "logout_note": "未知：同上，需要登录态才能探查。",
+
+  "logged_out_anchor": {
+    "kind": "dialog",
+    "match": "您的帐号信息已过期",
+    "dismiss": { "match": "确定", "center": [540, 1262] },
+    "note": "过期提示。点「确定」后落到登录页。"
+  },
+
+  "login_page_anchor": {
+    "match": "手机号登录/注册",
+    "center": [540, 1079]
+  },
+
+  "phone_login": {
+    "phone_field": { "center": [640, 838], "prefilled": true },
+    "next_button": { "match": "下一步", "center": [540, 1282], "disabled_until_agreed": true }
+  },
+
+  "password_login_available": true,
+  "password_login": {
+    "entry": { "match": "密码登录", "center": [198, 1420] },
+    "title_anchor": { "match": "账号密码登录", "center": [306, 410] },
+    "phone_field": { "center": [502, 805], "password": false },
+    "password_field": { "center": [457, 1003], "password": true,
+                        "bounds": [162, 931, 753, 1075] },
+    "agree_checkbox": { "center": [138, 1225], "note": "必须勾选，否则登录按钮无效" },
+    "login_button": { "match": "登录", "center": [540, 1447] },
+    "back_to_code_login": { "match": "手机号登录/注册", "center": [274, 1585] },
+    "forgot_password": { "match": "找回密码", "center": [882, 1585] }
+  },
+
+  "captcha_seen": false,
+  "captcha_note": "尚未走完一次真实登录，图形验证码/滑块是否会出现仍是未知。铁律 3 仍然生效：出现即停 + risk_set()。",
+
+  "rollback_verified": null,
+  "rollback_note": "回滚能力尚未在真机验证过。验证前不允许自动登出（见 plan 的 rollback_verified 能力门）。"
+}

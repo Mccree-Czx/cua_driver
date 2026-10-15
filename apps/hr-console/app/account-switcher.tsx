@@ -267,6 +267,10 @@ function AccountManager({
             ? "留空的字段不会被修改。手机号与密码不会回显——需要改哪项就重填哪项。"
             : "手机号是账号的真实身份，系统靠它核验手机上登录的是不是这个号。密码加密存档，用于换号失败时登回旧号。"}
         </p>
+        <p className="account-form-hint">
+          密码限制：系统要把密码敲进手机，而输入通道敲不了
+          <b>双引号</b>和<b>中文</b>——请换掉这两个；其余字母、数字、常见符号都可以。
+        </p>
         <div className="account-form">
           <Input
             placeholder={editing ? "账号名称（留空不改）" : "账号名称，如 主号-张HR"}
@@ -286,8 +290,7 @@ function AccountManager({
             onChange={(e) => setForm({ ...form, password: e.target.value })}
             maxLength={128}
             autoComplete="new-password"
-          />
-          <Button type="primary" loading={busy} onClick={() => void submit()}>
+          />          <Button type="primary" loading={busy} onClick={() => void submit()}>
             {editing ? "保存" : "创建账号"}
           </Button>
         </div>
