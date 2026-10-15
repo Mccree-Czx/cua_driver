@@ -78,7 +78,10 @@ export default function LoginWizard({
       const data: Progress = await resp.json();
       phaseRef.current = data.phase;
       setProgress(data);
-      if (data.phase === "success") await onChanged();
+      if (data.phase === "success") {
+        await onChanged();
+        reloadOnceForSwitch(data.account_id);
+      }
     } catch (e) {
       setErr(`读取进度失败：${e instanceof Error ? e.message : String(e)}`);
     }
@@ -103,7 +106,10 @@ export default function LoginWizard({
       const data: Progress = await resp.json();
       phaseRef.current = data.phase;
       setProgress(data);
-      if (data.phase === "success") await onChanged();
+      if (data.phase === "success") {
+        await onChanged();
+        reloadOnceForSwitch(data.account_id);
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -323,6 +329,30 @@ function Step({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+/**
+ * 切号成功后**整页刷新**一次。
+ *
+ * 各页面的数据都是客户端 `useEffect` 里 fetch 的，依赖数组里**没有 account**——
+ * 换号之后它们会继续显示**旧账号**的候选人与职位，看起来就像「数据串号了」。
+ * （2026-10-15 用户就把「职位重名」误读成了隔离坏了，其实一刷新就清楚。）
+ *
+ * ★ 用 sessionStorage 记住「这个账号已经刷过了」：轮询每 3 秒一次，
+ *   不记的话 `success` 会被反复看到 → **无限刷新**。
+ * ★ 拿不到 sessionStorage（隐私模式）时**不刷新**——宁可让用户手动 F5，
+ *   也不要冒无限刷新的险。
+ */
+function reloadOnceForSwitch(accountId: number | null | undefined) {
+  if (accountId == null) return;
+  const key = `hr-switched-${accountId}`;
+  try {
+    if (sessionStorage.getItem(key)) return;
+    sessionStorage.setItem(key, "1");
+  } catch {
+    return;
+  }
+  window.location.reload();
 }
 
 function phaseLabel(phase: Phase): string {

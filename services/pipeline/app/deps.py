@@ -1,4 +1,4 @@
-"""FastAPI 依赖：会话 / 任务队列 / screening 客户端 / 对象存储 / 登录态的单例提供者。
+"""FastAPI 依赖：会话 / 任务队列 / 对象存储 / 登录态的单例提供者。
 
 测试经 app.dependency_overrides 换 FakeTaskQueue / FakeScreening / FakeLoginState；
 MySQL 与 MinIO 保持真实（任务测试要求：真实 MySQL + 真实 MinIO）。
@@ -14,7 +14,6 @@ from app.db import SessionLocal
 from app.login_request import RedisLoginRequest
 from app.login_state import RedisLoginState
 from app.models import Account
-from app.screening_client import ScreeningClient
 from app.storage import ObjectStore
 from app.task_queue import ArqTaskQueue
 
@@ -56,9 +55,10 @@ def get_queue() -> ArqTaskQueue:
     return ArqTaskQueue()
 
 
-@lru_cache
-def get_screening() -> ScreeningClient:
-    return ScreeningClient()
+# `get_screening` 已于 2026-10-15 删除：全仓库 0 引用。
+# screening 那条路现在由 hr-tools 自己建连（`tools_mcp_server._screening()`），
+# 不走 FastAPI 依赖注入——留着一个没人用的 DI 工厂只会让人以为有个接口在用。
+# `ScreeningClient` 本身还活着，别一起删。
 
 
 @lru_cache
