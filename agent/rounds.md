@@ -1,7 +1,7 @@
 # Pi 招聘助手 · 轮次指令（外部调度触发）
 
 每个轮次由外部定时器以 `pi -p --append-system-prompt system-prompt.md "<本文件对应轮次指令>"` 方式触发。
-工作窗口 08:00–24:00 由外部调度判断；Pi 只执行。
+工作窗口 08:00–23:00 由外部调度判断；Pi 只执行。
 
 ## 1. main_round（由 launchd 每 5 分钟拉起一次；outbound 单轮 35 卡 / inbound 单轮 10 会话；串行锁保证同一时刻仅一轮）
 
