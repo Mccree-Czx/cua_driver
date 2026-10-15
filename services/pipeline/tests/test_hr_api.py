@@ -253,6 +253,57 @@ def test_patch_job_threshold_reflow(client, session):
     assert client.patch("/api/hr/jobs/999999", json={"llm_threshold": 80}).status_code == 404
 
 
+def test_patch_job_refuses_another_accounts_job(client, session):
+    """★ 改别的账号的职位必须 404。
+
+    这个端点原先只 `session.get(Job, job_id)` 就改，**没有账号校验**——
+    可以跨账号读写别人职位的 JD / status / llm_threshold / scoring_prefs。
+    同文件的 `/candidates/{jc_id}` 与 `/overview` 一直都做了，唯独这里漏了。
+
+    校验位置与 `/candidates/{jc_id}` 一致：**不区分「不存在」与「不属于你」**，
+    避免通过状态码探测别的账号有哪些职位。
+    """
+    job_id = _new_job(client)
+
+    other = models.Account(name=f"另一个号-{uuid4().hex[:6]}", is_active=False)
+    session.add(other)
+    session.commit()
+
+    def switch_active(account_id: int) -> None:
+        session.execute(models.Account.__table__.update().values(is_active=False))
+        session.execute(
+            models.Account.__table__.update()
+            .where(models.Account.id == account_id)
+            .values(is_active=True)
+        )
+        session.commit()
+
+    try:
+        switch_active(other.id)
+        assert (
+            client.patch(f"/api/hr/jobs/{job_id}", json={"llm_threshold": 85}).status_code
+            == 404
+        ), "跨账号改到了别人的职位"
+        # 写路径一并堵住：JD 与启停同样不能跨账号
+        assert (
+            client.patch(
+                f"/api/hr/jobs/{job_id}", json={"jd_text": "随便写点什么" * 5, "status": "active"}
+            ).status_code
+            == 404
+        )
+
+        # 切回去确认它本来改得动——排除「因为别的原因 404」
+        switch_active(DEFAULT_ACCOUNT_ID)
+        assert (
+            client.patch(f"/api/hr/jobs/{job_id}", json={"llm_threshold": 85}).status_code
+            == 200
+        )
+    finally:
+        switch_active(DEFAULT_ACCOUNT_ID)
+        session.execute(models.Account.__table__.delete().where(models.Account.id == other.id))
+        session.commit()
+
+
 # —— M4：人工队列 / 告警 ——
 
 

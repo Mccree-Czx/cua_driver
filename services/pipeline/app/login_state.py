@@ -11,6 +11,7 @@ is_login=None（从未检查）不动作。
 """
 
 import json
+from datetime import datetime
 from typing import Protocol
 
 import redis
@@ -29,6 +30,8 @@ class LoginStateStore(Protocol):
     def set(
         self, is_login: bool, task_id: str, checked_at: str, account_id: int
     ) -> None: ...
+
+    def clear(self, account_id: int) -> None: ...
 
 
 class RedisLoginState:
@@ -52,4 +55,22 @@ class RedisLoginState:
                 {"is_login": is_login, "task_id": task_id, "checked_at": checked_at},
                 ensure_ascii=False,
             ),
+        )
+
+    def clear(self, account_id: int) -> None:
+        """把某个账号标成**已登出**（写 `is_login=false`）。
+
+        多账号（2026-10-15）：一部手机同一时刻只登一个号，所以换号之后
+        旧账号那条必须被清掉——否则三个账号会同时挂着 `is_login: true`
+        （实测就是如此），而读它的 `/alerts` 会把几周前的 true 当成「还在线」，
+        「掉登录」告警也因此永远不会触发。
+
+        写 false 而不是删键：`checked_at` 要留着，删了就没法区分
+        「查过、已登出」和「从来没查过」。
+        """
+        self.set(
+            is_login=False,
+            task_id="",
+            checked_at=datetime.now().isoformat(timespec="seconds"),
+            account_id=account_id,
         )

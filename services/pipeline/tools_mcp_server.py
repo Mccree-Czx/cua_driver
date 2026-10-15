@@ -751,11 +751,16 @@ def _focused_edittext_text() -> str | None:
 
 
 def _login_account(account_id: int | None) -> tuple[int | None, str]:
-    """解析要操作的账号，返回 (id, 错误原因)。"""
+    """解析要操作的账号，返回 (id, 错误原因)。
+
+    ★ 省略 account_id 时只认**在途**的请求：终态请求是上一轮的残留，
+      拿它的账号去敲手机号 = **把旧号的号敲进手机**（这个函数的下游就是
+      `login_fill_phone`，真的会往输入框里打字）。
+    """
     if account_id is None:
-        req = RedisLoginRequest().get()
+        req = RedisLoginRequest().active()
         if req is None:
-            return None, "no_request"
+            return None, "no_active_request"
         account_id = req["account_id"]
     with SessionLocal() as session:
         acct = session.get(Account, account_id)
@@ -839,9 +844,14 @@ def login_req_set(phase: str, note: str = "") -> dict:
     if phase not in allowed:
         return {"ok": False, "error": f"phase 必须是 {sorted(allowed)} 之一"}
     store = RedisLoginRequest()
-    req = store.get()
+    # ★ 只认**在途**的请求（非终态且未过期）。这里以前用的是 `store.get()`，
+    #   它把终态/过期的请求也照样返回——而下面那句 `mark_account_logged_in()`
+    #   会**改生效账号**。于是：任何人在登录成功后 30 分钟内（hash TTL 1800s）
+    #   拿一条旧请求来报「成功」，就能把 is_active 静默翻回旧号，且没有任何报错。
+    #   今天实测就是靠这个，三个账号的登录态能同时为 true。
+    req = store.active()
     if req is None:
-        return {"ok": False, "error": "当前没有登录请求"}
+        return {"ok": False, "error": "当前没有**在途**的登录请求（已结束或已超时），拒绝写相位"}
     if phase == PHASE_SUCCESS:
         # 登录成功 = 手机上现在登的就是这个号：写登录态 + 置为生效账号。
         # 实现抽在 login_request.mark_account_logged_in —— 确定性驱动路径也要走同一步。

@@ -48,12 +48,17 @@ INTERACTION_MSG_TYPES = ("greet_request", "reply", "attachment", "direct_request
 class Account(Base):
     """猎聘招聘账号（多账号支持，2026-10-14）。
 
-    系统的执行端是手机上的猎聘 App，同一时刻只登录一个招聘号。切号由人工在
-    手机上完成，系统只负责「知道当前是哪个号」并按账号隔离数据。
+    系统的执行端是手机上的猎聘 App，同一时刻只登录一个招聘号。换号走
+    `POST /accounts/{id}/switch`——它**真的会去手机上**退出旧号、登新号，
+    成功之后才把 `is_active` 切过去。
 
     is_active 放数据库而不是 Redis：这是配置性状态，要持久、要进备份。
     Redis 一刷就丢失当前账号，系统便不知道该按哪个号算配额。应用层保证
-    全局最多一个为 true（切换走 hr_api 的 activate 端点，事务内保证）。
+    全局最多一个为 true（`mark_account_logged_in` 在事务内先全置 false 再置目标）。
+
+    ★ 曾经有个 `POST /accounts/{id}/activate` 只翻这一列、**不碰手机**，
+      而「生效账号 == 手机上登的号」是整套隔离的地基——一点就能把它掀了。
+      2026-10-15 已删除，换号只剩 `/switch` 一条路。
 
     phone / password_enc 是账号的凭据（2026-10-14 补）。手机号是账号的真实
     身份——系统靠它核对「手机上登录的到底是不是这个号」；密码只存密文

@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from app import models
 from app.config import get_settings
 from app.deps import get_login_request
-from app.keys import login_state_key
+from app.keys import login_req_key, login_state_key
 from app.login_request import RedisLoginRequest
 from app.main import app
 from conftest import DEFAULT_ACCOUNT_ID
@@ -58,11 +58,22 @@ def hr_tools_on_test_redis(monkeypatch):
 
 @pytest.fixture()
 def made(session):
-    """经 API 建出来的账号，测试后删干净（phone 有唯一约束，残留会污染下一轮）。"""
+    """经 API 建出来的账号，测试后删干净（phone 有唯一约束，残留会污染下一轮）。
+
+    还要**把生效账号还给默认账号**：好些用例会走一次登录、把生效账号换成新号。
+    这件事以前是 `client.post("/api/hr/accounts/1/activate")` 干的，而那个端点
+    2026-10-15 已删除（它只翻库、不碰手机，是隔离问题的源头）——所以只能直接改库。
+    """
     ids: list[int] = []
     yield ids
     for aid in ids:
         session.execute(models.Account.__table__.delete().where(models.Account.id == aid))
+    session.execute(models.Account.__table__.update().values(is_active=False))
+    session.execute(
+        models.Account.__table__.update()
+        .where(models.Account.id == DEFAULT_ACCOUNT_ID)
+        .values(is_active=True)
+    )
     session.commit()
 
 
@@ -400,6 +411,80 @@ def test_success_writes_login_state_and_activates(client, made, session, hr_tool
 
     session.expire_all()
     assert session.get(models.Account, acct["id"]).is_active is True
-    assert session.get(models.Account, 1).is_active is False
-    # 收拾现场：把生效账号还给默认账号
-    client.post("/api/hr/accounts/1/activate")
+    assert session.get(models.Account, DEFAULT_ACCOUNT_ID).is_active is False
+
+
+def test_login_req_set_refuses_a_terminal_request(
+    client, made, hr_tools_on_test_redis, monkeypatch
+):
+    """★ 终态请求不能被再次「报成功」——那会**改生效账号**。
+
+    `login_req_set` 原先用的是 `store.get()`，它把终态/过期的请求也照样返回。
+    而 `phase="success"` 那条分支会调 `mark_account_logged_in(req["account_id"])`
+    ——于是登录成功后的 30 分钟内（hash TTL 1800s），拿一条旧请求来报「成功」
+    就能把 `is_active` 静默翻回旧号，且没有任何报错。
+
+    2026-10-15 实测三个账号的登录态同时为 true，就是这条路留下的。
+    """
+    acct = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{acct['id']}/login")
+    assert tools.login_req_set("success")["ok"] is True
+
+    # 装个探针：确认第二次调用**根本没有**再去碰生效账号
+    touched: list[int] = []
+    monkeypatch.setattr(tools, "mark_account_logged_in", lambda i: touched.append(i))
+
+    again = tools.login_req_set("success")
+    assert again["ok"] is False
+    assert "在途" in again["error"]
+    assert touched == [], "终态请求竟然又改了一次生效账号"
+
+    # 别的相位同样不该被接受
+    assert tools.login_req_set("failed", "手滑")["ok"] is False
+
+
+def test_login_req_set_refuses_an_expired_request(
+    client, made, hr_tools_on_test_redis, monkeypatch
+):
+    """过期（但还不是终态）的请求同样不能动手。
+
+    超时判定只有轮询器在做（`login_watch`），而它 20 秒才跑一次——
+    中间这个窗口里，请求在 Redis 里看着还是 `pending`。
+    """
+    acct = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{acct['id']}/login")
+    assert tools.login_req_set("dispatched")["ok"] is True  # 非终态，先让它可被接受
+
+    # 把过期时间拨到过去
+    tools._redis().hset(login_req_key(), mapping={"expires_at": "1"})
+
+    touched: list[int] = []
+    monkeypatch.setattr(tools, "mark_account_logged_in", lambda i: touched.append(i))
+    assert tools.login_req_set("success")["ok"] is False
+    assert touched == []
+
+
+def test_switching_clears_the_previous_accounts_login_state(
+    client, made, hr_tools_on_test_redis
+):
+    """★ 一部手机同一时刻只登一个号——换号之后旧号那条必须被清掉。
+
+    实测过三个账号同时挂 `is_login: true` 且 TTL 为 -1：`/alerts` 于是拿几周前的
+    true 当「还在线」，而「掉登录」告警**永远不会触发**。这是隔离问题里最安静的一种。
+    """
+    import json
+
+    first = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{first['id']}/login")
+    assert tools.login_req_set("success")["ok"] is True
+
+    second = _new_account(client, made)
+    client.post(f"/api/hr/accounts/{second['id']}/login")
+    assert tools.login_req_set("success")["ok"] is True
+
+    old = tools._redis().get(login_state_key(first["id"]))
+    new = tools._redis().get(login_state_key(second["id"]))
+    assert json.loads(old)["is_login"] is False, "旧号还被标着「已登录」"
+    assert json.loads(new)["is_login"] is True
+    # checked_at 要留着：删了键就分不清「查过、已登出」和「从来没查过」
+    assert json.loads(old)["checked_at"]

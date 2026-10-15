@@ -240,27 +240,16 @@ def hr_account_patch(
     return _account_out(acct)
 
 
-@router.post("/accounts/{account_id}/activate")
-def hr_account_activate(
-    account_id: int, session: Session = Depends(get_session)
-) -> dict[str, Any]:
-    """把指定账号置为生效。事务内先全部置 false 再置目标为 true，保证恰好一个 active。
-
-    这一步**不会**去手机上切号——它只是告诉系统「接下来按哪个号算配额与隔离数据」。
-    """
-    target = session.get(models.Account, account_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"账号 {account_id} 不存在")
-    session.execute(
-        models.Account.__table__.update().values(is_active=False)
-    )
-    session.execute(
-        models.Account.__table__.update()
-        .where(models.Account.id == account_id)
-        .values(is_active=True)
-    )
-    session.commit()
-    return {"active_id": account_id, "name": target.name}
+# ★ `POST /accounts/{id}/activate` 已于 2026-10-15 **删除**。
+#
+# 它只翻库里的 `is_active`，**不碰手机**（原来的 docstring 自己写着这句）。
+# 而系统里所有其他地方都假设「库里的生效账号 == 手机上登的号」——
+# 这个端点一被调用，两者立刻不一致，下一轮 Pi 的 `job_list_active()`、
+# 候选人与配额就全按新号算，而手机还是旧号。前端下拉框的 onChange 直接调它，
+# 也就是说**一次误触就能制造这种不一致**，且没有任何确认。
+#
+# 换号现在只有一条路：`POST /accounts/{id}/switch`（或 `/login`），
+# 它们会真的去手机上退出旧号、登新号，成功之后才改 `is_active`。
 
 
 # —— 登录（批次 2：系统代操作手机）——
@@ -1046,11 +1035,22 @@ class JobPatch(BaseModel):
 
 @router.patch("/jobs/{job_id}")
 def hr_patch_job(
-    job_id: int, body: JobPatch, session: Session = Depends(get_session)
+    job_id: int,
+    body: JobPatch,
+    session: Session = Depends(get_session),
+    acct: models.Account = Depends(get_active_account),
 ) -> dict[str, Any]:
-    """岗位配置回流：JD 正文 / 启停 / LLM 阈值（遗留 0-100）/ 评分卡。"""
+    """岗位配置回流：JD 正文 / 启停 / LLM 阈值（遗留 0-100）/ 评分卡。
+
+    其它账号的 job_id 一律按 404 处理（不区分「不存在」与「不属于你」，
+    避免通过状态码探测别的账号有哪些职位）——与 `/candidates/{jc_id}` 同一套规矩。
+
+    ★ 这个校验是 2026-10-15 补的：原先这里只 `session.get(Job, job_id)` 就改，
+      可以跨账号读写**别人职位的 JD / status / llm_threshold / scoring_prefs**。
+      同文件的 `/candidates/{jc_id}` 与 `/overview` 一直都做了，唯独这里漏了。
+    """
     job = session.get(models.Job, job_id)
-    if job is None:
+    if job is None or job.account_id != acct.id:
         raise HTTPException(status_code=404, detail=f"岗位 {job_id} 不存在")
 
     if body.jd_text is not None:

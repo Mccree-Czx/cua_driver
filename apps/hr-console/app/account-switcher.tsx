@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Button, Input, Modal, Select, Tag } from "antd";
+import { Button, Input, Modal, Tag } from "antd";
 import { PlusOutlined, SettingOutlined, WarningOutlined } from "@ant-design/icons";
 import LoginWizard from "./login-wizard";
 
@@ -14,19 +14,21 @@ type Account = {
 };
 
 /**
- * 猎聘账号切换器（多账号支持，2026-10-14）。
+ * 猎聘账号切换器（多账号支持，2026-10-14；2026-10-15 改）。
  *
- * 重要：这里**只是告诉系统「接下来按哪个号算」**，不会去手机上切号——登出/登录
- * 由人工在猎聘 App 里完成。顺序必须是「先在手机切号 → 再在这里点选」。
+ * 这里只**显示**当前生效账号，换号走右边齿轮里的「切换到此账号」——
+ * 那条路会真的去手机上退出旧号、登新号，成功之后才改生效账号。
  *
- * 切号后整页刷新：各页面的数据是客户端 useEffect 里 fetch 的，router.refresh()
- * 不会重新触发那些请求。
+ * ★ 曾经这里是个下拉框，onChange 直接调 `POST /accounts/{id}/activate`。
+ *   那个端点只翻库里的 `is_active`、**不碰手机**，一次误触就能让
+ *   「库里的生效账号」和「手机上登的号」不一致——而系统里所有其他地方都假设
+ *   这两者一致（Pi 按生效账号取职位、算配额、隔离数据）。
+ *   端点已删，下拉框一并去掉：**换号只能走一条路**。
  */
 export default function AccountSwitcher() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
-  const [switching, setSwitching] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -49,34 +51,22 @@ export default function AccountSwitcher() {
     void load();
   }, [load]);
 
-  async function activate(id: number) {
-    setSwitching(true);
-    try {
-      const resp = await fetch(`/api/hr/accounts/${id}/activate`, { method: "POST" });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      window.location.reload();
-    } catch (e) {
-      setErr(`切换失败：${e instanceof Error ? e.message : String(e)}`);
-      setSwitching(false);
-    }
-  }
-
   const active = accounts.find((a) => a.id === activeId) ?? null;
 
   return (
     <div className="account-switcher">
       <span className="account-switcher-label">猎聘账号</span>
-      <Select
-        size="small"
-        style={{ minWidth: 170 }}
-        loading={loading}
-        disabled={switching}
-        value={activeId ?? undefined}
-        placeholder={activeId === null ? "未选择" : undefined}
-        onChange={(v) => void activate(v)}
-        options={accounts.map((a) => ({ value: a.id, label: labelOf(a) }))}
-        status={activeId === null ? "error" : undefined}
-      />
+      {/* 只读展示。换号请点右边的齿轮 →「切换到此账号」。 */}
+      <span
+        style={{
+          minWidth: 170,
+          fontWeight: activeId === null ? 400 : 600,
+          color: activeId === null ? "#cf1322" : "inherit",
+        }}
+        title="换号请点右边的齿轮"
+      >
+        {loading ? "读取中…" : active ? labelOf(active) : "未选择"}
+      </span>
       <Button
         size="small"
         type="text"

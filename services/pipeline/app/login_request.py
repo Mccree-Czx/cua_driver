@@ -255,19 +255,28 @@ def mark_account_logged_in(account_id: int) -> None:
     """
     from datetime import datetime
 
-    from sqlalchemy import update
+    from sqlalchemy import select, update
 
     from app.db import SessionLocal
     from app.login_state import RedisLoginState
     from app.models import Account
 
-    RedisLoginState().set(
+    state = RedisLoginState()
+    state.set(
         is_login=True,
         task_id="",
         checked_at=datetime.now().isoformat(timespec="seconds"),
         account_id=account_id,
     )
     with SessionLocal() as session:
+        # ★ 先把别人的登录态清掉，再写自己的。
+        #   一部手机同一时刻只登一个号——不清理的话三个账号会同时挂着
+        #   `is_login: true`（2026-10-15 实测就是这样），`/alerts` 于是拿
+        #   几周前的 true 当「还在线」，「掉登录」告警永远不会触发。
+        others = session.scalars(select(Account.id).where(Account.id != account_id)).all()
+        for other in others:
+            state.clear(other)
+
         session.execute(update(Account).values(is_active=False))
         session.execute(
             update(Account).where(Account.id == account_id).values(is_active=True)
