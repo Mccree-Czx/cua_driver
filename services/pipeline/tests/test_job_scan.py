@@ -119,6 +119,54 @@ def test_publish_form_guard_is_quiet_on_normal_page():
     flows._guard_publish_form(JOB_PAGE_XML)  # 不该抛
 
 
+# ——— 导航到职位列表 ———
+
+
+def test_goto_job_list_does_not_tap_the_tab_when_already_there(monkeypatch):
+    """★ 已经在「招聘中」列表上，就**一次都别点**底部「职位」tab。
+
+    猎聘的「职位」tab 是「回到该 tab **上次那页**」，不是「回到 tab 根」。
+    2026-10-15 真机复现：`ensure_main_tabs()` 已经把手机带到了「招聘中」列表，
+    脚本又去点了一下 tab —— 那一下把它送回了 Pi 上一轮留在那里的
+    「某个职位的候选人页」，于是判定「没进到职位管理页」，抓 JD 整段失败。
+
+    这条测试钉死的是「**不要多此一举地点击**」。
+    """
+    taps: list = []
+    monkeypatch.setattr(
+        phone, "ensure_main_tabs", lambda pkg, **kw: {"ok": True, "marks": ["推荐", "职位", "我的"]}
+    )
+    monkeypatch.setattr(phone, "dump", lambda: JOB_PAGE_XML)
+    monkeypatch.setattr(phone, "tap_node", lambda node, **kw: taps.append(node["center"]))
+    monkeypatch.setattr(phone, "tap", lambda *a, **k: taps.append(a))
+    monkeypatch.setattr(phone, "back", lambda: taps.append("BACK"))
+
+    flows._goto_job_list("测试")
+
+    assert "BACK" not in taps, "已经在列表上了还按了 BACK"
+    assert (675, 2122) not in taps, "已经在列表上了还点了底部「职位」tab"
+    # 唯一该点的是「招聘中」筛选 tab
+    assert taps == [(118, 277)]
+
+
+def test_goto_job_list_backs_out_of_a_remembered_subpage(monkeypatch):
+    """不在列表上时：点 tab → 还不在 → BACK 一层 → 直到回到列表。"""
+    screens = iter([SUBPAGE_XML, SUBPAGE_XML, JOB_PAGE_XML])
+    taps: list = []
+    monkeypatch.setattr(
+        phone, "ensure_main_tabs", lambda pkg, **kw: {"ok": True, "marks": ["推荐", "职位", "我的"]}
+    )
+    monkeypatch.setattr(phone, "dump", lambda: next(screens, JOB_PAGE_XML))
+    monkeypatch.setattr(phone, "tap_node", lambda node, **kw: taps.append(node["center"]))
+    monkeypatch.setattr(phone, "tap", lambda *a, **k: taps.append(a))
+    monkeypatch.setattr(phone, "back", lambda: taps.append("BACK"))
+
+    flows._goto_job_list("测试")
+
+    assert "BACK" in taps, "没从记住的子页退出来"
+    assert (118, 277) in taps, "最后没点「招聘中」"
+
+
 # ——— 登录态判定（必须与「真的没职位」区分开）———
 
 
@@ -141,6 +189,20 @@ _DETAIL_TMPL = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
     <node index="4" text="" content-desc="{jd}" class="android.view.View" bounds="[84,1539][996,2040]"/>
     <node index="5" text="关闭职位" class="android.widget.Button" bounds="[48,2064][426,2159]" clickable="true"/>
     <node index="6" text="编辑职位" class="android.widget.Button" bounds="[462,2064][1031,2159]" clickable="true"/>
+  </node>
+</hierarchy>
+"""
+
+
+# 不是职位管理页、也没有「职位介绍」——模拟猎聘「职位」tab 记住的候选人子页
+SUBPAGE_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" class="android.widget.FrameLayout" package="com.lietou.mishu" bounds="[0,0][1080,2244]">
+    <node index="1" text="资深亚马逊运营" class="android.view.View" bounds="[0,100][1080,200]"/>
+    <node index="2" text="看过我 78&#10;第 1 个标签，共 3 个" class="android.view.View" bounds="[0,250][360,400]"/>
+    <node index="3" text="推荐" class="android.widget.Button" bounds="[0,2085][270,2159]"/>
+    <node index="4" text="职位" class="android.widget.Button" bounds="[540,2085][810,2159]" clickable="true"/>
+    <node index="5" text="我的" class="android.widget.Button" bounds="[810,2085][1080,2159]"/>
   </node>
 </hierarchy>
 """

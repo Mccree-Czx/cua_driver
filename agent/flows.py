@@ -418,11 +418,22 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
     return text, False
 
 
-def _goto_job_list(step: str) -> str:
+def _on_job_list(xml: str) -> bool:
+    """这一屏是「职位管理」页吗（能看到「招聘中」+「发职位」两个标记）。"""
+    joined = " ".join(phone.texts(xml))
+    return all(marker in joined for marker in _JOB_PAGE_MARKERS)
+
+
+def _goto_job_list(step: str, max_back: int = 4) -> str:
     """把手机带到「职位管理 → 招聘中」列表，返回那一屏的 dump。
 
-    每一步都校验；失配即抛，绝不猜着点。`scan_jobs` 与 `fetch_jds` 共用这一条路，
-    所以锚点只有一份。
+    ★★ **「职位」tab 是「回到该 tab 上次那页」，不是「回到 tab 根」。**
+    2026-10-15 真机实测（复现过）：`ensure_main_tabs()` 已经把手机带到了
+    「招聘中」列表，脚本**又去点了一下「职位」tab**——那一下把它送回了
+    Pi 上一轮留在那里的「某个职位的候选人页」，于是判定「没进到职位管理页」。
+
+    所以顺序是：**已经在列表上就直接返回，一次都别点**；不在才点 tab；
+    点了还不在就 BACK 一层再试（最多 `max_back` 次），每次都要确认还在 App 里。
     """
     m = load_map()["职位扫描"]
     result = phone.ensure_main_tabs(PKG)
@@ -431,28 +442,25 @@ def _goto_job_list(step: str) -> str:
 
     xml = phone.dump()
     _guard_risk(xml, step)
-    tab = phone.find_exact(xml, m["phone_tab"]["match"])
-    if not tab:
-        raise FlowMismatch(step, "主界面底部没有「职位」tab", phone.texts(xml))
-    phone.tap_node(tab, pause=4.5)
-
-    xml = phone.dump()
-    _guard_risk(xml, "进职位页")
     _guard_publish_form(xml)
 
-    # ★ 猎聘会**记住「职位」tab 上次停在哪一页**：实测切回去时直接落在某个职位的
-    #   「职位详情页」上，而不是「招聘中」列表（2026-10-15 真机第一次跑 fetch_jds 就栽这儿）。
-    #   详情页上当然看不到「招聘中/发职位」两个标记，所以这里先按一次 BACK 回列表。
-    if phone.find_exact(xml, _JD_LABEL) and not all(
-        marker in " ".join(phone.texts(xml)) for marker in _JOB_PAGE_MARKERS
-    ):
+    for _ in range(max_back + 1):
+        if _on_job_list(xml):
+            break
+        tab = phone.find_exact(xml, m["phone_tab"]["match"])
+        if tab:
+            phone.tap_node(tab, pause=4.5)
+            xml = phone.dump()
+            _guard_risk(xml, "进职位页")
+            _guard_publish_form(xml)
+            if _on_job_list(xml):
+                break
         phone.back()
         xml = phone.dump()
-        _guard_publish_form(xml)
-
-    joined = " ".join(phone.texts(xml))
-    if not all(marker in joined for marker in _JOB_PAGE_MARKERS):
-        raise FlowMismatch(step, "没进到职位管理页（看不到「招聘中/发职位」）", phone.texts(xml))
+        if PKG not in phone.current_package(xml):
+            raise FlowMismatch(step, "BACK 把 App 退掉了，说明它本来就不在职位 tab 里", phone.texts(xml))
+    else:
+        raise FlowMismatch(step, "退不回「招聘中」列表", phone.texts(xml))
 
     recruiting = _find_startswith(xml, "招聘中")
     if not recruiting:
