@@ -116,6 +116,18 @@ class Job(Base):
     salary: Mapped[str | None] = mapped_column(String(64), nullable=True)
     hard_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     template_msgs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    # ★ 这一列**刻意没有 server_default**，和 hard_rules / template_msgs 保持一致。
+    #
+    #   迁移 0005 当初给它设了 MySQL 的表达式默认值 `DEFAULT ('{}')`，而
+    #   `alembic/env.py` 开了 `compare_server_default=True`，于是 `alembic check`
+    #   从 2026-10-10 起一直报 `modify_default jobs.scoring_prefs` 漂移
+    #   ——就是那个唯一的失败测试。
+    #
+    #   两种修法里选了「去掉默认值」而不是「把默认值写进 model」：MySQL 反射出来的是
+    #   `(_utf8mb4'{}')`，把它抄进 model 等于把某个 MySQL 版本的实现细节焊进代码，
+    #   换版本或字符集就又会漂。而去掉它是安全的——写入侧本来就有 Python 侧
+    #   `default=dict`，服务端默认值纯属多余。
+    #   迁移 0012 负责把它从已有库里删掉。
     scoring_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     # ★ **已废弃**（2026-10-15）：筛选链根本不读它——`ScreenRequest` 契约里只有
     #   `min_stars`（1–5），screening 也只做 `llm_score >= min_stars` 判断。
