@@ -62,8 +62,10 @@ export default function LoginWizard({
   // 用 ref 判终态：直接依赖 progress 会让 effect 每次都重建定时器
   const phaseRef = useRef<Phase>("idle");
 
+  // **一直在轮询，不在终态停下。**
+  // 之前终态就停，于是外部把请求重置后前端看不见，必须人工点「重试」——
+  // 2026-10-15 为此卡了好几轮。代价是弹窗开着时每 3 秒一个请求，可忽略。
   const poll = useCallback(async () => {
-    if (TERMINAL.includes(phaseRef.current)) return;
     try {
       const resp = await fetch("/api/hr/accounts/login-request");
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -103,13 +105,19 @@ export default function LoginWizard({
     }
   }
 
-  function retry() {
-    // phaseRef 也要一并复位——它才是轮询的开关，只清 state 会让轮询再也回不来
+  async function retry() {
+    // 「重试」要**真的重新发起请求**——只重置本地状态的话，外部那条还是 failed，
+    // 下一次轮询立刻又把它拉回来，点了等于没点（2026-10-15 就踩了这个）。
+    const mode = progress.mode ?? "auto";
     phaseRef.current = "idle";
     setProgress({ phase: "idle" });
-    setConfirmed(false);
     setCode("");
     setErr(null);
+    await post(`/api/hr/accounts/${account.id}/login`, {
+      method: "code",
+      mode,
+      force: true, // 覆盖那条已失败的旧请求
+    });
   }
 
   async function start(method: "password" | "code", mode: "auto" | "manual") {
@@ -268,7 +276,7 @@ export default function LoginWizard({
         </Button>
       )}
       {done && shown !== "success" && (
-        <Button size="small" onClick={retry}>
+        <Button size="small" onClick={() => void retry()}>
           重试
         </Button>
       )}

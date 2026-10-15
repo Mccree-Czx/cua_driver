@@ -1,10 +1,11 @@
 """登录轮询器判定逻辑测试（批次 2，2026-10-14）。
 
 login_watch.py 跑在 Mac 上、每 20 秒被 launchd 拉起一次。它是整条登录链的
-调度中枢：决定何时拉起 Pi、维护 `.login_in_flight` 哨兵、给请求落终态。没有测试
+调度中枢：决定何时驱动手机、维护 `.login_in_flight` 哨兵、给请求落终态。没有测试
 的话，它出问题只会在生产里以「登录卡住」或「main_round 全被挡住」的形式暴露。
 
-这里只测**判定**——拉起 Pi 的那一步被替换掉，绝不真的跑一轮。
+这里只测**判定**——真正的手机操作（flows/phone）被整体替换掉，绝不碰手机。
+重构后它不再拉起 Pi，而是直接跑确定性序列（见 login_watch 的模块 docstring）。
 """
 
 import sys
@@ -33,10 +34,21 @@ def watch(monkeypatch, tmp_path):
     monkeypatch.setattr(login_watch, "SENTINEL", tmp_path / ".login_in_flight")
     monkeypatch.setattr(run_round, "LOCK_FILE", tmp_path / ".round.lock")
 
-    launched: list[list[str]] = []
-    monkeypatch.setattr(login_watch.subprocess, "call", lambda cmd: launched.append(cmd) or 0)
+    # 记录真正被驱动的那一步，而不是真的碰手机
+    calls: list[tuple] = []
+    monkeypatch.setattr(login_watch, "_account_phone", lambda _id: "13800000000")
+    monkeypatch.setattr(
+        login_watch.flows, "login_code",
+        lambda number, **kw: calls.append(("login_code", number)) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        login_watch.flows, "submit_code",
+        lambda code: calls.append(("submit_code", code)) or {"ok": True},
+    )
+    monkeypatch.setattr(login_watch.phone, "home", lambda *a, **k: None)
+    monkeypatch.setattr(login_watch, "mark_account_logged_in", lambda _id: None)
 
-    yield store, launched, tmp_path
+    yield store, calls, tmp_path
     store.clear()
 
 
@@ -46,33 +58,71 @@ def _hold_round_lock(tmp_path: Path) -> None:
 
 
 def test_no_request_clears_sentinel(watch):
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     (tmp_path / ".login_in_flight").write_text("stale", encoding="utf-8")
 
     assert login_watch.main() == 0
     assert not (tmp_path / ".login_in_flight").exists()
-    assert launched == []
+    assert calls == []
 
 
-def test_pending_launches_round_and_sets_sentinel(watch):
-    store, launched, tmp_path = watch
+def test_pending_drives_login_and_sets_sentinel(watch):
+    """pending → 直接跑确定性登录序列（不经过 LLM），并把相位推到 awaiting_code。"""
+    store, calls, tmp_path = watch
     store.start(account_id=7)
 
     assert login_watch.main() == 0
-    assert len(launched) == 1
-    assert launched[0][-1] == "login_round"
+    assert calls == [("login_code", "13800000000")]
     assert (tmp_path / ".login_in_flight").exists()
     assert store.get()["attempts"] == 1
+    assert store.get()["phase"] == "awaiting_code"
+
+
+def test_awaiting_code_submits_the_claimed_code(watch):
+    """awaiting_code 且已填码 → 取码并提交，成功后落地为生效账号。"""
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    assert calls == [("submit_code", "123456")]
+    assert store.get()["phase"] == "success"
+    assert not (tmp_path / ".login_in_flight").exists()
+
+
+def test_awaiting_code_without_a_code_fails(watch):
+    """没填码就没什么可提交的——落 failed，别耗着。"""
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+    store.set_phase("awaiting_code")
+
+    assert login_watch.main() == 0
+    assert calls == []
+    assert store.get()["phase"] == PHASE_FAILED
+
+
+def test_flow_mismatch_fails_with_reason(watch, monkeypatch):
+    """锚点失配要说清「看到了什么」，不能只说失败——否则没法判断是锚点过期还是状态不对。"""
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+
+    def boom(*_a, **_kw):
+        raise login_watch.flows.FlowMismatch("下一步", "找不到「下一步」按钮", ["输入验证码"])
+
+    monkeypatch.setattr(login_watch.flows, "login_code", boom)
+    assert login_watch.main() == 0
+    detail = store.get()["error"]
+    assert "下一步" in detail and "输入验证码" in detail
 
 
 def test_in_progress_keeps_sentinel_but_does_not_launch(watch):
     """dispatched / verifying = Pi 正在跑，轮询器只维持哨兵，不重复拉起。"""
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     store.start(account_id=7)
     store.set_phase("dispatched")
 
     assert login_watch.main() == 0
-    assert launched == []
+    assert calls == []
     assert (tmp_path / ".login_in_flight").exists()
     assert store.get()["attempts"] == 0
 
@@ -83,46 +133,46 @@ def test_does_not_burn_attempt_when_another_round_is_running(watch):
     否则连续三次撞锁就会把用户一次正常的登录判死——这正是「先 bump 再判断」的写法
     会踩的坑。
     """
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     store.start(account_id=7)
     _hold_round_lock(tmp_path)
 
     assert login_watch.main() == 0
-    assert launched == []
+    assert calls == []
     assert store.get()["attempts"] == 0
     assert store.get()["phase"] == "pending"
 
 
 def test_attempt_cap_stops_relaunching(watch):
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     store.start(account_id=7)
     for _ in range(3):
         store.bump_attempts()
 
     assert login_watch.main() == 0
-    assert launched == []
+    assert calls == []
     assert store.get()["phase"] == PHASE_FAILED
     assert not (tmp_path / ".login_in_flight").exists()
 
 
 def test_timeout_marks_expired(watch):
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     store.start(account_id=7)
     store._redis.hset("pipeline:state:login_req", "expires_at", "1")
 
     assert login_watch.main() == 0
     assert store.get()["phase"] == PHASE_EXPIRED
-    assert launched == []
+    assert calls == []
     assert not (tmp_path / ".login_in_flight").exists()
 
 
 def test_terminal_phase_clears_sentinel_without_launching(watch):
-    store, launched, tmp_path = watch
+    store, calls, tmp_path = watch
     store.start(account_id=7)
     store.set_phase("success")
 
     assert login_watch.main() == 0
-    assert launched == []
+    assert calls == []
     assert not (tmp_path / ".login_in_flight").exists()
 
 

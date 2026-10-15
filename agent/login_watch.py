@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """登录轮询器（Mac 侧，launchd 每 20 秒拉起一次，见 com.hr-workbuddy.pi-login）。
 
-职责有三，都只跟 Redis 打交道：
+职责有三：
 
-1. **发现登录请求**：phase 是 pending / awaiting_code 时拉起一轮 `login_round`。
+1. **发现登录请求并驱动手机**：phase 是 pending / awaiting_code 时，跑
+   `flows.py` 里的确定性序列（**不经过 LLM**）。
+   以前这里是 `subprocess.call(run_round.py login_round)` —— 一个 6 次点击的固定序列
+   要穿过 Redis → 轮询器 → run_round → Pi(LLM) → MCP → adb，DeepSeek 一返 503 就全停，
+   而且首字能等 284 秒。改成直接跑 flow 后：秒级、每步 dump 可核对、**接口挂了照样能登录**。
+   `login_round` 保留为人工兜底入口（见 rounds.md §4），不再自动拉起。
 2. **维护 `.login_in_flight` 哨兵**：run_round.py 只用标准库、读不了 Redis，靠这个
    文件知道「手机可能停在登录页」。没有它，main_round 会把登录页误判成掉登录，
    触发 risk_set() 造成全系统假熔断。
-3. **过期与重试封顶**：登录请求超时、或拉起次数用尽，都由这里落终态——轮询器
+3. **过期与重试封顶**：登录请求超时、或尝试次数用尽，都由这里落终态——轮询器
    总在跑，Pi 不一定在。
 
 20 秒（而不是 60 秒）是因为用户填完验证码后要等这个间隔才被提交。
@@ -16,7 +21,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -66,17 +70,28 @@ sys.path.insert(0, str(REPO_ROOT / "services" / "pipeline"))
 sys.path.insert(0, str(AGENT_DIR))
 
 import run_round  # noqa: E402  同目录的轮次运行器（借用它的锁判定，避免复制一份逻辑）
+import flows  # noqa: E402  确定性驱动：登录/退出的固定序列
+import phone  # noqa: E402  adb 原语与锚点匹配
 from app.login_request import (  # noqa: E402
     LAUNCHABLE_PHASES,
     MAX_ATTEMPTS,
     MODE_AUTO,
+    PHASE_AWAITING_CODE,
     PHASE_EXPIRED,
     PHASE_FAILED,
+    PHASE_PENDING,
+    PHASE_SUCCESS,
     TERMINAL_PHASES,
     RedisLoginRequest,
+    mark_account_logged_in,
 )
 
 SENTINEL = run_round.LOGIN_IN_FLIGHT_FILE
+
+# 是否允许代用户点「同意并继续」（独立的《服务协议及个人信息保护》同意页）。
+# ★ 那是代做**法律同意**，所以默认关；确认过之后再开。
+# （登录表单里那个「我已阅读并同意」勾选框是流程必经步骤，不受此开关影响。）
+AGREE_TERMS = os.environ.get("HR_AGREE_TERMS", "").strip() in {"1", "true", "yes"}
 
 
 def _round_running() -> bool:
@@ -132,14 +147,14 @@ def main() -> int:
         return 0
 
     if req["phase"] not in LAUNCHABLE_PHASES:
-        # dispatched / verifying：Pi 正在跑，等它自己推进
+        # verifying：流程正在跑，等它自己推进
         return 0
 
     if req["attempts"] >= MAX_ATTEMPTS:
-        print(f"[login_watch] 已拉起 {req['attempts']} 次仍未推进，置为 failed")
+        print(f"[login_watch] 已尝试 {req['attempts']} 次仍未推进，置为 failed")
         store.set_phase(
             PHASE_FAILED,
-            f"已自动尝试 {MAX_ATTEMPTS} 次仍未完成，为避免空烧 token 已停止重试；"
+            f"已自动尝试 {MAX_ATTEMPTS} 次仍未完成，为避免反复空跑已停止重试；"
             "请重试或人工在手机上登录",
         )
         _clear_sentinel()
@@ -151,10 +166,72 @@ def main() -> int:
         return 0
 
     store.bump_attempts()
-    print(f"[login_watch] 拉起 login_round（第 {req['attempts'] + 1} 次，phase={req['phase']}）")
-    return subprocess.call(
-        [sys.executable, str(AGENT_DIR / "run_round.py"), "login_round"]
-    )
+    if req["phase"] == PHASE_PENDING:
+        return _drive_login(store, req)
+    return _drive_submit(store, req)
+
+
+def _fail(store, message: str) -> int:
+    print(f"[login_watch] 停手：{message}")
+    store.set_phase(PHASE_FAILED, message)
+    _clear_sentinel()
+    phone.home()
+    return 0
+
+
+def _account_phone(account_id: int) -> str | None:
+    """取账号登记的手机号。抽成独立函数便于测试打桩（否则驱动测试要连真库）。"""
+    from app.db import SessionLocal
+    from app.models import Account
+
+    with SessionLocal() as session:
+        account = session.get(Account, account_id)
+        return account.phone if account else None
+
+
+def _drive_login(store, req: dict) -> int:
+    """phase=pending：输手机号 → 勾协议 → 点「下一步」把验证码发出去。
+
+    这一步跑的是确定性脚本，**不经过 LLM**——所以 DeepSeek 接口挂了也照样能登录，
+    而且秒级完成、每步 dump 可核对。
+    """
+    number = _account_phone(req["account_id"])
+    if not number:
+        return _fail(store, f"账号 {req['account_id']} 没有登记手机号，无法登录")
+
+    print(f"[login_watch] 驱动登录：账号 {req['account_id']}，手机尾号 {number[-4:]}")
+    try:
+        flows.login_code(number, agree=AGREE_TERMS)
+    except flows.FlowMismatch as exc:
+        return _fail(store, f"{exc}")
+    except phone.AdbError as exc:
+        return _fail(store, f"adb 出错：{exc}")
+
+    store.set_phase(PHASE_AWAITING_CODE, "")
+    print("[login_watch] 验证码已发出 → 前端应弹出输入框")
+    return 0
+
+
+def _drive_submit(store, req: dict) -> int:
+    """phase=awaiting_code：取人工填的码，输进去提交。"""
+    code = store.claim_code()
+    if not code:
+        return _fail(store, "验证码不可用（未填、已用过或已过期）")
+
+    print(f"[login_watch] 提交验证码（{len(code)} 位）")
+    try:
+        flows.submit_code(code)
+    except flows.FlowMismatch as exc:
+        return _fail(store, f"{exc}")
+    except phone.AdbError as exc:
+        return _fail(store, f"adb 出错：{exc}")
+
+    # 与 Pi 那条路共用同一份落地实现
+    mark_account_logged_in(req["account_id"])
+    store.set_phase(PHASE_SUCCESS, "")
+    print(f"[login_watch] ✅ 登录成功，已把账号 {req['account_id']} 置为生效账号")
+    _clear_sentinel()
+    return 0
 
 
 if __name__ == "__main__":

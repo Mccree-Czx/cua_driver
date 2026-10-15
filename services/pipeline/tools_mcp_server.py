@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.keys import login_state_key, msg_touch_key, risk_pause_key
+from app.keys import msg_touch_key, risk_pause_key
 from app.login_request import (
     PHASE_AWAITING_CODE,
     PHASE_DISPATCHED,
@@ -46,6 +46,7 @@ from app.login_request import (
     PHASE_SUCCESS,
     PHASE_VERIFYING,
     RedisLoginRequest,
+    mark_account_logged_in,
 )
 from app.messaging import OneMessagePerCandidateError, ensure_no_out_message
 from app.models import Account, Candidate, Interaction, Job, JobCandidate, TaskLog
@@ -816,27 +817,9 @@ def login_req_set(phase: str, note: str = "") -> dict:
     if req is None:
         return {"ok": False, "error": "当前没有登录请求"}
     if phase == PHASE_SUCCESS:
-        # 登录成功 = 手机上现在登的就是这个号，登录态与生效账号一起落地。
-        # 这一步终于给 RedisLoginState.set() 找到了调用点——在此之前它全仓库无人调用。
-        _redis().set(
-            login_state_key(req["account_id"]),
-            json.dumps(
-                {
-                    "is_login": True,
-                    "task_id": None,
-                    "checked_at": datetime.now().isoformat(timespec="seconds"),
-                },
-                ensure_ascii=False,
-            ),
-        )
-        with SessionLocal() as session:
-            session.execute(Account.__table__.update().values(is_active=False))
-            session.execute(
-                Account.__table__.update()
-                .where(Account.id == req["account_id"])
-                .values(is_active=True)
-            )
-            session.commit()
+        # 登录成功 = 手机上现在登的就是这个号：写登录态 + 置为生效账号。
+        # 实现抽在 login_request.mark_account_logged_in —— 确定性驱动路径也要走同一步。
+        mark_account_logged_in(req["account_id"])
     store.set_phase(phase, note)
     return {"ok": True, "phase": phase, "account_id": req["account_id"]}
 

@@ -214,3 +214,32 @@ class RedisLoginRequest:
 
     def clear(self) -> None:
         self._redis.delete(login_req_key())
+
+
+def mark_account_logged_in(account_id: int) -> None:
+    """登录成功后的落地：写登录态 + 把该账号置为系统生效账号。
+
+    **只留一份实现**——驱动脚本（确定性路径）与 Pi（经 MCP 工具）都要走这一步，
+    两边各写一遍迟早走样，而走样的表现是「手机上登的是 B、系统按 A 算配额」，
+    是这套系统里最难发现的静默故障。
+    """
+    from datetime import datetime
+
+    from sqlalchemy import update
+
+    from app.db import SessionLocal
+    from app.login_state import RedisLoginState
+    from app.models import Account
+
+    RedisLoginState().set(
+        is_login=True,
+        task_id="",
+        checked_at=datetime.now().isoformat(timespec="seconds"),
+        account_id=account_id,
+    )
+    with SessionLocal() as session:
+        session.execute(update(Account).values(is_active=False))
+        session.execute(
+            update(Account).where(Account.id == account_id).values(is_active=True)
+        )
+        session.commit()
