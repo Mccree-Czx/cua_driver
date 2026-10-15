@@ -575,12 +575,13 @@ def fetch_jds(
             skipped.append(title)
             continue
 
+        # ★ 每次点之前**重新取一次卡片位置**，不要用开跑时记下的那份：
+        #   列表可能还在滚动/回弹（刚点完「招聘中」筛选就是这样），旧 bounds 会过期，
+        #   点下去落到别的元素上。（2026-10-15 真机实测：4 个职位里**第 1 个**
+        #   报了 wrong_page，正是列表还没稳的时候——后 3 个都正常。）
+        seen.clear()
+        _collect_job_cards(phone.dump(), seen)
         card = seen.get(title)
-        if card is None:
-            # 列表可能已经滚过、或这次没扫到——重扫一屏再找
-            seen.clear()
-            _collect_job_cards(phone.dump(), seen)
-            card = seen.get(title)
         if card is None:
             failed[title] = "not_on_list"
             continue
