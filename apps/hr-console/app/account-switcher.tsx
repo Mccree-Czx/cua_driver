@@ -55,18 +55,9 @@ export default function AccountSwitcher() {
 
   return (
     <div className="account-switcher">
-      <span className="account-switcher-label">猎聘账号</span>
-      {/* 只读展示。换号请点右边的齿轮 →「切换到此账号」。 */}
-      <span
-        style={{
-          minWidth: 170,
-          fontWeight: activeId === null ? 400 : 600,
-          color: activeId === null ? "#cf1322" : "inherit",
-        }}
-        title="换号请点右边的齿轮"
-      >
-        {loading ? "读取中…" : active ? labelOf(active) : "未选择"}
-      </span>
+      {/* ★ 这里原先有「猎聘账号 + 账号名」一截，**已去掉**（2026-10-15 用户要求）。
+          生效账号改从齿轮 →「猎聘账号管理」弹窗看：那里列出全部账号、生效的带
+          「生效中」，换号的两个按钮也本来就在那儿——头部这截纯属重复展示。 */}
       <Button
         size="small"
         type="text"
@@ -100,10 +91,6 @@ export default function AccountSwitcher() {
       </Modal>
     </div>
   );
-}
-
-function labelOf(a: Account): string {
-  return a.phone_masked ? `${a.name}（${a.phone_masked}）` : `${a.name}（未登记手机号）`;
 }
 
 type FormState = { name: string; phone: string; password: string };
