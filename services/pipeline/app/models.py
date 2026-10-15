@@ -35,6 +35,10 @@ from hr_workbuddy import CandidateStatus
 
 # jobs.status：spec §4 未枚举取值，M1 岗位创建后即为 active
 JOB_STATUS_ACTIVE = "active"
+# 扫到了、但还没配 JD 的职位（2026-10-15）。
+# `job_list_active` 与 `job_quota_status` 都硬过滤 active，所以 draft 的职位
+# **在工具层就看不见**——Pi 不会拿一个空 JD 去给真实候选人打分。联锁在代码里，不在提示词里。
+JOB_STATUS_DRAFT = "draft"
 
 CANDIDATE_SOURCES = ("inbound", "recommended")
 INTERACTION_DIRECTIONS = ("out", "in")
@@ -98,6 +102,13 @@ class Job(Base):
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     jd_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 扫职位时从卡片上一并读回来的信息（2026-10-15）。卡片原文形如
+    # 「机械结构工程师\n上海-黄浦区 本科 5年以上 25-45k」，拆成四列存。
+    # 全部可空：存量职位是手工建的，没有这些值。
+    location: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    education: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    experience: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    salary: Mapped[str | None] = mapped_column(String(64), nullable=True)
     hard_rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     template_msgs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     scoring_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

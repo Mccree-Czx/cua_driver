@@ -193,6 +193,25 @@ def open_app(package: str, settle: float = 6.0) -> None:
     time.sleep(settle)
 
 
+def swipe(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    duration_ms: int = 400,
+    pause: float = 1.5,
+) -> None:
+    """滑动。职位列表翻页用。
+
+    ★ **WebView 不吃 uiautomator 的滑动**（见 login_map 的「★通用教训」）——
+      猎聘「我的」页就是 WebView。原生列表（职位管理页）可以。
+      所以滑完必须 dump 确认内容真的变了，不能假设它动了。
+    """
+    shell(
+        "input", "swipe",
+        str(start[0]), str(start[1]), str(end[0]), str(end[1]), str(duration_ms),
+    )
+    time.sleep(pause)
+
+
 # 底部导航的三个 tab。**出现两个以上**才算「在主界面」——只认一个会被
 # 页面里碰巧出现的同名文字骗过。
 MAIN_TAB_MARKERS = ("推荐", "职位", "我的")

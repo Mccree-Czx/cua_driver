@@ -33,6 +33,11 @@ class JobOut(BaseModel):
     id: int
     title: str
     jd_text: str
+    # 扫职位时从卡片上读回来的（0011）。存量职位为 null。
+    location: str | None = None
+    education: str | None = None
+    experience: str | None = None
+    salary: str | None = None
     hard_rules: dict[str, Any]
     template_msgs: dict[str, Any]
     llm_threshold: int

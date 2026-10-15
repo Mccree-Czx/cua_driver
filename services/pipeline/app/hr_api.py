@@ -32,6 +32,7 @@ from app.deps import (
     get_session,
     get_store,
 )
+from app.job_sync import MIN_JD_CHARS
 from app.keys import risk_pause_key
 from app.state_machine import InvalidTransition, StateEvent, TransitionContext, transition
 from hr_workbuddy import CandidateStatus
@@ -1037,16 +1038,46 @@ class JobPatch(BaseModel):
     llm_threshold: int | None = None
     min_stars: int | None = None
     scoring_prefs: dict[str, Any] | None = None
+    # 「补 JD 并启用」这条路（2026-10-15）：扫描入库的职位带的是 status=draft，
+    # 前端填完 JD 才能转 active。没有这两个字段的话，扫到的职位永远启用不了。
+    jd_text: str | None = None
+    status: str | None = None
 
 
 @router.patch("/jobs/{job_id}")
 def hr_patch_job(
     job_id: int, body: JobPatch, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
-    """岗位配置回流：LLM 阈值（遗留 0-100）/ 评分卡（min_stars + scoring_prefs）。"""
+    """岗位配置回流：JD 正文 / 启停 / LLM 阈值（遗留 0-100）/ 评分卡。"""
     job = session.get(models.Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"岗位 {job_id} 不存在")
+
+    if body.jd_text is not None:
+        job.jd_text = body.jd_text
+
+    if body.status is not None:
+        if body.status not in (models.JOB_STATUS_ACTIVE, models.JOB_STATUS_DRAFT):
+            raise HTTPException(
+                status_code=422,
+                detail=f"status 只能是 {models.JOB_STATUS_ACTIVE} 或 {models.JOB_STATUS_DRAFT}",
+            )
+        # ★ 校验的是**生效后**的 JD：这次可能只传了 status、JD 是库里已有的那份。
+        #   放一个没有 JD 的职位 active，等于让 LLM 凭空判断候选人合不合适。
+        if (
+            body.status == models.JOB_STATUS_ACTIVE
+            and len((job.jd_text or "").strip()) < MIN_JD_CHARS
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"JD 不足 {MIN_JD_CHARS} 字，不能启用——"
+                    "没有 JD 的职位会让系统凭空判断候选人是否合适，"
+                    "然后给真实候选人发招呼。"
+                ),
+            )
+        job.status = body.status
+
     if body.llm_threshold is not None:
         if not 0 <= body.llm_threshold <= 100:
             raise HTTPException(status_code=422, detail="llm_threshold 须在 0-100")
@@ -1063,6 +1094,8 @@ def hr_patch_job(
     return {
         "ok": True,
         "id": job.id,
+        "status": job.status,
+        "jd_chars": len((job.jd_text or "").strip()),
         "llm_threshold": job.llm_threshold,
         "scoring_prefs": job.scoring_prefs,
     }

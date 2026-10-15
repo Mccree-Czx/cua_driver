@@ -28,6 +28,9 @@ TEST_REDIS_URL = "redis://127.0.0.1:6379/15"
 # 而「撞锁」的测试把 pytest 的 PID 写进了锁文件；真跑抢占会把测试进程本身 SIGTERM 掉。
 PREEMPT = {"ok": True, "count": 0}
 
+# 记下每次真正落库的职位同步：(account_id, 条数, truncated)
+SYNCED: list[tuple] = []
+
 
 @pytest.fixture()
 def watch(monkeypatch, tmp_path):
@@ -52,8 +55,40 @@ def watch(monkeypatch, tmp_path):
     monkeypatch.setattr(login_watch.phone, "home", lambda *a, **k: None)
     monkeypatch.setattr(login_watch, "mark_account_logged_in", lambda _id: None)
 
+    # 扫职位：默认成功返回一个职位。真正的解析/护栏在 test_job_scan.py 里用固件 XML 测，
+    # 这里只关心「登录成功之后有没有去扫、扫失败会不会把登录判死」。
+    monkeypatch.setattr(
+        login_watch.flows,
+        "scan_jobs",
+        lambda **kw: calls.append(("scan_jobs",))
+        or {
+            "ok": True,
+            "reason": "",
+            "jobs": [{"title": "机械结构工程师", "details": "上海-黄浦区 本科 5年以上 25-45k"}],
+            "swipes": 0,
+            "truncated": False,
+            "seen": [],
+        },
+    )
+    monkeypatch.setattr(
+        login_watch,
+        "sync_scanned_jobs",
+        lambda account_id, items, **kw: SYNCED.append(
+            (account_id, len(items), kw.get("truncated"))
+        )
+        or {
+            "created": len(items),
+            "updated": 0,
+            "unchanged": 0,
+            "scanned": len(items),
+            "skipped": [],
+            "truncated": kw.get("truncated", False),
+        },
+    )
+
     PREEMPT["ok"] = True
     PREEMPT["count"] = 0
+    SYNCED.clear()
 
     def _fake_preempt() -> bool:
         PREEMPT["count"] += 1
@@ -98,9 +133,56 @@ def test_awaiting_code_submits_the_claimed_code(watch):
     store.submit_code("123456")
 
     assert login_watch.main() == 0
-    assert calls == [("submit_code", "123456")]
+    # 登录成功后**紧接着**扫职位——顺序不能反：切完号就扫，用户下一眼就能在前端看到
+    assert calls == [("submit_code", "123456"), ("scan_jobs",)]
     assert store.get()["phase"] == "success"
     assert not (tmp_path / ".login_in_flight").exists()
+
+
+def test_scan_failure_does_not_fail_the_login(watch, monkeypatch):
+    """★ 扫描失败**不是**登录失败。
+
+    登录已经成了；打成 failed 会让前端报红，还会诱导用户重来一遍——
+    而重来要再消耗一条短信验证码。它只能是一句 `notice`。
+    """
+    store, calls, tmp_path = watch
+    monkeypatch.setattr(
+        login_watch.flows,
+        "scan_jobs",
+        lambda **kw: (_ for _ in ()).throw(login_watch.flows.FlowMismatch("扫描职位", "锚点过期")),
+    )
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    assert store.get()["phase"] == "success"
+    assert "没扫到" in store.get()["notice"]
+    assert store.get()["error"] == ""
+
+
+def test_scan_phase_keeps_the_sentinel_alive(watch):
+    """★ 扫描期间相位停在 `scanning_jobs`（非终态）——哨兵靠它挡着 main_round。
+
+    否则 main_round 会在扫描中途把手机抢走，留下一个扫了一半的职位列表。
+    """
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+    store.set_phase("scanning_jobs", "")
+
+    assert login_watch.main() == 0
+    assert calls == []  # 不该动手
+    assert store.get()["phase"] == "scanning_jobs"
+    assert (tmp_path / ".login_in_flight").exists()  # 哨兵还在，main_round 会让路
+
+
+def test_scan_result_reaches_the_database(watch):
+    """扫到的职位要落到**当前这个账号**名下（而不是「当前生效账号」）。"""
+    store, calls, tmp_path = watch
+    store.start(account_id=7)
+    store.submit_code("123456")
+
+    assert login_watch.main() == 0
+    assert SYNCED == [(7, 1, False)]
 
 
 def test_awaiting_code_without_a_code_just_waits(watch):

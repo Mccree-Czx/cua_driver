@@ -11,6 +11,7 @@ import {
   InboxOutlined,
   FileTextOutlined,
   MenuOutlined,
+  ProfileOutlined,
   RobotOutlined,
 } from "@ant-design/icons";
 import AlertBar from "./alert-bar";
@@ -18,6 +19,7 @@ import AccountSwitcher from "./account-switcher";
 
 const NAV = [
   { key: "/", icon: <DashboardOutlined />, label: <Link href="/">驾驶舱</Link> },
+  { key: "/jobs", icon: <ProfileOutlined />, label: <Link href="/jobs">职位</Link> },
   { key: "/candidates", icon: <TeamOutlined />, label: <Link href="/candidates">候选人</Link> },
   { key: "/manual", icon: <InboxOutlined />, label: <Link href="/manual">人工队列</Link> },
   { key: "/logs", icon: <FileTextOutlined />, label: <Link href="/logs">运行日志</Link> },

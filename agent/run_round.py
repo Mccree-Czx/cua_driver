@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = AGENT_DIR.parent
 SYSTEM_PROMPT = AGENT_DIR / "system-prompt.md"
 ROUNDS_FILE = AGENT_DIR / "rounds.md"
 
@@ -119,6 +120,53 @@ def login_in_flight() -> bool:
         return (time.time() - LOGIN_IN_FLIGHT_FILE.stat().st_mtime) < LOGIN_SENTINEL_MAX_AGE
     except OSError:
         return False
+
+
+def _job_query_python() -> Path | None:
+    """能 `import app.job_sync` 的解释器；找不到返回 None（调用方 fail-open）。
+
+    launchd 拉的本来就是仓库 venv 的 python；但本脚本的设计前提是「只用标准库」，
+    也可能被人用裸 python3 手动跑——那种解释器没有 pipeline 的依赖，所以两个都试。
+    """
+    for candidate in (REPO_ROOT / ".venv" / "bin" / "python", Path(sys.executable)):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def has_active_jobs() -> bool:
+    """当前生效账号名下有没有已启用的职位？
+
+    「没有职位」是**配置问题**（刚切的号还没扫职位、或职位还没补 JD），不是
+    「今天没活干」。所以它必须在 `should_backoff()` **之前**拦下来，
+    而且**绝不碰 `.inbound_state.json`**——否则一轮空跑就把 empty_streak 推到 2，
+    白白退避 30 分钟，而屏幕上看起来只是「系统不干活」。
+
+    ★ **fail-open**：查不到（脚本不在、DB 不通、超时）一律当成「有职位」放行。
+      反过来写的话，一次 DB 抖动会让每一轮都静默跳过，而它的表现和「正常跳过」
+      一模一样——没人会发现系统已经停了。这条有专门的测试盯着。
+    """
+    python = _job_query_python()
+    if python is None:
+        return True
+    script = (
+        "import sys; sys.path.insert(0, 'services/pipeline')\n"
+        "from app.job_sync import active_job_count\n"
+        "print(active_job_count())\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-c", script],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        return True
+    return (result.stdout or "").strip() != "0"
 
 
 def parse_round_result(output: str):
@@ -317,6 +365,11 @@ def main() -> int:
         return 0
     if name in ("main_round", "daily_round") and login_in_flight():
         print(f"[skip] {name}: 有登录在途（手机停在登录页，跑本轮会误判成掉登录）")
+        return 0
+    if name == "main_round" and not has_active_jobs():
+        # ★ 刻意不碰 .inbound_state.json：没职位是配置问题，不是「今天没活」。
+        #   记进退避的话，一轮空跑就会把后续 30 分钟全挡掉。
+        print(f"[skip] {name}: 当前账号名下没有已启用的职位（在前端补齐 JD 后自动恢复）")
         return 0
     if name == "main_round" and should_backoff():
         print(f"[skip] {name}: 空未读退避（连续空，30 分钟内不再启动 Pi）")

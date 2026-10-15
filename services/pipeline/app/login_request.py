@@ -32,6 +32,10 @@ PHASE_LOGGING_OUT = "logging_out"  # 正在退出旧号（只有 switch 会经�
 PHASE_DISPATCHED = "dispatched"  # 正在操作手机（输手机号、发验证码）
 PHASE_AWAITING_CODE = "awaiting_code"  # 验证码已发送，等人工填
 PHASE_VERIFYING = "verifying"  # 拿到码，正在提交
+# 登录已经成了，正在扫这个账号的在招职位（2026-10-15）。
+# ★ 它**必须是非终态**：`.login_in_flight` 哨兵靠「请求还没到终态」保持新鲜，
+#   而扫职位要动手机一分钟左右——这期间绝不能让 main_round 插进来抢手机。
+PHASE_SCANNING_JOBS = "scanning_jobs"
 PHASE_SUCCESS = "success"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"

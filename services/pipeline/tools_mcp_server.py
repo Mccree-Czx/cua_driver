@@ -49,7 +49,17 @@ from app.login_request import (
     mark_account_logged_in,
 )
 from app.messaging import OneMessagePerCandidateError, ensure_no_out_message
-from app.models import Account, Candidate, Interaction, Job, JobCandidate, TaskLog
+from app.job_sync import MIN_JD_CHARS
+from app.models import (
+    JOB_STATUS_ACTIVE,
+    JOB_STATUS_DRAFT,
+    Account,
+    Candidate,
+    Interaction,
+    Job,
+    JobCandidate,
+    TaskLog,
+)
 from app.screening_client import ScreeningClient
 from app.state_machine import (
     InvalidTransition,
@@ -532,7 +542,16 @@ def job_upsert(
     """按 title 幂等建岗位：已存在返回 {created: false}，不存在则创建返回 {created: true}。
 
     仅当前账号内按 title 判重——两个号可以有同名职位，各建各的。
+
+    ★ **没有像样的 JD 就不许 active**（2026-10-15 补的守卫）：签名默认
+      `jd_text=""` + `status="active"`，也就是说原先可以建出一个「没有 JD 但在招」的
+      职位，然后被 `job_list_active()` 选中、拿去给**真实候选人**打分。这不是假想——
+      `agent/rounds.md:29` 里就有一条「jd_text 匹配不到时 `job_upsert(title=沟通职位,
+      jd_text="")`」的指示。现在这种情况自动落到 `draft`，并在返回值里说明原因。
     """
+    downgraded = status == JOB_STATUS_ACTIVE and len((jd_text or "").strip()) < MIN_JD_CHARS
+    if downgraded:
+        status = JOB_STATUS_DRAFT
     with SessionLocal() as session:
         acct = _active_account_id(session)
         job = session.execute(
@@ -551,7 +570,14 @@ def job_upsert(
         session.add(job)
         session.commit()
         session.refresh(job)
-        return {"id": job.id, "created": True}
+        result = {"id": job.id, "created": True}
+        if downgraded:
+            result["status"] = status
+            result["notice"] = (
+                f"JD 不足 {MIN_JD_CHARS} 字，已按 draft 建。"
+                "该职位不会参与打招呼，补完 JD 在前端启用后才生效。"
+            )
+        return result
 
 
 @mcp.tool()

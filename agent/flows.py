@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -289,3 +291,140 @@ def logout(*, agree: bool = False) -> dict[str, Any]:
     if not _is_logged_out_screen(xml):
         raise FlowMismatch("退出", "退出后没落到登录页", phone.texts(xml))
     return {"ok": True, "already_logged_out": False}
+
+
+# ——— 职位扫描（2026-10-15）———
+
+# 职位管理页的标记：两个都在，才算真的站在那一页上。
+_JOB_PAGE_MARKERS = ("招聘中", "发职位")
+
+# ★ 危险页：「发职位」的**空白新建表单**。误入并提交 = **真的对外发布一个职位**。
+#   这不是假想——daily_round 当年就是栽在这儿：
+#   `.round_daily_round.log:23-24`「未完成…误入『发布职位』表单，已退出」。
+#   用「请填写职位描述」这个**占位符**当标记，而不是「职位描述」：编辑已有职位时
+#   那一页也有「职位描述」标签，但里面是有内容的，不会是「请填写」。
+_PUBLISH_FORM_MARKERS = ("请填写职位描述", "发布职位")
+
+# 卡片第二行的特征：有薪资（25-45k）或地点（上海-黄浦区）。
+# 没有这个特征的行不当详情——卡片上还有「看过我/沟通过/收到简历」这类计数行。
+_DETAIL_RE = re.compile(r"\d+\s*[-~]?\s*\d*\s*[kK]|-\s*[一-龥]{2,}[区市县]")
+
+
+def _guard_publish_form(xml: str) -> None:
+    """看到「发职位」空白表单就立刻退出并报错。"""
+    joined = " ".join(phone.texts(xml))
+    hit = [marker for marker in _PUBLISH_FORM_MARKERS if marker in joined]
+    if hit:
+        phone.back()
+        raise FlowMismatch(
+            "扫描职位", f"误入「发职位」新建表单（看到 {hit}），已退出，未做任何提交", phone.texts(xml)
+        )
+
+
+def _find_startswith(xml: str, prefix: str) -> dict[str, Any] | None:
+    """找 label 以 prefix 开头的节点。
+
+    「招聘中」那个 tab 的文字实测是「招聘中 N」（带数量），所以 `find_exact` 匹配不上；
+    但也不能退回子串匹配——那会命中页面里别处出现的「招聘中」。用前缀刚好。
+    """
+    for node in phone.nodes(xml):
+        if phone.label(node).startswith(prefix):
+            return node
+    return None
+
+
+def _collect_job_cards(xml: str, seen: dict[str, dict[str, str]]) -> int:
+    """把这一屏的职位卡收进 `seen`，返回新增条数。"""
+    added = 0
+    for node in phone.nodes(xml):
+        text = (node["desc"] or node["text"]).strip()
+        if "\n" not in text:
+            continue
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if len(lines) < 2 or len(lines[0]) > 40:
+            continue
+        details = next((line for line in lines[1:] if _DETAIL_RE.search(line)), "")
+        if not details:
+            continue
+        title = lines[0]
+        if title not in seen:
+            seen[title] = {"title": title, "details": details}
+            added += 1
+    return added
+
+
+def scan_jobs(*, max_swipe: int = 6, budget_seconds: float = 180.0) -> dict[str, Any]:
+    """扫出当前账号「招聘中」的职位列表。**只读**。
+
+    两条绝不越的线：
+    - **不点职位卡**：点进去是**候选人数据页**，那屏上有「不合适」「看简历」这类
+      会真实影响候选人的按钮。
+    - **不碰「发职位」**：那是新建表单，提交了就是真的对外发布一个职位。
+
+    返回 `{"ok", "jobs": [{"title","details"}], "swipes", "truncated", "reason", "seen"}`。
+    `reason` 非空 = 根本没扫成（不在登录态 / 还在引导页），**必须与「这个号确实没职位」
+    区分开**——账号 3 就是新号，登录后落在「创建招聘名片」引导页，误判成 0 职位
+    会让它静默空转。
+    """
+    m = load_map()["职位扫描"]
+    phone.home()
+    phone.open_app(PKG)
+    xml = phone.dump()
+
+    if _is_logged_out_screen(xml):
+        return {"ok": False, "reason": "not_logged_in", "jobs": [], "seen": phone.texts(xml)}
+    if _is_onboarding(xml):
+        return {"ok": False, "reason": "onboarding", "jobs": [], "seen": phone.texts(xml)}
+
+    result = phone.ensure_main_tabs(PKG)
+    if not result["ok"]:
+        raise FlowMismatch(
+            "扫描职位", "退不回主界面，找不到底部「职位」tab", result.get("seen", [])
+        )
+
+    xml = phone.dump()
+    _guard_risk(xml, "扫描职位")
+    tab = phone.find_exact(xml, m["phone_tab"]["match"])
+    if not tab:
+        raise FlowMismatch("扫描职位", "主界面底部没有「职位」tab", phone.texts(xml))
+    phone.tap_node(tab, pause=4.5)
+
+    xml = phone.dump()
+    _guard_risk(xml, "进职位页")
+    _guard_publish_form(xml)
+    joined = " ".join(phone.texts(xml))
+    if not all(marker in joined for marker in _JOB_PAGE_MARKERS):
+        raise FlowMismatch("扫描职位", "没进到职位管理页（看不到「招聘中/发职位」）", phone.texts(xml))
+
+    recruiting = _find_startswith(xml, "招聘中")
+    if recruiting:
+        phone.tap_node(recruiting, pause=3)
+        xml = phone.dump()
+        _guard_publish_form(xml)
+
+    # ★ 时间预算：扫描跑在「登录成功之后、相位还是非终态」这段时间里，
+    #   卡住不动会让 `.login_in_flight` 哨兵一直挡着 main_round。每次 dump 都要
+    #   2-3 秒，再叠加 adb 自己的 90 秒超时，没有预算的话最坏能拖很久。
+    deadline = time.monotonic() + budget_seconds
+
+    seen: dict[str, dict[str, str]] = {}
+    new = _collect_job_cards(xml, seen)
+    swipes = 0
+    while new and swipes < max_swipe and time.monotonic() < deadline:
+        phone.swipe(tuple(m["list"]["scroll_from"]), tuple(m["list"]["scroll_to"]))
+        swipes += 1
+        new = _collect_job_cards(phone.dump(), seen)
+
+    jobs = list(seen.values())
+    # 停下来了但这一屏还出新卡 → 要么滑到上限、要么时间用光，列表都没到底。
+    # **绝不能拿它当全集**：上层据此只增不删（见 app/job_sync.py）。
+    exhausted = swipes >= max_swipe or time.monotonic() >= deadline
+    truncated = bool(new) and exhausted
+    return {
+        "ok": True,
+        "reason": "",
+        "jobs": jobs,
+        "swipes": swipes,
+        "truncated": truncated,
+        "seen": phone.texts(xml),
+    }

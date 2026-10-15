@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 AGENT_DIR = Path(__file__).resolve().parent
@@ -74,6 +75,7 @@ sys.path.insert(0, str(AGENT_DIR))
 import run_round  # noqa: E402  同目录的轮次运行器（借用它的锁判定，避免复制一份逻辑）
 import flows  # noqa: E402  确定性驱动：登录/退出的固定序列
 import phone  # noqa: E402  adb 原语与锚点匹配
+from app.job_sync import sync_scanned_jobs  # noqa: E402
 from app.login_request import (  # noqa: E402
     KIND_SWITCH,
     MAX_ATTEMPTS,
@@ -83,6 +85,7 @@ from app.login_request import (  # noqa: E402
     PHASE_FAILED,
     PHASE_LOGGING_OUT,
     PHASE_PENDING,
+    PHASE_SCANNING_JOBS,
     PHASE_SUCCESS,
     TERMINAL_PHASES,
     RedisLoginRequest,
@@ -348,10 +351,65 @@ def _drive_submit(store, req: dict) -> int:
 
     # 与 Pi 那条路共用同一份落地实现
     mark_account_logged_in(req["account_id"])
-    store.set_phase(PHASE_SUCCESS, "")
+    note = _scan_jobs(store, req)
+    store.set_phase(PHASE_SUCCESS, note)
     print(f"[login_watch] ✅ 登录成功，已把账号 {req['account_id']} 置为生效账号")
     _clear_sentinel()
     return 0
+
+
+# 「扫不到」的几种原因，翻成人话。**它们与「这个号确实没有在招职位」
+# 是不同的事**，混在一起会让用户对着「0 个职位」发呆。
+_SCAN_REASONS = {
+    "onboarding": "该账号还没建招聘名片（停在引导页），暂时没有职位管理页",
+    "not_logged_in": "手机上不在登录态",
+}
+
+
+def _scan_jobs(store, req: dict) -> str:
+    """登录成功后顺手扫出该账号的在招职位，返回要挂到 success 上的说明。
+
+    ★ **扫描失败不是登录失败**：登录已经成了，打成 failed 会让前端报红、还会
+      诱导用户重来一遍——而重来要再消耗一条短信验证码。所以只回一句 `notice`。
+
+    ★ 相位在扫完之前停在 `scanning_jobs`（非终态），`.login_in_flight` 哨兵靠它
+      保持新鲜，main_round 才不会在扫描中途把手机抢走。
+
+    ★ 这里**兜住所有异常**：相位卡在 `scanning_jobs` 会让下一轮登录永久堵住，
+      比丢一次扫描严重得多。
+    """
+    store.set_phase(PHASE_SCANNING_JOBS, "")
+    print("[login_watch] 登录成功，正在扫该账号的在招职位…")
+
+    try:
+        result = flows.scan_jobs()
+    except Exception as exc:  # noqa: BLE001  见 docstring 最后一条
+        traceback.print_exc()
+        return f"登录成功，但职位没扫到（{exc}）。可稍后重试，或在前端手工添加职位。"
+
+    if not result["ok"]:
+        reason = _SCAN_REASONS.get(result["reason"], result["reason"])
+        print(f"[login_watch] 没有可扫的职位页：{reason}")
+        return f"登录成功。{reason}——补齐后系统才能开始打招呼。"
+
+    try:
+        summary = sync_scanned_jobs(
+            req["account_id"], result["jobs"], truncated=result["truncated"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        return f"登录成功，扫到 {len(result['jobs'])} 个职位但写库失败（{exc}）"
+
+    print(f"[login_watch] 职位同步：{summary}")
+    if summary["created"]:
+        tail = "（列表没扫全，可重扫）" if summary["truncated"] else ""
+        return (
+            f"已同步 {summary['created']} 个在招职位{tail}，"
+            "在前端补齐 JD 并启用后才会开始打招呼"
+        )
+    if summary["updated"]:
+        return f"已更新 {summary['updated']} 个职位的详情"
+    return f"职位已是最新（{summary['unchanged']} 个已存在）"
 
 
 if __name__ == "__main__":
