@@ -343,6 +343,22 @@ def main_round() -> int:
     log(f"main_round 开始（自动打招呼：{'开' if GREET_ENABLED else '**关**'}）")
 
     collect_jobs()
+
+    # ★ 顺手补**一个** JD（每轮最多一个）。
+    #
+    #   为什么 main 也要做这件事：`daily_round` 只在 19:50 跑一次，
+    #   而「可用职位」（= 采候选人的前提）要求 JD 读全。
+    #   不补的话，全新库上**上午装好的系统要等到晚上 19:50 才有第一个可用职位**，
+    #   中间每一轮都在「扫到 3 个职位 → 跳过候选人采集」——看着在跑，其实空转。
+    #
+    #   一轮补一个：几个职位几轮就齐了，而且每轮只多花 ~60 秒（间隔 900 秒，够）。
+    #   抓失败不影响本轮其余部分——JD 抓取是最容易撞上风控/页面不对的那个动作。
+    for job in jobs_needing_jd()[:1]:
+        try:
+            collect_jd(job["title"])
+        except flows.FlowMismatch as exc:
+            log(f"  抓「{job['title']}」的 JD 失败：{exc}")
+
     jobs = usable_jobs()
     if not jobs:
         log("  没有可用职位（要 启用 + 开放中 + JD 读全），跳过候选人采集")
