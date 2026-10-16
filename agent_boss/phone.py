@@ -121,7 +121,15 @@ def active_tab(xml: str) -> str | None:
     return None
 
 
-_TAB_BY_RID = {"cl_tab_1": "牛人", "cl_tab_2": "搜索", "cl_tab_3": "消息", "cl_tab_4": "我的"}
+#: ★ 两份 rid 都要认：可点的容器是 `cl_tab_N`，但 `selected="true"` 挂在
+#: **`tv_tab_N`** 上（实测）。只写 cl_tab_N 的话 active_tab() 永远返回 None，
+#: 于是 ensure_tab() 每次都点一下——正是它要避免的那个刷新。
+_TAB_BY_RID = {
+    "cl_tab_1": "牛人", "tv_tab_1": "牛人",
+    "cl_tab_2": "搜索", "tv_tab_2": "搜索",
+    "cl_tab_3": "消息", "tv_tab_3": "消息",
+    "cl_tab_4": "我的", "tv_tab_4": "我的",
+}
 
 
 def ensure_tab(name: str, settle: float = 7.0) -> str:
