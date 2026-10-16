@@ -143,6 +143,18 @@ class ConversationIn(BaseModel):
     messages: list[MessageIn] = Field(default_factory=list)
 
 
+#: ★★ BOSS **对「开放中」的职位不打状态标签**（实测：职位管理页「全部」tab 里，
+#: 在线职位那一行没有 `tv_job_state`，待开放/已关闭的才有）。
+#: 所以采数端读回来的是**空串**。
+#:
+#: 不归一的话会出一条**静止的死链**：库里存 `""` → `hr_tools.job_list_active`
+#: 筛 `state == "开放中"` 永远匹配不上 → `usable` 恒为 0 → 轮次闸门⑤永远跳过 →
+#: **整条自动化什么都不做，而且看起来一切正常**。
+#: （2026-10-16 真机联调就是这么撞上的：明明有个在招职位，overview 里「开放中」是 0。）
+def _norm_state(raw: str) -> str:
+    return raw.strip() or "开放中"
+
+
 @router.post("/api/ingest/jobs", dependencies=[Depends(_token_header)])
 def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
     """采数端推职位。按 `title` upsert（BOSS 的职位名发布后不可修改，拿它当业务键是安全的）。"""
@@ -155,7 +167,7 @@ def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
             created += 1
         else:
             updated += 1
-        row.state = item.state
+        row.state = _norm_state(item.state)
         row.details = item.details
         row.tags = item.tags
         # ★ JD 只在**这次读到、且读全了**的时候覆盖。

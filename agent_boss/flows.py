@@ -482,6 +482,15 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str
     out: dict[str, dict[str, Any]] = {}
     for _ in range(max_scroll + 1):
         _collect_conversations(xml, out)
+        # ★ 丢掉**系统通知**那条伪会话（2026-10-16 真机撞到）：
+        #   「消息」列表里混着一条叫「通知」的卡片（道具通知/系统通知），
+        #   它不是人、没有职位、点进去是 `ChatNoticeActivity` 而不是聊天页——
+        #   `read_conversation` 会在它身上白跑一次并抛 FlowMismatch。
+        #
+        #   区分标记（实测）：**它有 `tv_desc`（值如「道具通知」），而真人会话都没有**；
+        #   真人会话另有 `tv_position`（关联职位），它也没有。
+        #   两个条件一起用，比只认名字「通知」稳（名字是 BOSS 写的，会变）。
+        out = {k: v for k, v in out.items() if not v.get("_sys_desc") and v.get("position")}
         if len(out) >= limit:
             break
         phone.swipe((540, 1600), (540, 700))          # ★ 只往下走
@@ -541,6 +550,8 @@ def _collect_conversations(xml: str, out: dict[str, dict[str, Any]]) -> None:
             current["status"] = text
         elif rid == "tv_msg":
             current["last_msg"] = text
+        elif rid == "tv_desc":
+            current["_sys_desc"] = text
 
 
 #: 时间分隔可能是「16:36」或「10月16日」这类。

@@ -52,6 +52,23 @@ def test_ingest_job_upserts_by_title(client):
     assert items[0]["state"] == "已关闭"
 
 
+def test_open_job_without_state_label_is_normalized(client):
+    """★ BOSS **对「开放中」的职位不打状态标签**，采数端读回来的是空串。
+
+    不归一的话会出一条**静默的死链**：库里存 `""` → `hr_tools.job_list_active`
+    筛 `state == "开放中"` 永远匹配不上 → `usable` 恒为 0 → 轮次闸门⑤永远跳过 →
+    **整条自动化什么都不做，而且看起来一切正常**。
+
+    2026-10-16 真机联调就是这么撞上的：明明有个在招职位，overview 里「开放中」是 0。
+    """
+    _ingest_job(client, state="", jd_complete=True)
+    item = client.get("/api/jobs").json()["items"][0]
+    assert item["state"] == "开放中", "空状态没有被归一"
+
+    # 归一之后它才真的可用
+    assert client.get("/api/hr/overview").json()["jobs"]["usable"] == 1
+
+
 def test_half_read_jd_must_not_overwrite_a_good_one(client):
     """★ 一次抓失败的 JD（没读全）不能把已经读全的冲掉。"""
     _ingest_job(client)
