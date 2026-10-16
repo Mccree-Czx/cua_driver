@@ -263,9 +263,26 @@ def collect_jd(title: str) -> bool:
 
 
 def collect_candidates(job_title: str, limit: int = 10) -> int:
+    """采一个职位下的推荐候选人（列表卡上的那些字段）。
+
+    ★ **不发 `boss_key`**——由服务端用姓名兜底。
+      原因是实测发现列表卡与详情页给的公司字符串**不是同一个**
+      （`云南白药 · 数据开发` vs `云南白药集团·数据开发`），
+      在这边拼键会让同一个人变成两条。详见 `services/boss-pipeline/app/api.py::_boss_key`。
+
+    ★ 列表卡上的 `works` / `bounds` 不是 `CandidateIn` 的字段：
+      `works` 是「公司·职位 / 求职期望」那几行的原文，`bounds` 是屏幕坐标——
+      两个都不该进库（前者拆不开，后者换台设备就废）。
+    """
     cs = flows.scan_candidates(limit=limit)
     if cs:
-        _post("/api/ingest/candidates", [{**c, "job_title": job_title} for c in cs])
+        _post("/api/ingest/candidates", [{
+            "name": c["name"],
+            "job_title": job_title,
+            "summary": c.get("summary", ""),
+            "tags": c.get("tags", []),
+            "active": c.get("active", ""),
+        } for c in cs])
     log(f"  「{job_title}」推荐 {len(cs)} 人")
     return len(cs)
 

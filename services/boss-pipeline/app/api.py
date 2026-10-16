@@ -106,7 +106,8 @@ class JobIn(BaseModel):
 
 
 class CandidateIn(BaseModel):
-    boss_key: str
+    #: ★ **可以不传**，服务端会退化成用 `name`（见下面 `_boss_key`）。
+    boss_key: str = ""
     name: str
     #: ★ 这个候选人是**从哪个职位的推荐流里采到的**。BOSS 的牛人推荐按职位，
     #:   所以有它才能建 job_candidate 那行。留空则不建（比如从会话列表看到的）。
@@ -166,16 +167,38 @@ def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
     return {"created": created, "updated": updated}
 
 
+def _boss_key(item: CandidateIn) -> str:
+    """候选人的业务主键。
+
+    ★★ **实测纠正**：原本打算用「姓名｜公司」，但真机上发现**两个页面拿到的
+    公司字符串不是同一个东西**：
+
+    | 来源 | 字段 | 实测值 |
+    |---|---|---|
+    | 牛人列表卡 | `works[0]`（`ll_work_exp`） | `云南白药 · 数据开发` |
+    | 候选人详情页 | `job_and_company`（`tv_job_and_com`） | `云南白药集团·数据开发` |
+
+    拼起来的话，**同一个人从两个页面进来会变成两条记录**。
+    所以退回**只用姓名**——它在两个页面上都一样。
+
+    代价：同一个职位下同名的两个人会被并成一条。取舍上这比「一个人变两条」
+    好得多（后者会让「一人一消息」的联锁直接失效——同一个人被打两次招呼）。
+    公司信息照常存在 `job_and_company` 里，只是不参与主键。
+    """
+    return item.boss_key or item.name
+
+
 @router.post("/api/ingest/candidates", dependencies=[Depends(_token_header)])
 def ingest_candidates(items: list[CandidateIn], session: SessionDep) -> dict[str, int]:
     """采数端推候选人。按 `boss_key` upsert；带了 `job_title` 就顺带建 job_candidate。"""
     created = updated = jc_created = 0
     for item in items:
+        key = _boss_key(item)
         row = session.scalar(
-            select(models.Candidate).where(models.Candidate.boss_key == item.boss_key)
+            select(models.Candidate).where(models.Candidate.boss_key == key)
         )
         if row is None:
-            row = models.Candidate(boss_key=item.boss_key, name=item.name)
+            row = models.Candidate(boss_key=key, name=item.name)
             session.add(row)
             created += 1
         else:
