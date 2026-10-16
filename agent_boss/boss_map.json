@@ -1,0 +1,344 @@
+{
+  "_说明": "BOSS直聘 App（招聘端）实测锚点。存成文件而不是写进代码：App 升级只改这里。坐标基于 1080x2244（App 可用区 1080x2159，底栏占 2094~2159）。",
+  "app": {
+    "package": "com.hpbr.bosszhipin",
+    "screen": "1080x2244",
+    "usable_height": 2159,
+    "role": "招聘端（BOSS 身份）"
+  },
+  "probe": {
+    "at": "2026-10-16",
+    "by": "Mac 10.99.31.81 → adb 无线连 10.99.22.219:5555（华为 EML-AL00 / Android 10），逐屏 uiautomator dump",
+    "verified": true,
+    "note": "走通了一次真实登录（隐私协议 → 身份选择 → 手机号 → 滑块 → 短信码 → 登录后），但**登录后被风控拦在实名认证墙上**，登录后的深页面（牛人/搜索/消息）尚未摸。"
+  },
+
+  "★通用教训": {
+    "锚点策略与猎聘相反": "★ BOSS 是**原生 Android**，dump 里带完整 `resource-id`（`com.hpbr.bosszhipin:id/xxx`）。猎聘是 Flutter，几乎没有稳定 ID。所以 BOSS 一律**优先按 resource-id 定位**，坐标只作兜底。**不要照抄猎聘的 login_map.json 写法。**",
+    "底栏文字节点尺寸为 0": "底部导航的 `tv_tab_1..4` 文字节点 bounds 全是 `[0,0][0,0]`（标签被隐藏），**点它们无效**。必须点对应的可点容器 `cl_tab_1..4`。",
+    "无 id 的按钮": "隐私协议页的「同意」「拒绝」是**没有 resource-id 的 TextView**，只能靠 text 精确匹配（`text == '同意'`）。",
+    "短信码输满自动提交": "★ 验证码是自定义 4 格 OTP（隐藏 `et_code` 接输入 + `tv_code1..4` 负责显示）。**输满第 4 位会自动提交**，不存在「再点下一步」这一步。所以输入后立刻 dump 会看不到那 4 格——页面已经跳走了。",
+    "★铁律 3 在这里尤其重要": "BOSS 的风控比猎聘重得多。滑块页出现即停手，人脸认证绝不触碰。详见本文件「风控」段。"
+  },
+
+  "风控": {
+    "★三道关卡_全部必须人工": [
+      "① 网易易盾滑块（点「下一步」后立刻弹）",
+      "② 短信验证码",
+      "③ ★ 人脸识别实名认证（「检测到您的账号异常」）"
+    ],
+    "滑块": {
+      "容器": { "class": "WebView", "text": "易盾验证码", "bounds": [108, 863, 972, 1661] },
+      "title": "请完成安全验证",
+      "可读到的内外层": ["验证码背景", "验证码滑块", "刷新", "切换至语音验证码", "向右拖动滑块填充拼图"],
+      "★读不到内部": "uiautomator 只能读到外面这层壳。**内部滑动结构读不到，也无从自动化。**",
+      "处置": "停手 + 报告，等人手动滑。绝不尝试绕过（项目铁律 3）。"
+    },
+    "人脸认证墙": {
+      "activity": "com.hpbr.bosszhipin.module.webview.WebViewActivity",
+      "markers": ["请您验证本人身份", "检测到您的账号异常", "开始人脸识别认证"],
+      "button": { "match": "开始人脸识别认证", "bounds": [69, 1051, 1011, 1180] },
+      "more_actions": {
+        "match": "更多操作", "bounds": [591, 2080, 744, 2128],
+        "items": ["解绑实名", "切换为牛人身份", "客服消息", "退出登录", "取消"],
+        "★危险邻居": "「解绑实名」会解除账号实名绑定——**绝不要点**。要离开只走「退出登录」（会二次确认）。"
+      },
+      "★结论": "新设备/新 IP 上登录 BOSS 招聘端，账号会被判异常并要求**实名本人人脸识别**。这一步不能也不该自动化。"
+    }
+  },
+
+  "登录": {
+    "①隐私协议": {
+      "activity": "（首次启动弹窗）",
+      "anchor_markers": ["欢迎使用BOSS直聘"],
+      "title": { "rid": "tv_title", "text": "欢迎使用BOSS直聘", "bounds": [165, 443, 633, 516] },
+      "content": { "rid": "tv_content", "note": "两段长文本，在 rv_contents 里" },
+      "buttons": {
+        "拒绝": { "match": "拒绝", "center": [334, 1746], "bounds": [153, 1680, 516, 1812], "★无resource_id": true },
+        "同意": { "match": "同意", "center": [745, 1746], "bounds": [564, 1680, 927, 1812], "★无resource_id": true }
+      }
+    },
+
+    "②身份选择": {
+      "activity": "com.hpbr.bosszhipin.module.tutorial.activity.TutorialActivity2",
+      "title": { "rid": "tv_title", "text": "找工作 招人才 直接聊" },
+      "选择招人": { "rid": "cl_boss_card", "center": [540, 1561], "bounds": [51, 1340, 1029, 1782],
+                    "label": "我要招人", "label_rid": "tv_boss_title" },
+      "选择找工作": { "rid": "cl_geek_card", "center": [540, 975], "bounds": [51, 754, 1029, 1196],
+                      "label": "我要找工作", "label_rid": "tv_geek_title",
+                      "★不要点": "会把账号切到求职者端" }
+    },
+
+    "③登录页": {
+      "activity": "com.hpbr.bosszhipin.login.activity.GetStartedActivity2",
+      "title": { "rid": "tv_login_title", "text": "登录/注册" },
+      "subtitle": { "rid": "desc_tv", "text": "首次验证通过即注册BOSS直聘账号" },
+      "country_code": { "rid": "tv_country_phone_code", "text": "+86", "center": [132, 643] },
+      "phone_field": { "rid": "et_phone", "class": "EditText", "center": [619, 644],
+                       "bounds": [231, 587, 1008, 701],
+                       "clear_button": { "rid": "iv_clear", "bounds": [918, 587, 1008, 701] } },
+      "no_sms_hint": { "rid": "tv_no_sms", "text": "接收不到短信" },
+      "next_button": { "rid": "btn_confirm", "class": "Button", "text": "下一步",
+                       "center": [540, 1002], "bounds": [72, 936, 1008, 1068] },
+      "agree_checkbox": { "rid": "checkbox", "class": "CheckBox", "center": [96, 1162],
+                          "bounds": [72, 1134, 120, 1191],
+                          "注意": "勾选后 dump 里 checked=\"true\"" },
+      "agree_text": { "rid": "tv_privacy_protocol", "bounds": [120, 1122, 1008, 1236],
+                      "text": "已阅读并同意《BOSS直聘用户协议》和《隐私政策》，允许BOSS直聘统一管理本人账号信息" },
+      "third_party_login": {
+        "微信": { "rid": "img_wechat_login", "bounds": [273, 1501, 387, 1615] },
+        "QQ": { "rid": "img_qq_login", "bounds": [483, 1501, 597, 1615] },
+        "微博": { "rid": "img_wauth_login", "bounds": [693, 1501, 807, 1615] }
+      },
+      "back": { "rid": "backButton", "bounds": [0, 85, 150, 235] },
+      "★没有密码登录": "招聘端登录只有「手机号 + 短信验证码」。**没有账号密码这条路**——猎聘的「密码加密存档、换号失败登回旧号」在 BOSS 上不适用。"
+    },
+
+    "④短信验证码": {
+      "activity": "同上（GetStartedActivity2 内的同页浮层，底下的手机号表单仍在树里）",
+      "title": "输入短信验证码",
+      "subtitle": { "rid": "smsSubtitleText", "例": "已向您的手机 1449 发送验证码" },
+      "code_input": { "rid": "et_code", "class": "EditText", "center": [540, 620],
+                      "bounds": [72, 545, 1008, 695],
+                      "display_cells": ["tv_code1", "tv_code2", "tv_code3", "tv_code4"],
+                      "★": "4 格。输满 4 位**自动提交**，不需要点下一步。" },
+      "resend": { "rid": "sendCodeButton", "text": "重新发送（53s）", "bounds": [362, 719, 717, 812] },
+      "submit": { "rid": "nextStepButton", "text": "下一步", "bounds": [72, 872, 1008, 1004],
+                  "note": "自动提交已足够，这个按钮一般用不上" },
+      "voice_code": { "rid": "sendVoiceCodeButton", "text": "语音接听验证码", "bounds": [72, 1082, 345, 1135] }
+    },
+
+    "⑤登录后引导": {
+      "activity": "com.hpbr.bosszhipin.module.interview.NewCollectionActivity",
+      "markers": ["恭喜获得BOSS荣誉勋章"],
+      "medal": { "rid": "tv_medal_title", "例": "三顾茅庐" },
+      "立即点亮": { "rid": "tv_page_yes", "center": [540, 1654], "bounds": [240, 1587, 840, 1722] },
+      "暂不点亮": { "rid": "tv_page_no", "center": [540, 1822], "bounds": [426, 1764, 654, 1881],
+                    "推荐": "保守选项，用它跳过引导" }
+    }
+  },
+
+  "主界面": {
+    "activity": "com.hpbr.bosszhipin.module.main.activity.MainActivity",
+    "底部导航": {
+      "container": { "rid": "main_tab_layout_view", "bounds": [0, 2094, 1080, 2159] },
+      "tabs": {
+        "牛人": { "rid": "cl_tab_1", "bounds": [0, 2094, 270, 2159], "center": [135, 2126], "label_rid": "tv_tab_1" },
+        "搜索": { "rid": "cl_tab_2", "bounds": [270, 2094, 540, 2159], "center": [405, 2126], "label_rid": "tv_tab_2" },
+        "消息": { "rid": "cl_tab_3", "bounds": [540, 2094, 810, 2159], "center": [675, 2126], "label_rid": "tv_tab_3" },
+        "我的": { "rid": "cl_tab_4", "bounds": [810, 2094, 1080, 2159], "center": [945, 2126], "label_rid": "tv_tab_4" }
+      },
+      "★": "点 cl_tab_N 容器；tv_tab_N 的 bounds 是 [0,0][0,0]，点了没用。",
+      "判定在不在主界面": "出现 main_tab_layout_view 且能同时找到 cl_tab_1 与 cl_tab_4 —— 参照猎聘 ensure_main_tabs「只认一个会被骗」的教训，至少认两个。"
+    },
+    "我的页": {
+      "profile_name": { "rid": "ctl_f3_profile", "例": "郑先生" },
+      "company_position": { "rid": "tv_company_and_position", "例": "OutIn·HR Director" },
+      "stats": {
+        "沟通过": { "rid": "tv_boss_contacts_number" },
+        "面试": { "rid": "tv_interview_count" },
+        "收藏": { "rid": "tv_favor_geeks" },
+        "影响力": { "rid": "tv_prop" }
+      },
+      "顶部图标": {
+        "切换身份": { "rid": "iv_switch_identity", "bounds": [654, 104, 786, 236] },
+        "扫一扫": { "rid": "iv_scanner_entrance", "bounds": [786, 104, 918, 236] },
+        "设置": { "rid": "iv_general_settings", "bounds": [918, 104, 1050, 236] }
+      },
+      "★职位入口": {
+        "rid": "layout_bar_group / rl_position",
+        "bounds": [24, 847, 1056, 1027],
+        "texts": ["暂无在线职位", "职位管理", "tv_arrow"],
+        "note": "这是进「职位管理」的入口，是后续扫在招职位的起点。点它进 PositionListManagementActivity（详见本文件「职位管理」段）。「暂无在线职位」指的是没有**开放中**的职位，账号其实有 3 个（2 待开放 + 1 已关闭）。"
+      },
+      "推广位": {
+        "rid": "rvPropList",
+        "items": ["优先曝光·曝光刷新卡", "置顶职位·置顶卡", "群发消息·牛人炸弹Pro"],
+        "★": "这三个都是**付费推广**（同猎聘的「火爆刷」）。绝不要点。"
+      },
+      "其他入口": ["我的权益", "钱包/发票", "公司主页", "招才宝典"]
+    }
+  },
+
+  "职位管理": {
+    "activity": "com.hpbr.bosszhpin.module_boss.component.position.manage.PositionListManagementActivity",
+    "★注意包路径": "是 `bosszhpin`（App 自己的拼写笔误），不是 `bosszhipin`。照抄。",
+    "进入方式": { "from": "我的页 rl_position", "center": [540, 937], "bounds": [24, 847, 1056, 1027] },
+    "title": { "rid": "tv_title", "text": "职位管理" },
+    "back": { "rid": "iv_back", "center": [90, 160] },
+    "右上角": { "rid": "iv_action_custom", "bounds": [812, 121, 1033, 199], "★未探明": "不知道是干什么的，用前先摸" },
+    "tabs": {
+      "全部": [43, 235, 127, 385], "开放中": [212, 235, 338, 385], "待开放": [424, 235, 550, 385],
+      "审核未通过": [637, 235, 847, 385], "已关闭": [931, 235, 1057, 385],
+      "★": "这五个是 TextView、**没有 resource-id**，只能靠文字精确匹配"
+    },
+    "list": {
+      "container": "rv_list",
+      "item_nodes": { "职位名": "tv_job_name", "状态": "tv_job_state", "信息行": "fl_job_info" },
+      "fl_job_info_格式": "「上海·四川北路  |  本科  |  3-5年  |  18-25K·13薪  |  全职」——★ 商圈级城市 + 经验用区间",
+      "recyclerview_不传_clickable": "RecyclerView 本身 clickable=false，卡片点击要看子节点"
+    },
+    "★2026-10-16_实测的账号状态": {
+      "已有职位数": 3,
+      "明细": [
+        "高级大数据开发工程师（待开放）上海·四川北路 | 本科 | 3-5年 | 18-25K·13薪 | 全职",
+        "人事经理（绩效、企业文化方向）（待开放）上海·四川北路 | 本科 | 5-10年 | 20-30K·13薪 | 全职",
+        "数字化专员（已关闭）上海·四川北路 | 本科 | 1-3年 | 12-17K·13薪 | 全职"
+      ],
+      "★": "这 3 个是**原本就存在的**，不是探查留下的草稿。注意「我的」页显示「暂无在线职位」是因为没有「开放中」的，两者不矛盾。"
+    },
+    "发职位入口": { "rid": "btn_post_job", "text": "发布新职位", "bounds": [60, 2067, 1020, 2159],
+                    "★": "点它只打开空白表单，**不会发布**；真正危险的是表单里的提交（本流程两步，全是「下一步」）" }
+  },
+
+  "发布职位": {
+    "activity": "com.hpbr.bosszhpin.module_boss.component.position.mopost.create.MOCreatePositionActivity",
+    "★只探到第一页": "本流程是**两步向导**，第二页「选择职位要求」需要在第一页填了必填项、点了「下一步」才能看到。**本次没填、没点，所以第二页完全未知。**",
+    "进度": { "步骤1": "填写基本信息", "步骤2": "选择职位要求（★未探到）" },
+    "第一页": {
+      "title": { "rid": "tv_content_title", "text": "发布社招" },
+      "复制历史职位": { "rid": "tv_content_change", "bounds": [660, 358, 1080, 470] },
+      "招聘类型": {
+        "rid": "fl_type_list",
+        "options": {
+          "社招全职": [60, 880, 519, 993],
+          "应届校园招聘": [543, 880, 1002, 993],
+          "实习生招聘": [60, 1017, 519, 1130],
+          "兼职招聘": [543, 1017, 1002, 1130]
+        },
+        "★": "四个 Button 的 rid 全是 `btn_city`（复用），只能靠文字区分"
+      },
+      "职位名称": { "row_bounds": [0, 1130, 1080, 1405], "占位": "请填写职位名称，如\"销售专员\"" },
+      "职位描述": { "row_bounds": [0, 1405, 1080, 1680], "占位": "介绍工作内容、职位要求",
+                    "有小红书标": "iv_red_dot [825,1553][975,1613] —— 必填" },
+      "下一步": { "rid": "btn_save", "★文字是「下一步」不是「保存」": true,
+                  "bounds": [60, 2067, 1020, 2159],
+                  "★": "rid 叫 btn_save 但语义是「下一步」。**绝不轻点**——虽然只是翻页，但这是发布流程的一部分。" }
+    },
+    "★页面原文提示": "注：招聘类型、职位名称、职位类型和工作城市发布后不可修改",
+    "★退出表单的坑": {
+      "现象": "点 iv_back 退出时，会弹一个引导框「不想写描述？AI帮你写 / 不想重复填？复制历史职位」，按钮是「AI帮我写」「复制历史职位」。",
+      "★它不是丢弃确认": "别在这两个按钮里二选一。**真正的关闭入口是弹框下方的 `iv_close`（约 540,1599）**，关掉之后再按一次 BACK 才是干净退出（实测不会再问，直接回到我的页，且**不留草稿**）。"
+    }
+  },
+
+  "职位详情页": {
+    "activity": "com.hpbr.bosszhipin.module.position.MyJobActivity",
+    "进入方式": { "from": "职位管理页点职位卡", "center": [300, 500] },
+    "back": { "rid": "iv_back", "center": [90, 160] },
+    "右上角": { "rid": "iv_copy", "bounds": [900, 100, 1044, 220], "★未探明": "疑似「复制」" },
+    "字段": {
+      "职位名": "tv_job_name", "薪资": "tv_job_salary",
+      "标签": "fl_tags 内的 TextView（城市/学历/经验）",
+      "招聘数据": "tv_count / tv_desc 成对出现：沟通过 / 查看过 / 感兴趣 / 分享查看",
+      "★JD": { "rid": "tv_description", "note": "**JD 在这一页直接可读**，不用进编辑表单。猎聘的 fetch_jds 在这里有对应物。" },
+      "职位标签": "btn_word ×N（如「要求数据开发经验」「PostgreSQL」）+ 末尾有「查看全部」"
+    },
+    "待开放标记": ["tv_banner_title «竞招职位·待开放»", "tv_right_alert «开放后可争夺牛人»"],
+    "底部按钮": {
+      "编辑": { "rid": "btn_reset", "bounds": [60, 2067, 341, 2159], "center": [200, 2113],
+                "★危险邻居": "与「开放职位」中心相距 **500px**。按坐标精确点，绝不按文字模糊找。" },
+      "开放职位": { "rid": "btn_confirm", "bounds": [380, 2067, 1020, 2159], "center": [700, 2113],
+                    "★": "见下方「开放职位实测」" }
+    }
+  },
+
+  "★开放职位实测（2026-10-16）": {
+    "结果": "**成功**。「高级大数据开发工程师」从「待开放」变成「开放中」，牛人 tab 随即出现候选人推荐。",
+    "★中间有一道付费墙": {
+      "activity": "com.hpbr.bosszhipin.business.paydialog.ZPDialogPayActivity",
+      "内容": "「曝光刷新卡」——额外曝光加速招聘。预计曝光 1500+ / 预计回复 57+ / 预计投递 29+",
+      "高级筛选": "毕业院校（统招本科/211/985/QS100）、年龄区间（16-22 / 22-30 / 30-35 / 35岁以上）",
+      "价格": "456 直豆（tv_price）",
+      "按钮": { "rid": "v_btn", "text": "立即开启", "bounds": [684, 2082, 1020, 2159], "★危险": "**会真的扣直豆**" },
+      "★出口": { "rid": "iv_close", "center": [994, 622], "noclose": "另有 touch_outside [0,85][1080,474] 可点空白关闭" }
+    },
+    "★关键经验": "**关掉付费弹窗不影响开放结果**——实测点了 iv_close 之后职位照样开放成功。所以正确做法是：点「开放职位」→ 弹付费墙 → 点 iv_close 跳过 → 职位已开放。",
+    "结果页": { "activity": "...my.activity.boss.share.HandlePositionResultActivity",
+                "标题": "「职位修改成功」（★措辞是「修改」不是「开放」，别被误导）",
+                "完成": { "rid": "tv_more", "text": "完成", "center": [960, 190] } }
+  },
+
+  "牛人": {
+    "进入": { "rid": "cl_tab_1", "center": [135, 2126] },
+    "★前提": "**必须有「开放中」的职位**，否则这里是空状态（「一大波牛人正期待您发布职位」+ btn_action_main「发布职位」）。",
+    "顶部职位筛选": { "class": "TextView", "bounds": [60, 85, 810, 217], "例": "高级大数据开发工程师",
+                      "note": "可点，用来切换按哪个职位推荐" },
+    "右上AI入口": { "rid": "fl_ai_entrance / ai_deep_search_entrance_style2_view", "bounds": [930, 91, 1050, 211] },
+    "筛选行": {
+      "left": { "container": "rv_filter_left", "选项": ["推荐", "精选（带 tv_badge 计数）", "最新"],
+                "node": "tv_filter_text" },
+      "right": { "container": "rv_filter_right", "选项": ["上海", "筛选"] }
+    },
+    "列表": {
+      "container": "rv_list [0,352][1080,2094]",
+      "卡片": "每张卡是一个可点的 FrameLayout，如 [0,352][1080,983] / [0,983][1080,1614] / [0,1614][1080,2094]",
+      "★卡片上没有打招呼按钮": "整张卡可点 → 进候选人详情页，「立即沟通」在那里面",
+      "卡内字段": {
+        "姓名": "tv_geek_name", "性别": "iv_gender", "头像": "iv_avatar",
+        "活跃度": "fl_tags 内的 TextView（如「刚刚活跃」）",
+        "概要": "tv_work_edu_other_desc（如「10年以上  |  本科  |  面议」）",
+        "工作经历": "ll_work_exp → tv_content（公司 · 职位）",
+        "求职期望": "tv_content（如「求职期望：数据开发」）",
+        "标签": "flow_layout → tv_tag_text"
+      },
+      "★移除按钮": { "rid": "iv_close", "例": "[948,376][1056,484]", "note": "卡片右上角的 X，估计是「不感兴趣/移除」。**未探明后果，别乱点。**" }
+    }
+  },
+
+  "候选人详情": {
+    "activity": "com.hpbr.bosszhpin.boss.resume2.normal.BossViewGeekResumePagerActivity",
+    "注意包路径": "又是 `bosszhpin`。",
+    "进入方式": { "from": "牛人 tab 点卡片中心", "center": [540, 667],
+                  "★避开": "卡片右上角 iv_close 在 x 948~1056 之间" },
+    "back": { "rid": "iv_back", "center": [90, 160] },
+    "顶部操作": { "container": "RecyclerView title_actions [684,100][1044,220]",
+                  "三个图标": [[684, 100, 804, 220], [804, 100, 924, 220], [924, 100, 1044, 220]],
+                  "★未探明": "不知道各是什么（可能是 收藏/分享/更多）" },
+    "字段": {
+      "姓名": "tv_geek_name", "性别": "iv_gender", "头像": "iv_avatar",
+      "当前公司职位": "tv_job_and_com（「腾讯音乐娱乐科技（深圳）·数据架构师」）",
+      "在职状态": "tv_geek_work_status（如「离职-随时到岗」）",
+      "基本项": "tv_geek_work_year / tv_geek_degree / tv_geek_age（经验 / 学历 / 年龄）",
+      "自我描述": "tv_geek_description",
+      "求职期望": "tv_job_and_city / tv_salary / tv_industry",
+      "工作经历": "cl_company → tv_work_company / tv_time_range"
+    },
+    "★打招呼": {
+      "rid": "（无 resource-id）",
+      "class": "Button",
+      "text": "立即沟通",
+      "bounds": [60, 2064, 1020, 2159],
+      "container": "cl_bottom_actions → bottom_buttons_layout",
+      "★": "**这就是 BOSS 版的「打招呼」**。点一下会给真实候选人发消息。写操作，必须有人授权。"
+    },
+    "提示气泡": { "rid": "bubble_tip_view_id", "text": "「不合适、举报」功能可点击这里使用～" }
+  },
+
+  "退出": {
+    "★未实测": "**这次没有真的走一遍退出登录**（账号刚过实名墙，不宜再折腾）。以下是 dump 里读到的入口，用前必须在真机上核对。",
+    "入口": {
+      "路径A": "实名认证墙页 →「更多操作」[591,2080,744,2128] →「退出登录」",
+      "路径B": "我的页 → iv_general_settings [918,104,1050,236] → 设置页里找「退出登录」"
+    },
+    "★危险邻居": "「更多操作」菜单里和「退出登录」并排的有**「解绑实名」**——点错会解除账号实名绑定。只按坐标精确点，不确定就停手。"
+  },
+
+  "未摸到的部分": {
+    "说明": "以下**都没有实测锚点**，用前必须现场探查：",
+    "列表": [
+      "★ 发布表单的**第二页「选择职位要求」**（城市/薪资/经验/学历）—— 发职位流程的关键缺口",
+      "★ 「立即沟通」点下去之后是什么（直接发消息？进聊天页？有没有默认招呼语？）—— **写操作，需授权**",
+      "★ 消息 tab 的会话列表与聊天页",
+      "搜索 tab（「人才库」）里的搜索/筛选",
+      "候选人卡片右上角 iv_close 的后果（不感兴趣？移除？）",
+      "候选人详情页顶部的三个图标分别是什么",
+      "「不合适」「举报」入口（气泡提示说在这里）",
+      "收简历 / 附件简历的读取路径",
+      "退出登录（两条路径都是 dump 里读到的，没走过）",
+      "iv_action_custom（职位管理页右上角）是干什么的",
+      "登录态过期后的表现",
+      "职位「开放」之后能不能关回去"
+    ]
+  }
+}
