@@ -269,6 +269,34 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
 
 # —— 候选人（牛人 tab）——
 
+def _find_in_list(xml: str, name: str, *, step: str, max_scroll: int = 6) -> dict[str, Any] | None:
+    """在候选人列表里找某个人，先**滚回顶部**再往下找。
+
+    ★ 为什么必须滚回顶部：`scan_candidates()` 会把列表**滚下去**，
+      紧接着调 `read_candidate(第一名的名字)` 时那人早被滚出屏幕了——
+      真机上连着跑必撞（实测：扫到「顾国庆/聂白甜/刘晓尚」，再读「顾国庆」时
+      屏幕上已经是「赵川」了，直接 FlowMismatch）。
+      列表滚上去是幂等的（到顶就不动了），所以这里放心滚。
+    """
+    for _ in range(max_scroll):
+        phone.swipe((540, 700), (540, 1700))          # 往上翻 = 回到更靠前的条目
+    xml = phone.dump_stable()
+    card = phone.find_exact(xml, name)
+    if card:
+        return card
+    for _ in range(max_scroll):                        # 还没找到就往下找
+        phone.swipe((540, 1600), (540, 700))
+        after = phone.dump_stable()
+        if after == xml:
+            break
+        xml = after
+        card = phone.find_exact(xml, name)
+        if card:
+            return card
+    return None
+
+
+
 def scan_candidates(*, limit: int = 10, max_scroll: int = 4) -> list[dict[str, Any]]:
     """读「牛人」tab 的候选人推荐列表。**纯只读**。
 
@@ -348,7 +376,7 @@ def read_candidate(name: str) -> dict[str, Any]:
       调用方应该知情。
     """
     xml = goto_tab("牛人")
-    card = phone.find_exact(xml, name)
+    card = _find_in_list(xml, name, step="读候选人")
     if not card:
         raise FlowMismatch("读候选人", f"牛人列表里没有「{name}」", phone.texts(xml))
 
