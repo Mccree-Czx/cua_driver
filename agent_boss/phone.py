@@ -18,6 +18,7 @@ BOSS 是**原生 Android**，dump 里带完整 `resource-id`
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -99,6 +100,44 @@ def ensure_main_tabs(package: str = PKG, max_back: int = 5, settle: float = 6.0)
 def goto_tab(name: str, settle: float = 7.0) -> None:
     """切底部 tab。★ 点的是 `cl_tab_N` 容器，不是文字节点（后者尺寸为 0）。"""
     tap(TAB_CENTERS[name], pause=settle)
+
+
+def active_tab(xml: str) -> str | None:
+    """当前选中哪个底部 tab（`牛人`/`搜索`/`消息`/`我的`），识别不出返回 None。
+
+    ★ 为什么不能用 `nodes()` 找：`selected="true"` 挂在 `tv_tab_N` 上，
+      而它的 bounds 是 `[0,0][0,0]`（标签被隐藏），`nodes()` 会跳过零尺寸节点。
+      所以只能直接在原始 XML 上正则。
+    """
+    for raw in re.findall(r"<node\b[^>]*>", xml):
+        if 'selected="true"' not in raw:
+            continue
+        rid = re.search(r'resource-id="([^"]*)"', raw)
+        if not rid:
+            continue
+        short = rid.group(1).rsplit("/", 1)[-1]
+        if short in _TAB_BY_RID:
+            return _TAB_BY_RID[short]
+    return None
+
+
+_TAB_BY_RID = {"cl_tab_1": "牛人", "cl_tab_2": "搜索", "cl_tab_3": "消息", "cl_tab_4": "我的"}
+
+
+def ensure_tab(name: str, settle: float = 7.0) -> str:
+    """确保停在某个底部 tab，返回那一屏的 dump。**已经在该 tab 就不点。**
+
+    ★★ 必须这样（2026-10-16 实测代价）：**点已经激活的 tab 会刷新那一页**——
+      「牛人」列表上实测：点一下当前 tab，`郭鑫` 变成 `郭宁`，精选计数从 10 跳到 14。
+      跟「往回滚」是同一类坑：**任何多余的交互都会让推荐流换一批人**。
+      所以「先拿姓名、再调一个会自己导航的函数」这种写法必然踩雷，
+      凡是操作列表里某个具体对象的流程，都必须**先确认已在目标 tab**，
+      在同一个 dump 里拿到目标再动手。
+    """
+    current = active_tab(dump_stable())
+    if current != name:
+        goto_tab(name, settle=settle)
+    return dump_stable()
 
 
 #: BOSS 上「点一下就有真实后果」的文字。**任何自动化流程在点之前都该拿它自检。**

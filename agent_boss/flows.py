@@ -141,7 +141,13 @@ def ensure_main_tabs() -> dict[str, Any]:
 
 
 def goto_tab(name: str) -> str:
-    """切底部 tab，返回切换后的 dump。"""
+    """**显式**切底部 tab，返回切换后的 dump。
+
+    ★ 注意它与 `phone.ensure_tab()` 的区别：这个**总是点一下**。
+      点已经激活的 tab 会**刷新那一页**（实测：牛人列表点一下当前 tab，
+      `郭鑫` 变 `郭宁`，精选计数 10→14）。所以操作列表里某个具体对象时
+      不要用它，用 `phone.ensure_tab()`。
+    """
     if name not in phone.TAB_CENTERS:
         raise FlowMismatch("切tab", f"没有这个 tab：{name}，可选 {sorted(phone.TAB_CENTERS)}")
     phone.goto_tab(name)
@@ -166,7 +172,7 @@ def scan_jobs(*, max_scroll: int = 4) -> list[dict[str, Any]]:
     if not result["ok"]:
         raise FlowMismatch("扫描职位", f"退不回主界面：{result}", result.get("seen", []))
 
-    phone.goto_tab("我的")
+    phone.ensure_tab("我的")
     xml = phone.dump_stable()
     entry = _m("职位管理", "进入方式", "center")
     phone.tap(tuple(entry), pause=8)
@@ -228,7 +234,7 @@ def fetch_jd(title: str, *, max_scroll: int = 3) -> dict[str, Any]:
     if not result["ok"]:
         raise FlowMismatch("抓JD", f"退不回主界面：{result}", result.get("seen", []))
 
-    phone.goto_tab("我的")
+    phone.ensure_tab("我的")
     phone.tap(tuple(_m("职位管理", "进入方式", "center")), pause=8)
     xml = phone.dump_stable()
     _guard_risk(xml, "进职位管理")
@@ -309,7 +315,7 @@ def scan_candidates(*, limit: int = 10, max_scroll: int = 4) -> list[dict[str, A
     if not result["ok"]:
         raise FlowMismatch("扫描牛人", f"退不回主界面：{result}", result.get("seen", []))
 
-    xml = goto_tab("牛人")
+    xml = phone.ensure_tab("牛人")
     if "发布职位后" in " ".join(phone.texts(xml)):
         raise FlowMismatch(
             "扫描牛人",
@@ -377,7 +383,7 @@ def read_candidate(name: str) -> dict[str, Any]:
     ★ **不会往回滚去找人**——往回滚会刷新整条推荐流（见文件里那段注释）。
       要连着读多个人，用 `read_candidates()`。
     """
-    xml = goto_tab("牛人")
+    xml = phone.ensure_tab("牛人")
     card = phone.find_exact(xml, name)
     if not card:
         raise FlowMismatch(
@@ -397,7 +403,7 @@ def read_candidates(*, limit: int = 5, max_move: int = 30) -> list[dict[str, Any
       等回头读某个已滚过去的人时——**回不去**（往回滚会刷新整条流，见上面的注释）。
       所以正确用法是这一条：看到谁读谁，只往下走。
     """
-    goto_tab("牛人")
+    phone.ensure_tab("牛人")
     out: list[dict[str, Any]] = []
     tried: set[str] = set()
     stale = 0
@@ -526,7 +532,7 @@ def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
     前提：`candidate` 必须**此刻就在牛人列表的当前屏**上
     （列表往回滚会刷新，见文件里那段注释）。
     """
-    xml = goto_tab("牛人")
+    xml = phone.ensure_tab("牛人")
     card = phone.find_exact(xml, candidate)
     if not card:
         raise FlowMismatch(
