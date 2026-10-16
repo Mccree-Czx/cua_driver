@@ -588,9 +588,21 @@ def read_conversation(name: str) -> dict[str, Any]:
     ★ 打开会话会把它**标记为已读**（BOSS 的行为），这是只读流程里唯一的外部可见副作用。
     """
     xml = phone.ensure_tab("消息")
-    card = phone.find_exact(xml, name)
+    # 往下翻着找。★ 这里跟「牛人」列表不同：会话列表往下翻是**安全的**
+    #   （那是推荐流才有的刷新问题）。而且新消息会不断把老会话挤下去——
+    #   实测刚发完招呼几分钟，张雄瑜（16:36）就被挤出了首屏。
+    card = None
+    for _ in range(6):
+        card = phone.find_exact(xml, name)
+        if card:
+            break
+        phone.swipe((540, 1600), (540, 700))
+        after = phone.dump_stable()
+        if after == xml:
+            break
+        xml = after
     if not card:
-        raise FlowMismatch("读会话", f"消息列表里没有「{name}」", phone.texts(xml))
+        raise FlowMismatch("读会话", f"消息列表里没有「{name}」（找过 6 屏）", phone.texts(xml))
 
     # ★★ **绝不能点姓名**（2026-10-16 实测踩到）：点会话的 `tv_name` 会打开
     #    `ChatSettingsNewActivity`——那一页上有「加入黑名单」「标记为不合适」
