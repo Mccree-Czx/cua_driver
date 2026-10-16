@@ -462,6 +462,101 @@ def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
     return detail
 
 
+# —— 消息（收件箱，纯只读）——
+
+def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str, Any]]:
+    """读「消息」tab 的会话列表。**纯只读**。
+
+    卡片字段（实测）：`tv_name` / `tv_position` / `tv_time` / `iv_msg_status` / `tv_msg`，
+    未读红点是 `badge_view`（数字在它的子节点里）。
+
+    ★ 只读当前子 tab 的内容。默认是「全部」；若停在其他子 tab 上，
+      有些会话不在列表里——找不到会如实报错，不会静默少给。
+    """
+    result = ensure_main_tabs()
+    if not result["ok"]:
+        raise FlowMismatch("读消息", f"退不回主界面：{result}", result.get("seen", []))
+
+    xml = phone.ensure_tab("消息")
+    out: dict[str, dict[str, Any]] = {}
+    for _ in range(max_scroll + 1):
+        _collect_conversations(xml, out)
+        if len(out) >= limit:
+            break
+        phone.swipe((540, 1600), (540, 700))          # ★ 只往下走
+        after = phone.dump_stable()
+        if after == xml:
+            break
+        xml = after
+    return list(out.values())[:limit]
+
+
+def _collect_conversations(xml: str, out: dict[str, dict[str, Any]]) -> None:
+    current: dict[str, Any] | None = None
+    for node in phone.nodes(xml):
+        rid = node["rid"].rsplit("/", 1)[-1]
+        text = phone.label(node).strip()
+        if rid == "tv_name":
+            if not text:
+                continue
+            current = out.setdefault(
+                text,
+                {"name": text, "position": "", "time": "", "status": "", "last_msg": ""},
+            )
+        elif current is None:
+            continue
+        elif rid == "tv_position":
+            current["position"] = text
+        elif rid == "tv_time":
+            current["time"] = text
+        elif rid == "iv_msg_status":
+            current["status"] = text
+        elif rid == "tv_msg":
+            current["last_msg"] = text
+
+
+def read_conversation(name: str) -> dict[str, Any]:
+    """打开一个会话，读消息。**纯只读**。
+
+    ★ **聊天页上四个快捷操作（求简历 / 换电话·微信 / 约面试 / 不合适）一律不碰**，
+      它们在 `mExchangeContainerLayout` 里，**就压在消息列表上方**。
+      本函数只点：会话卡片 → 返回。
+
+    ★ 打开会话会把它**标记为已读**（BOSS 的行为），这是只读流程里唯一的外部可见副作用。
+    """
+    xml = phone.ensure_tab("消息")
+    card = phone.find_exact(xml, name)
+    if not card:
+        raise FlowMismatch("读会话", f"消息列表里没有「{name}」", phone.texts(xml))
+
+    phone.tap_node(card, pause=9)
+    xml = phone.dump_stable()
+    _guard_risk(xml, "开会话")
+    if "ChatRoomActivity" not in phone.current_activity():
+        raise FlowMismatch("读会话", "没进到聊天页", phone.texts(xml))
+
+    def one(rid: str) -> str:
+        node = phone.find_rid(xml, rid)
+        return phone.label(node).strip() if node else ""
+
+    messages = [
+        {"direction": "in" if n["rid"].endswith("tv_content_text") else "out",
+         "text": phone.label(n).strip(), "y": n["bounds"][1]}
+        for n in phone.nodes(xml)
+        if n["rid"].endswith(("tv_content_text", "tv_content")) and phone.label(n).strip()
+    ]
+    times = [phone.label(n).strip() for n in phone.nodes(xml)
+             if n["rid"].endswith("tv_text") and phone.label(n).strip()]
+
+    detail = {"name": one("tv_title"), "position": one("tv_sub_title"),
+              "messages": messages, "time_marks": times}
+
+    phone.tap(tuple(_m("候选人详情", "back", "center")), pause=6)
+    if "ChatRoomActivity" in phone.current_activity():
+        raise FlowMismatch("读会话", "按了返回但还在聊天页", phone.texts(phone.dump_stable()))
+    return detail
+
+
 # —— 打招呼（写操作，默认干跑）——
 
 #: 打过招呼的账本。★ 防的是「同一个人被打两次招呼」——那对真实的人是打扰。
