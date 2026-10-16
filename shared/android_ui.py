@@ -118,8 +118,17 @@ def adb(*args: str, timeout: int = 90) -> str:
     if _DEVICE:
         cmd += ["-s", _DEVICE]
     cmd += list(args)
+    # ★ 必须显式 encoding="utf-8"：手机回来的 dump 是 UTF-8，而 Windows 上
+    #   `text=True` 会按本地代码页（cp936）解码 → 所有中文变成「鎺ㄨ崘」这种乱码，
+    #   于是**每个文字锚点都匹配不上**，且不报错。macOS 默认就是 UTF-8，所以
+    #   这个坑只在 Windows 上暴露（2026-10-16 跑云机探针时踩到）。
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, errors="replace"
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=timeout,
+        errors="replace",
     )
     if result.returncode != 0 and "error" in (result.stderr or "").lower():
         raise AdbError(result.stderr.strip()[:200])
@@ -146,6 +155,27 @@ def reconnect(serial: str | None = None, pause: float = 2.0) -> bool:
         return any(d["serial"] == target and d["state"] == "device" for d in list_devices())
     except (AdbError, OSError):
         return False
+
+
+def ensure_connected(*, pause: float = 2.0, tries: int = 3) -> bool:
+    """确保 `_DEVICE`（形如 `host:port` 的网络设备）此刻真的在连着。
+
+    ★ 为什么需要它：`adb connect` 是**一次性**的——adb server 重启、设备掉线、
+      或云手机客户端重开之后，那条连接**不会自己回来**，而后续每条命令都会失败。
+      进程启动时调一次，比每条命令都祈祷它还在要可靠。
+
+    非网络设备（USB 序列号）直接返回 True：本函数不管 USB，那由系统负责。
+    ★ 没设 `_DEVICE` 时同样返回 True——「不传 -s、交给 adb 挑唯一那台」是既有行为。
+    """
+    target = _DEVICE
+    if not target or ":" not in target:
+        return True
+    for _ in range(tries):
+        if any(d["serial"] == target and d["state"] == "device" for d in list_devices()):
+            return True
+        if reconnect(target, pause=pause):
+            return True
+    return False
 
 
 def dump(retries: int = 3, pause: float = 1.5) -> str:

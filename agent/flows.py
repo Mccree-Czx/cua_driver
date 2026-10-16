@@ -4,12 +4,15 @@
 `FlowMismatch`，并附上当时屏幕上看到了什么。刻意不做「猜着点」——锚点失配说明
 `login_map.json` 过期了，正确动作是重新校准锚点表，不是现场试。
 
-锚点全部来自 `login_map.json`（实测、外部化，App 升级只改它），本文件不写死坐标。
+锚点全部来自锚点表（实测、外部化，App 升级只改它），本文件不写死坐标。
+锚点表**按设备分文件**：真机用 `login_map.json`，网络设备（云手机/无线 adb）用
+`login_map.cloud.json`——两者的分辨率与 App 版本都不同，坐标不通用。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -19,6 +22,8 @@ import phone
 
 PKG = "com.lietou.mishu"
 MAP_PATH = Path(__file__).resolve().parent / "login_map.json"
+#: 网络设备（云手机）的锚点表。分辨率 720x1280、猎聘 versionCode 与真机不同，必须各探一套。
+MAP_PATH_CLOUD = Path(__file__).resolve().parent / "login_map.cloud.json"
 
 
 class FlowMismatch(RuntimeError):
@@ -31,8 +36,27 @@ class FlowMismatch(RuntimeError):
         super().__init__(f"[{step}] {detail}｜屏上：{self.seen[:12]}")
 
 
+def map_path() -> Path:
+    """按设备选锚点表。
+
+    优先 `HR_LOGIN_MAP`（显式覆盖，给探针与调试用）；否则看 `ANDROID_SERIAL`
+    是不是 `host:port` 形式——网络设备（云手机、无线 adb）走云机表，其余一律走
+    默认的真机表。
+
+    ★ **不设任何覆盖时，返回的就是 `MAP_PATH`，行为与从前逐字节相同。**
+    ★ 云机表**不存在就报错，不静默退回真机表**——拿真机坐标去点 720x1280 的屏，
+      会点错地方且不报错，这类静默失败是这套代码最忌讳的。
+    """
+    explicit = os.environ.get("HR_LOGIN_MAP")
+    if explicit:
+        return Path(explicit)
+    if ":" in (os.environ.get("ANDROID_SERIAL") or ""):
+        return MAP_PATH_CLOUD
+    return MAP_PATH
+
+
 def load_map() -> dict[str, Any]:
-    return json.loads(MAP_PATH.read_text(encoding="utf-8"))
+    return json.loads(map_path().read_text(encoding="utf-8"))
 
 
 def _expect(xml: str, markers: tuple[str, ...], step: str, what: str) -> None:
@@ -407,11 +431,18 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
       那部分。所以做一次**增长检测**：往下滚一屏再取一次，文本变长说明被截断了，
       继续滚（最多 `max_scroll` 次）直到不再增长。**没增长过才敢说 complete**，
       而只有 complete 的 JD 才会被自动启用（见 `app/job_sync.py`）。
+
+    ★ 滚动坐标**从锚点表读**（`职位JD.详情页.scroll_from/scroll_to`）：从前写死
+      `(540,1600)→(540,900)`，那是 1080x2244 真机的坐标——换到 720x1280 的云机上
+      y=1600 在屏外，滑动直接失效且不报错（2026-10-16 改）。
     """
+    m = load_map()["职位JD"]["详情页"]
+    scroll_from = tuple(m["scroll_from"])
+    scroll_to = tuple(m["scroll_to"])
     text = _jd_from_screen(phone.dump())
     for _ in range(max_scroll):
         before = len(text)
-        phone.swipe((540, 1600), (540, 900))
+        phone.swipe(scroll_from, scroll_to)
         text = _jd_from_screen(phone.dump())
         if len(text) <= before:
             return text, True

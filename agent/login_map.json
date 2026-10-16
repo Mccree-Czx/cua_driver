@@ -134,7 +134,10 @@
       "anchor_markers": ["职位介绍", "编辑职位"],
       "jd_label": { "match": "职位介绍", "bounds": [84, 1428, 300, 1503] },
       "jd_node_hint": "「职位介绍」标签**下方**那个长文本节点就是完整 JD。实测 bounds=[84,1539][996,2040]、content-desc 长度 543、**一次给全、不需要滚动**。",
-      "back_arrow": { "center": [72, 151] }
+      "back_arrow": { "center": [72, 151] },
+      "scroll_from": [540, 1600],
+      "scroll_to": [540, 900],
+      "scroll_note": "JD 增长检测用的滑动（原写死在 flows._extract_jd 里，2026-10-16 移到锚点表——各设备分辨率不同，写死必然在别的设备上滑出屏外）。"
     },
     "退出": { "kind": "back", "max_back": 1,
               "note": "详情页按一次 BACK 就回列表；再按一次会退出 App 到桌面（列表页是 App 主页）。" },

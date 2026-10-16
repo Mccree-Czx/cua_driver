@@ -41,6 +41,7 @@ from android_ui import (  # noqa: F401  显式列出，让 IDE 与静态检查�
     dump,
     dump_stable,
     edittexts,
+    ensure_connected,
     ensure_main_tabs as _ensure_main_tabs,
     field_at,
     find,
