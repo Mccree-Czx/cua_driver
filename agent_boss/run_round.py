@@ -448,10 +448,22 @@ def main(argv: list[str]) -> int:
     if name in ("main_round", "daily_round") and login_gate_in_flight():
         log("[skip] 手机停在风控关卡前等人（boss:login_gate_in_flight）——安静跳过，不动标记")
         return 0
-    # ⑤ 有可用职位（仅 main）
+    # ⑤ 有可用职位 —— ★ **只看一眼、不再拦**（2026-10-16 改）
+    #
+    #   原来这里 `return 0`（照猎聘 `has_active_jobs` 的写法）。在猎聘那套是对的，
+    #   因为**它的职位是人手工建的**：库里没有 active 职位，说明这个号确实没在招，
+    #   白跑一轮没意义。
+    #
+    #   BOSS 反过来：**职位就是轮次自己扫出来的**。于是全新库上成了死锁——
+    #   闸门说「没有可用职位，别跑」，而不跑就永远不会有可用职位。
+    #   第一次上调度就是这么卡住的（18:45:58 `[skip]`，退出码 0，看起来一切正常）。
+    #
+    #   而且「没有可用职位」也不等于「没事可做」：inbound（读未读会话）完全
+    #   不依赖职位。所以这里降级成**只记一笔**，真正该拦的地方在下面
+    #   `main_round` 里（没有可用职位就跳过候选人采集那一段）。
     if name == "main_round" and not usable_jobs():
-        log("[skip] 服务端没有可用职位（启用 + 开放中 + JD 读全）")
-        return 0
+        log("[note] 服务端还没有可用职位（启用 + 开放中 + JD 读全）——"
+            "本轮只做采集与未读会话，不采候选人")
     # ⑥ 退避（仅 main）
     if name == "main_round" and should_backoff(load_inbound_state()):
         log("[skip] 空未读退避中")
