@@ -465,7 +465,7 @@ def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
 
 # —— 消息（收件箱，纯只读）——
 
-def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str, Any]]:
+def scan_conversations(*, limit: int = 20, max_scroll: int = 6) -> list[dict[str, Any]]:
     """读「消息」tab 的会话列表。**纯只读**。
 
     卡片字段（实测）：`tv_name` / `tv_position` / `tv_time` / `iv_msg_status` / `tv_msg`，
@@ -479,6 +479,26 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str
         raise FlowMismatch("读消息", f"退不回主界面：{result}", result.get("seen", []))
 
     xml = phone.ensure_tab("消息")
+
+    # ★ **先滚回顶部**（2026-10-16 真机发现）。
+    #   消息列表是个可双向滚的长列表，而上一轮/上一次人工操作会把它留在中间。
+    #   只从当前位置往下读的话，**上半截的会话会一轮一轮地一直漏掉**——
+    #   实测：同一部手机，只读当下这一段是 5 个，滚回顶部再顺着读是 29 个。
+    #
+    #   ⚠️ **这里是本文件里唯一一处「往回滚」**，所以要说清它的把握程度：
+    #      在**牛人**列表上往回滚会**注入一批新候选人**（那边实测过，见 boss_map 的
+    #      「★绝不能往回滚」）。消息列表**没有观察到**那种行为——
+    #      实测连滚三次，每次露出的都是更靠前的不同会话，不像刷新。
+    #      但这一条**没有像牛人那边那样被反复验证过**，所以：
+    #      · 结果按名字去重（`out` 是 dict），就算真刷新了也只是多读到几个，不会写坏数据
+    #      · 一旦发现这里的行为变了，把这段删掉、退回「读到哪算哪」也比写坏数据强
+    for _ in range(6):
+        before = phone.texts(phone.dump_stable())
+        phone.swipe((540, 700), (540, 1700))
+        after = phone.texts(phone.dump_stable())
+        if before == after:            # 到顶了（屏没变）
+            break
+
     out: dict[str, dict[str, Any]] = {}
     for _ in range(max_scroll + 1):
         _collect_conversations(xml, out)
