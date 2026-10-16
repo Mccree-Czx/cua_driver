@@ -49,6 +49,7 @@ from android_ui import (  # noqa: F401
     list_devices,
     nodes,
     open_app,
+    reconnect,
     risk_markers,
     set_dump_path,
     shell,

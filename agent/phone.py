@@ -54,6 +54,7 @@ from android_ui import (  # noqa: F401  显式列出，让 IDE 与静态检查�
     list_devices,
     nodes,
     open_app,
+    reconnect,
     resolve_adb,
     risk_markers,
     shell,

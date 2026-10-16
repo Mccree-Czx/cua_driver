@@ -130,10 +130,43 @@ def shell(*args: str, timeout: int = 90) -> str:
     return adb("shell", *[str(a) for a in args], timeout=timeout)
 
 
-def dump() -> str:
-    """取当前界面的 uiautomator dump。"""
-    shell("uiautomator", "dump", DUMP_PATH)
-    return shell("cat", DUMP_PATH)
+def reconnect(serial: str | None = None, pause: float = 2.0) -> bool:
+    """重连无线 adb。**只对 `host:port` 形式的 serial 有意义。**
+
+    ★ 2026-10-16 实测：这台手机的无线 adb 会**偶发抖动**，一条命令报
+      `error: closed`，紧接着又完全正常。长流程（一次扫职位要跑几十条命令）
+      撞上一次就整个挂掉，所以要么能重连、要么能重试——两个都给了。
+    """
+    target = serial or _DEVICE
+    if not target or ":" not in target:
+        return False
+    try:
+        adb("connect", target, timeout=15)
+        time.sleep(pause)
+        return any(d["serial"] == target and d["state"] == "device" for d in list_devices())
+    except (AdbError, OSError):
+        return False
+
+
+def dump(retries: int = 3, pause: float = 1.5) -> str:
+    """取当前界面的 uiautomator dump。
+
+    ★ 会重试瞬时故障（`error: closed` 这类无线 adb 抖动）。
+      **只在这里重试是因为 dump 是幂等的**——`input tap` 绝不能重试，
+      重试会变成连点两下。所以重试逻辑只放在读命令上。
+    """
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            shell("uiautomator", "dump", DUMP_PATH)
+            return shell("cat", DUMP_PATH)
+        except AdbError as exc:
+            last = exc
+            if attempt == retries - 1:
+                break
+            time.sleep(pause)
+            reconnect()
+    raise last  # type: ignore[misc]
 
 
 def dump_stable(tries: int = 5, pause: float = 3.0, min_nodes: int = 10) -> str:
@@ -148,7 +181,13 @@ def dump_stable(tries: int = 5, pause: float = 3.0, min_nodes: int = 10) -> str:
     """
     xml = ""
     for _ in range(tries):
-        xml = dump()
+        try:
+            xml = dump()
+        except AdbError:
+            # 连接抖到 dump() 自己的重试都用完了——再给它一次机会
+            reconnect()
+            time.sleep(pause)
+            continue
         if len(re.findall(r"<node\b", xml)) >= min_nodes:
             return xml
         time.sleep(pause)
