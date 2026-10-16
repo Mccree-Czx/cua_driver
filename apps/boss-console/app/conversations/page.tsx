@@ -30,7 +30,7 @@ export default function ConversationsPage() {
       const p = new URLSearchParams();
       if (q.trim()) p.set("q", q.trim());
       if (unreadOnly) p.set("unread_only", "true");
-      const r = await fetch(`/api/conversations?${p}`);
+      const r = await fetch(`/api/hr/conversations?${p}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setRows((await r.json()).items);
       setErr(null);
@@ -47,7 +47,7 @@ export default function ConversationsPage() {
 
   async function open(id: number) {
     setOpenId(id);
-    const r = await fetch(`/api/conversations/${id}`);
+    const r = await fetch(`/api/hr/conversations/${id}`);
     setMessages(r.ok ? (await r.json()).messages : []);
   }
 

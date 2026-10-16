@@ -10,9 +10,13 @@ import {
   ProfileOutlined,
   TeamOutlined,
   MessageOutlined,
+  InboxOutlined,
+  FileTextOutlined,
+  SlidersOutlined,
   MenuOutlined,
   ThunderboltOutlined,
 } from "@ant-design/icons";
+import AlertBar from "./alert-bar";
 
 /**
  * BOSS 控制台的外壳。
@@ -24,11 +28,22 @@ import {
  * 这里**没有账号切换器、没有告警条**——猎聘那两个组件绑的是它的登录态与配额，
  * BOSS 这边还没有对应的东西。等统一身份那条线做完再说。
  */
+/**
+ * 导航。★ 顺序照「人一天里怎么用」排，不是照字母：
+ * 先看驾驶舱，再看职位（今天招什么），再是候选人（谁在投），
+ * 然后会话（谁回话了），人工队列（哪里卡住了），日志（出什么事了），
+ * 评分偏好排最后（现在还没接打分，是保留形状的页）。
+ *
+ * 没有「账号」相关项——BOSS 无密码、单账号（用户已定不复刻那套）。
+ */
 const NAV = [
   { key: "/", icon: <DashboardOutlined />, label: <Link href="/">驾驶舱</Link> },
   { key: "/jobs", icon: <ProfileOutlined />, label: <Link href="/jobs">职位</Link> },
   { key: "/candidates", icon: <TeamOutlined />, label: <Link href="/candidates">候选人</Link> },
   { key: "/conversations", icon: <MessageOutlined />, label: <Link href="/conversations">会话</Link> },
+  { key: "/manual", icon: <InboxOutlined />, label: <Link href="/manual">人工队列</Link> },
+  { key: "/logs", icon: <FileTextOutlined />, label: <Link href="/logs">运行日志</Link> },
+  { key: "/scoring", icon: <SlidersOutlined />, label: <Link href="/scoring">评分偏好</Link> },
 ];
 
 function BrandMark() {
@@ -98,7 +113,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </Drawer>
 
-        <div className="portal-content">{children}</div>
+        <div className="portal-content">
+          {/* 顶栏只留告警条——猎聘那边的「账号切换器」在 BOSS 上没有对应物 */}
+          <div className="portal-topbar">
+            <AlertBar />
+          </div>
+          {children}
+        </div>
       </div>
     </div>
   );
