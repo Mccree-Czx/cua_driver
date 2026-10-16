@@ -1,0 +1,17 @@
+[project]
+name = "boss-pipeline"
+version = "0.1.0"
+description = "BOSS直聘 服务端 — 承接 agent_boss 采到的职位/候选人/会话数据"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13",
+    "cryptography>=42", # PyMySQL 需要它完成 MySQL 8 默认的 caching_sha2_password 首次认证
+    "fastapi>=0.115",
+    "pydantic-settings>=2.2",
+    "pymysql>=1.1",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = ["httpx>=0.27", "pytest>=8"]
