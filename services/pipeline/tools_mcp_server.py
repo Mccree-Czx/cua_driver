@@ -1204,11 +1204,11 @@ def _screencap() -> bytes:
     return result.stdout
 
 
-# ★★ 下面这一整批坐标（滑屏起止、PDF 翻页/转发按钮）都是 **1080x2244 的真机**测出来的，
-#   换设备（例如 720x1280 的云手机）会**滑出屏外或点空，而且不报错**。
-#   锚点表已经按设备分文件了（`_login_map_path()` / `agent/flows.map_path()`），
-#   但**这几个常量还没接进去**——云机要走「收附件简历 → PDF 归档」这条路之前，
-#   必须先按设备重探（用 `agent/probe_anchors.py` 的人机配合范式，别现场试错）。
+# ★★ 下面这一整批坐标（滑屏起止、PDF 翻页/转发按钮）都是 **1080x2244 的真机**测出来的。
+#   **它们只服务真机那条「转发 → UC」的老路**；云机走的是「直取内部目录」（见
+#   `_fetch_via_internal_dir`），完全不需要这些坐标，也不需要 UC。
+#   换设备时如果走的是云机，就别再照抄这些坐标——它们是设备专属的。
+#   （2026-10-16：原本这里写「云机要走路之前必须先重探」，后来发现云机有更短的路。）
 def _swipe_up() -> None:
     subprocess.run(
         [ADB, "shell", "input", "swipe", "540", "1800", "540", "400", "500"],
@@ -1277,6 +1277,148 @@ def _clear_uc_cache() -> None:
     _adb_shell("rm", "-f", f"{UC_CACHE_DIR}/*.pdf")
 
 
+# ——— 云机路径：直取猎聘内部附件目录（2026-10-16 实测）———
+
+#: ★ 为什么云机不需要走 UC：真机的 adb 是 `uid=2000(shell)`，读 `/data/data/` 直接
+#:   Permission denied，所以才要「转发给 UC → 从 UC 外部缓存 pull」绕一圈。
+#:   云机的 adb 是 `uid=0(root)`，能直接读猎聘自己的目录——实测 `adb pull` 拿到的
+#:   就是真 PDF（%PDF-1.7）。这条路短得多，也不依赖 UC 装没装。
+
+
+def _direct_attachment_dir() -> str | None:
+    """云机的「直接取件目录」；真机返回 None（真机表里显式写着 null）。
+
+    ★ 判断**跟着锚点表走**：表本来就按设备分文件（`_login_map_path()` 看
+      `ANDROID_SERIAL`），所以「这是不是云机」这件事已经有唯一来源，不再另造
+      一个环境变量判断——两个来源迟早会不一致，而不一致就是静默点错。
+    ★ 真机表里那一项**显式写 null** 而不是缺键：缺失与「有意没有」要能分辨，
+      否则将来有人补上 UC 之外的路径时，会不知道 null 是漏配还是设计。
+    """
+    try:
+        data = json.loads(_login_map_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    section = data.get("附件简历") or {}
+    return section.get("直接取件目录") or None
+
+
+def _adb_rooted() -> bool:
+    """设备的 adb 是不是 root。
+
+    ★ 必须显式判断：`_adb_shell` 丢弃 stderr，没有 root 时 `ls /data/data/...`
+      返回**空 stdout**——看起来和「这个目录是空的」一模一样，于是会被静默
+      当成「没有附件」。云机是多云有 root 开关的，关掉就退化成真机那种权限。
+    """
+    return _adb_shell("id", "-u").strip() == "0"
+
+
+def _direct_attachments(directory: str) -> list[dict]:
+    """附件目录里的 .pdf，按 mtime 从新到旧。每项 {name, size, mtime}。
+
+    `ls -t -1` 一行一名（含空格/中文不会被拆开），`stat -c "%s %Y"` 一次拿大小与
+    时间戳——大小用来判「写完了没」，时间戳用来判「是不是这一轮的」。
+
+    ★ 格式串**必须一起 quote**：`adb shell` 是把参数用空格拼起来交给设备 sh 的，
+      裸传 `"%s %Y"` 会变成 `stat -c %s %Y <路径>`，`%Y` 被当成另一个操作数，
+      stdout 只剩大小 → 解析不出 → **整份文件被跳过，目录看起来是空的**
+      （2026-10-16 实测踩到：明明 `ls` 能看到文件，这个函数却返回 []）。
+    """
+    quoted = shlex.quote(directory)
+    fmt = shlex.quote("%s %Y")
+    out: list[dict] = []
+    for line in _adb_shell("ls", "-t", "-1", quoted).splitlines():
+        name = line.strip()
+        if not name.lower().endswith(".pdf"):
+            continue
+        meta = _adb_shell("stat", "-c", fmt, shlex.quote(f"{directory}/{name}")).split()
+        if len(meta) != 2 or not all(v.isdigit() for v in meta):
+            continue
+        out.append({"name": name, "size": int(meta[0]), "mtime": int(meta[1])})
+    return out
+
+
+def _fetch_via_internal_dir(
+    directory: str, name: str = "", *, max_wait: float = 30.0, max_age: float = 600.0
+) -> tuple[str, bytes]:
+    """云机取件：等最新的 PDF 落盘 → `adb pull` → 返回 `(文件名, 字节)`。
+
+    ★ 与 UC 路径的 before/after diff 不同：那边是**先取快照再点转发**，文件必然
+      在工具调用之后才出现；而这边 Pi 是**先把附件点开**才调工具，文件可能已经在
+      盘上了。所以判据改成「最新一份 + mtime 足够新」，而不是「新出现的」。
+
+    ★ `name` 是候选人姓名，用来**优先挑文件名的**：附件原始文件名通常含姓名
+      （实测「莱顿大学-孔佳悦-销售.pdf」），这一条能挡住「取到别的候选人的简历」
+      这种最坏的错——那也是这类工具最贵的错。
+
+    ★ 落盘是**异步**的，光判「存在」不够——半写的文件也存在。所以要求
+      「大小非 0」且「连续两次探得大小一致」才敢 pull。
+
+    ★ 实测（2026-10-16）：猎聘会在**离开 PDF 查看器后清空这个目录**（我 17:38
+      拉走的那份，17:41 就没了）。所以文件是**易失的**——点完要尽快取，别拖。
+    """
+    if not _adb_rooted():
+        raise RuntimeError(
+            f"设备 adb 不是 root（id -u != 0），读不了 {directory}。"
+            "云机的 root 开关被关了？这条路走不通就得退回真机那种「转发给 UC」的取法。"
+        )
+    if _adb_shell("test", "-d", shlex.quote(directory), "&&", "echo", "yes").strip() != "yes":
+        raise RuntimeError(f"附件目录不存在：{directory}（Pi 真的把附件打开了吗？）")
+
+    started = time.time()
+    deadline = time.monotonic() + max_wait
+    pick: dict | None = None
+    pending: tuple[str, int] | None = None
+    seen: list[str] = []
+    while time.monotonic() < deadline:
+        items = _direct_attachments(directory)
+        if items:
+            seen = [i["name"] for i in items]
+            named = [i for i in items if name and name in i["name"]]
+            pool = named or [i for i in items if started - i["mtime"] <= max_age]
+            if pool:
+                top = max(pool, key=lambda i: i["mtime"])
+                if top["size"] > 0:
+                    if pending == (top["name"], top["size"]):
+                        pick = top  # 连续两次大小一致 → 认为写完了
+                        break
+                    pending = (top["name"], top["size"])
+        time.sleep(1.0)
+
+    if pick is None:
+        raise RuntimeError(
+            f"等不到新的附件 PDF（{max_wait:.0f}s）。目录里现有：{seen or '（空）'}"
+            f"，候选人是「{name or '未提供'}」——要么 Pi 没真的点开附件，"
+            "要么落盘比预期慢（猎聘会在离开查看器后清空该目录，拖久了就没了）。"
+        )
+
+    remote = f"{directory}/{pick['name']}"
+    local = Path(tempfile.gettempdir()) / pick["name"]
+    try:
+        # ★ remote 用**裸字面量**：`adb pull` 走 sync 协议、不经设备 sh，
+        #   套上 shlex.quote 反而会把单引号写进路径。（实测中文+括号的文件名裸传可行。）
+        pull = subprocess.run(
+            [ADB, "pull", remote, str(local)], capture_output=True, timeout=60
+        )
+        if pull.returncode != 0 or not local.exists():
+            raise RuntimeError(f"adb pull 失败：{pull.stderr[:200]!r}")
+        got = local.stat().st_size
+        if got != pick["size"]:
+            raise RuntimeError(f"pull 回来的大小不符：设备 {pick['size']}、本地 {got}")
+        data = local.read_bytes()
+    finally:
+        local.unlink(missing_ok=True)
+
+    if data[:4] != b"%PDF":
+        raise RuntimeError(
+            f"拉到的不是 PDF（文件头 {data[:8]!r}）：{pick['name']}——别把它当简历归档"
+        )
+
+    # 只删**本次取走的这一份**，且 best-effort：不删则目录无界增长、下一轮更难判新旧；
+    # 但删失败不该让整件事失败（简历已经拿到手了）。不删整个目录——可能删掉别人刚落的。
+    _adb_shell("rm", "-f", shlex.quote(remote))
+    return pick["name"], data
+
+
 def _share_target_center(xml: str, keyword: str) -> tuple[int, int] | None:
     """在分享面板 XML 里找 text/content-desc 含 keyword 的目标，返回其标签中心坐标。
 
@@ -1328,21 +1470,14 @@ def _images_differ(a: bytes, b: bytes, threshold_ratio: float = 0.001) -> bool:
     return changed / total > threshold_ratio
 
 
-@mcp.tool()
-def download_attachment(
-    job_id: int,
-    liepin_user_id: str,
-    name: str,
-    job_title: str,
-) -> dict:
-    """从附件 PDF 查看器下载真实简历 PDF 并归档 MinIO（替代逐页截图）。
+def _fetch_via_uc() -> tuple[str, bytes]:
+    """真机取件：点「转发」→ 分享面板选 UC → 轮询 UC 缓存 → pull → `(文件名, 字节)`。
 
-    前置：Pi 已导航到附件 PDF 查看器（「头像→资料页→划到底→附件简历→PDF」路径，
-    右上角有「转发」按钮）。工具自动：点「转发」→ 分享面板选「UC浏览器/PDF阅读器」
-    → 轮询 UC 外部缓存拿到新 PDF → adb pull → 归档 resumes/ 键 → 回写
-    candidate.attachment_keys（receive_resume 守卫证据）→ 清理缓存。
+    前置：Pi 已导航到附件 PDF 查看器（**「头像→资料页→划到底→附件简历→PDF」**路径，
+    右上角才有「转发」；会话里直接点「附件简历」打开的那个没有）。
 
-    返回 {"object_key", "name", "bytes"}；任一步失败抛 RuntimeError。
+    ★ 真机为什么非要绕这一圈：它的 adb 是 `uid=2000(shell)`，读不了 `/data/data/`，
+      拿不到猎聘自己的附件目录。云机有 root，走 `_fetch_via_internal_dir`，不经过这里。
     """
     # 0. 先清空 UC 缓存，避免「该 PDF 已被缓存」导致后续轮询等不到新文件
     _clear_uc_cache()
@@ -1372,23 +1507,44 @@ def download_attachment(
 
     # 4. adb pull 到本地临时文件
     local = Path(tempfile.gettempdir()) / new_name
-    pull = subprocess.run(
-        [ADB, "pull", f"{UC_CACHE_DIR}/{new_name}", str(local)],
-        capture_output=True,
-        timeout=60,
-    )
-    if pull.returncode != 0 or not local.exists():
-        raise RuntimeError(f"pull 失败：{pull.stderr[:200]!r}")
-    nbytes = local.stat().st_size
+    try:
+        pull = subprocess.run(
+            [ADB, "pull", f"{UC_CACHE_DIR}/{new_name}", str(local)],
+            capture_output=True,
+            timeout=60,
+        )
+        if pull.returncode != 0 or not local.exists():
+            raise RuntimeError(f"pull 失败：{pull.stderr[:200]!r}")
+        data = local.read_bytes()
+    finally:
+        # ★ 放进 finally：从前这行在最后、异常路径上不执行，临时文件会留在盘上
+        local.unlink(missing_ok=True)
 
-    # 5. 归档真 PDF（resumes/ 键规范，重名自动加时间戳）
-    data = local.read_bytes()
+    # 7'. 清空 UC 缓存（清空全部 .pdf，避免含空格文件名删不掉）
+    _clear_uc_cache()
+    return new_name, data
+
+
+def _archive_attachment(
+    job_id: int,
+    liepin_user_id: str,
+    name: str,
+    job_title: str,
+    filename: str,
+    data: bytes,
+) -> str:
+    """把取到的 PDF 归档 MinIO 并回写附件证据。**不含任何 adb**，所以可以单测。
+
+    ★ 查不到 candidate 时**必须抛**（2026-10-16 修）：从前这里是 `if cand is not None:`
+      静默跳过、**仍然返回成功**——结果是 MinIO 里躺着一个孤儿对象，而
+      `candidate.attachment_keys` 没有证据，`receive_resume` 照样被拒。
+      查不到通常意味着「设备驱动的那个账号」与「当前生效账号」不是同一个
+      （例如拿 dev 库去跑生产账号上的候选人）。
+    """
     key = _store().put_resume(
         job_id, liepin_user_id, name, job_title, datetime.now().date(), data
     )
 
-    # 6. 回写：candidate.attachment_keys（receive_resume 守卫证据）
-    #     + jc.minio_object_key（前端 has_pdf / resume_url 依赖）
     with SessionLocal() as session:
         acct = _active_account_id(session)
         cand = session.execute(
@@ -1397,25 +1553,57 @@ def download_attachment(
                 Candidate.liepin_user_id == liepin_user_id,
             )
         ).scalar_one_or_none()
-        if cand is not None:
-            cand.attachment_keys = [key]
-            jc = session.execute(
-                select(JobCandidate).where(
-                    JobCandidate.account_id == acct,
-                    JobCandidate.candidate_id == cand.id,
-                    JobCandidate.job_id == job_id,
-                )
-            ).scalar_one_or_none()
-            if jc is not None:
-                jc.minio_object_key = key
-                jc.resume_downloaded_at = datetime.now()
-            session.commit()
+        if cand is None:
+            raise RuntimeError(
+                f"已归档 {key}（{filename}，{len(data)} 字节），但在生效账号 {acct} 下"
+                f"找不到候选人 liepin_user_id={liepin_user_id}——设备驱动的账号与当前"
+                "生效账号很可能不是同一个。MinIO 里会留下一个孤儿对象，需人工清理。"
+            )
+        cand.attachment_keys = [key]
+        jc = session.execute(
+            select(JobCandidate).where(
+                JobCandidate.account_id == acct,
+                JobCandidate.candidate_id == cand.id,
+                JobCandidate.job_id == job_id,
+            )
+        ).scalar_one_or_none()
+        if jc is not None:
+            jc.minio_object_key = key
+            jc.resume_downloaded_at = datetime.now()
+        session.commit()
+    return key
 
-    # 7. 清理本地临时文件 + UC 缓存（清空全部 .pdf，避免含空格文件名删不掉）
-    local.unlink(missing_ok=True)
-    _clear_uc_cache()
 
-    return {"object_key": key, "name": new_name, "bytes": nbytes}
+@mcp.tool()
+def download_attachment(
+    job_id: int,
+    liepin_user_id: str,
+    name: str,
+    job_title: str,
+) -> dict:
+    """把候选人发来的附件简历（真 PDF）取回来并归档 MinIO。
+
+    前置：Pi 已把附件 PDF **打开**（右上角有没有「转发」不重要）。
+
+    取件方式**按设备自动分派**（跟着锚点表走）：
+    - **云手机**（adb 是 root）：直接 `adb pull` 猎聘内部附件目录里最新的那份——
+      不需要转发、不需要 UC、不需要点任何坐标；
+    - **真机**（adb 非 root，读不了 `/data/data`）：走「点转发 → 分享面板选 UC →
+      轮询 UC 缓存 → pull」。真机必须走**「头像→资料页→划到底→附件简历」**那条路，
+      因为只有那条打开出来的 PDF 右上角才有「转发」。
+
+    成功后归档到 `resumes/` 键，并回写 `candidate.attachment_keys`
+    （`receive_resume` 的唯一证据）与 `jc.minio_object_key`。
+
+    返回 {"object_key", "name", "bytes"}；任一步失败抛 RuntimeError。
+    """
+    directory = _direct_attachment_dir()
+    if directory:
+        filename, data = _fetch_via_internal_dir(directory, name)
+    else:
+        filename, data = _fetch_via_uc()
+    key = _archive_attachment(job_id, liepin_user_id, name, job_title, filename, data)
+    return {"object_key": key, "name": filename, "bytes": len(data)}
 
 
 @mcp.tool()

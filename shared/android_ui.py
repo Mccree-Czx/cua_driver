@@ -252,18 +252,30 @@ def dump(retries: int = 3, pause: float = 1.5) -> str:
     ★ 会重试瞬时故障（`error: closed` 这类无线 adb 抖动）。
       **只在这里重试是因为 dump 是幂等的**——`input tap` 绝不能重试，
       重试会变成连点两下。所以重试逻辑只放在读命令上。
+
+    ★★ 每次**先删掉上一份 dump 文件**（2026-10-16 云机实测踩到）：
+      `uiautomator dump` 失败时**不会覆盖**旧文件，`cat` 于是把**上一屏**当成
+      这一屏返回——不报错，但是错的页面。云机上这一下骗过了我：截图明明是消息
+      列表，dump 却返回 PDF 查看器的层级（11 个节点，刚好越过 dump_stable 的
+      min_nodes=10 门槛，于是被当成「像样的结果」收下了）。
+      先删掉旧文件，失败时就拿不到任何东西 → 空结果 → 重试，而不是拿旧屏当真相。
     """
     last: Exception | None = None
     for attempt in range(retries):
         try:
+            shell("rm", "-f", DUMP_PATH)
             shell("uiautomator", "dump", DUMP_PATH)
-            return shell("cat", DUMP_PATH)
+            xml = shell("cat", DUMP_PATH)
         except AdbError as exc:
             last = exc
-            if attempt == retries - 1:
-                break
-            time.sleep(pause)
-            reconnect()
+        else:
+            if xml.strip():
+                return xml
+            last = AdbError("uiautomator dump 没有产出内容（旧文件已先删，不会是旧屏）")
+        if attempt == retries - 1:
+            break
+        time.sleep(pause)
+        reconnect()
     raise last  # type: ignore[misc]
 
 

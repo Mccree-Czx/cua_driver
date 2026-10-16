@@ -5,6 +5,7 @@
 真实招聘账号的手机上。所以这里把优先级钉死，尤其是「不设任何覆盖时与从前一致」。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -56,3 +57,24 @@ def test_missing_map_raises_instead_of_falling_back(monkeypatch, tmp_path):
     monkeypatch.setenv("HR_LOGIN_MAP", str(tmp_path / "does-not-exist.json"))
     with pytest.raises(OSError):
         flows.load_map()
+
+
+def _section(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))["附件简历"]
+
+
+def test_cloud_map_points_at_internal_attachment_dir():
+    """云机表给出「直接取件目录」——adb 是 root，能读 /data/data。"""
+    assert _section(flows.MAP_PATH_CLOUD)["直接取件目录"].startswith("/data/data/")
+
+
+def test_real_phone_map_marks_it_explicitly_null():
+    """真机表必须有这个键、且**显式**为 null。
+
+    `tools_mcp_server._direct_attachment_dir()` 靠「有没有值」分派取件路径。
+    缺键与「有意没有」必须能分辨——真机读不了 /data/data 是有意走 UC 的，
+    将来有人看到缺键会以为是漏配、随手补上一条没验证过的路径。
+    """
+    section = _section(flows.MAP_PATH)
+    assert "直接取件目录" in section
+    assert section["直接取件目录"] is None

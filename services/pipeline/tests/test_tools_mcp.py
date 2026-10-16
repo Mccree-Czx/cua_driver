@@ -232,3 +232,95 @@ class TestCaptureAttachmentPages:
             ).scalar_one()
             assert cand.snapshot_object_key == result["snapshot_object_key"]
             assert cand.attachment_keys == result["object_keys"]  # 附件证据落库（守卫依赖）
+
+
+class _FakeResumeStore:
+    """只实现 put_resume——`_archive_attachment` 只用这一个方法。"""
+
+    def __init__(self):
+        self.calls: list[tuple[str, int]] = []
+
+    def put_resume(self, job_id, liepin_user_id, name, job_title, date, data):
+        key = f"resumes/{job_id}/{liepin_user_id}/{name}.pdf"
+        self.calls.append((key, len(data)))
+        return key
+
+
+class TestArchiveAttachment:
+    """归档层：不含 adb，所以能在这里钉死（从前整条 download_attachment 零覆盖）。"""
+
+    def test_writes_object_key_and_evidence(self, jc_factory, monkeypatch):
+        jc = jc_factory()
+        fake = _FakeResumeStore()
+        monkeypatch.setattr(tools, "_store", lambda: fake)
+
+        key = tools._archive_attachment(
+            jc.job_id, jc.candidate.liepin_user_id, "孔佳悦", "海外销售",
+            "莱顿大学-孔佳悦-销售.pdf", b"%PDF-1.7 x",
+        )
+
+        assert fake.calls == [(key, 10)]
+        with SessionLocal() as session:
+            cand = session.get(models.Candidate, jc.candidate_id)
+            assert cand.attachment_keys == [key]  # receive_resume 的唯一证据
+            row = session.get(models.JobCandidate, jc.id)
+            assert row.minio_object_key == key
+            assert row.resume_downloaded_at is not None
+
+    def test_unknown_candidate_raises_instead_of_silent_success(self, jc_factory, monkeypatch):
+        """回归（2026-10-16 修）：从前是 `if cand is not None` 静默跳过、**仍返回成功**。
+
+        后果：MinIO 里躺着孤儿对象、candidate 没有附件证据，`receive_resume` 照样被拒，
+        而调用方以为下载成功了。典型触发场景是「设备驱动的账号 ≠ 当前生效账号」
+        （例如拿 dev 库去跑生产账号上的候选人）。
+        """
+        jc = jc_factory()
+        monkeypatch.setattr(tools, "_store", lambda: _FakeResumeStore())
+
+        with pytest.raises(RuntimeError, match="找不到候选人"):
+            tools._archive_attachment(
+                jc.job_id, "no-such-liepin-id", "某人", "岗位", "x.pdf", b"%PDF-1.7"
+            )
+
+
+class TestDownloadDispatch:
+    """取件按设备分派：表里有「直接取件目录」就直取，否则走 UC（真机）。"""
+
+    _CLOUD_DIR = "/data/data/com.lietou.mishu/app_flutter/attachment"
+
+    def _stub(self, monkeypatch, calls: dict) -> None:
+        def _direct(directory, name=""):
+            calls["direct"] = (directory, name)
+            return "云机.pdf", b"%PDF-1.7"
+
+        def _uc():
+            calls["uc"] = True
+            return "真机.pdf", b"%PDF-1.7"
+
+        monkeypatch.setattr(tools, "_fetch_via_internal_dir", _direct)
+        monkeypatch.setattr(tools, "_fetch_via_uc", _uc)
+        monkeypatch.setattr(tools, "_store", lambda: _FakeResumeStore())
+
+    def test_uses_internal_dir_when_map_has_one(self, jc_factory, monkeypatch):
+        jc = jc_factory()
+        calls: dict = {}
+        self._stub(monkeypatch, calls)
+        monkeypatch.setattr(tools, "_direct_attachment_dir", lambda: self._CLOUD_DIR)
+
+        out = tools.download_attachment(jc.job_id, jc.candidate.liepin_user_id, "孔佳悦", "海外销售")
+
+        assert calls == {"direct": (self._CLOUD_DIR, "孔佳悦")}  # 姓名要传下去，用来挑文件名
+        assert out["name"] == "云机.pdf"
+        assert out["object_key"].startswith("resumes/")
+
+    def test_falls_back_to_uc_when_map_says_null(self, jc_factory, monkeypatch):
+        """真机表里那个键是 null → 必须走 UC，而不是拿一个空目录去直取。"""
+        jc = jc_factory()
+        calls: dict = {}
+        self._stub(monkeypatch, calls)
+        monkeypatch.setattr(tools, "_direct_attachment_dir", lambda: None)
+
+        out = tools.download_attachment(jc.job_id, jc.candidate.liepin_user_id, "孔佳悦", "海外销售")
+
+        assert calls == {"uc": True}
+        assert out["name"] == "真机.pdf"

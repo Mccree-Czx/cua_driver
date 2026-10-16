@@ -148,6 +148,13 @@
     }
   },
 
+  "附件简历": {
+    "直接取件目录": null,
+    "★为什么不填": "真机的 adb 是 **uid=2000(shell)**（实测 `adb shell id`），读 /data/data 直接 Permission denied，拿不到猎聘自己的附件目录。所以真机只能走「点转发 → 分享面板选 UC → 轮询 UC 外部缓存 → pull」那条老路（坐标见 tools_mcp_server 的 PDF_FORWARD 等常量）。",
+    "★null 是有意的": "这个键**显式写 null 而不是干脆不写**：tools_mcp_server._direct_attachment_dir() 靠「有没有值」分派——缺键与『有意没有』必须能分辨，否则将来有人会以为这是漏配而随手补上一条没验证过的路径。",
+    "★云机对照": "云机（adb 是 root）这份是 agent/login_map.cloud.json，那里这个键有值。"
+  },
+
   "rollback_verified": null,
   "rollback_note": "回滚能力尚未在真机验证过。验证前不允许自动登出。"
 }
