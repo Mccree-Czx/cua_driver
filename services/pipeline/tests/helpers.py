@@ -13,6 +13,14 @@ TEST_DATABASE_URL = os.environ.get(
     "mysql+pymysql://hr_user:hr_dev_pw@127.0.0.1:3306/hr_workbuddy_test",
 )
 
+# ★ 2026-10-16 补：光钉住 DATABASE_URL **不够**——`REDIS_URL` 与 `MINIO_ENDPOINT`
+#   是**跟着 .env 走**的。而云机执行端（10.99.40.66）的 `.env` 指生产 197，
+#   那台机器上也会跑 pytest：不钉住就会写**生产 Redis 的风控键与配额桶**
+#   （里面还有 BOSS 在用的 `baidu-ocr-token`），还会往生产 MinIO 传对象。
+#   与 TEST_DATABASE_URL 同理，必须在导入 `app.*` 之前钉死。
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+TEST_MINIO_ENDPOINT = os.environ.get("TEST_MINIO_ENDPOINT", "127.0.0.1:9000")
+
 
 def run_alembic(*args: str) -> subprocess.CompletedProcess:
     """在 pipeline 目录下以子进程运行 alembic。
