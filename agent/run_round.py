@@ -122,6 +122,45 @@ def login_in_flight() -> bool:
         return False
 
 
+def ensure_device() -> str | None:
+    """跑轮次前把「用哪台设备」定死。返回 None = 可以跑；否则返回拒跑原因。
+
+    按「这台机器是不是专门驱动云机的」分三档：
+
+    1. **已设 `ANDROID_SERIAL`** → 直接用，什么都不做。
+    2. **设了 `HR_CLOUD_PHONE=1`**（.66 那台云机专用执行端）→ 用
+       `discover_cloud_phone()` 找云机**当前**的端点，写进环境。
+       ★ 云机的 adb 端口是**动态**的（实测一次会话换了三次），写死必然失效。
+       ★ **找不到就拒跑这一轮，不猜**。猜错不是「少干一轮」——`flows.map_path()`
+         会因此走进「不含冒号 → 真机表」那条分支，**拿 1080x2244 的坐标去点
+         720x1280 的屏**，而且全程不报错。
+    3. **都不是**（Mac 那台跑真机的）→ 保持原样：不传 `-s`，交给 adb 挑唯一那台。
+       ★ 这一档**必须保持老行为**：Mac 上没有多多云客户端，`discover_cloud_phone()`
+         永远返回 None；要是把它也变成「拒跑」，等于把正在跑的生产停掉。
+    """
+    import phone  # 延迟导入：避免改变本脚本的导入期行为
+
+    if os.environ.get("ANDROID_SERIAL"):
+        return None
+    if os.environ.get("HR_CLOUD_PHONE") != "1":
+        return None
+
+    endpoint = phone.discover_cloud_phone()
+    if not endpoint:
+        return (
+            "HR_CLOUD_PHONE=1 但找不到云机的 adb 端点（多多云客户端没开？云机没开机？）。"
+            "不猜设备：猜错会让 map_path() 选到真机锚点表，拿 1080x2244 的坐标点云机的屏"
+        )
+
+    # ★ 两行都要，缺一不可：
+    #   - 环境变量是给**子进程**的（Pi → mobile-mcp / hr-tools，它们靠它选设备与锚点表）
+    #   - use_device() 是给**本进程**的：`android_ui._DEVICE` 在**导入时**读一次环境变量，
+    #     此后再改 os.environ 对它已经无效了
+    os.environ["ANDROID_SERIAL"] = endpoint
+    phone.use_device(endpoint)
+    return None
+
+
 def device_problem() -> str | None:
     """手机配置有问题吗？有问题返回一句原因，没问题返回 None。
 
@@ -497,6 +536,12 @@ def main() -> int:
     # 两者都可跨工作窗口运行
     if name not in WINDOW_EXEMPT_ROUNDS and not within_window(now):
         print(f"[skip] {name}: 工作窗口外（{now:%H:%M}）")
+        return 0
+    # 先把「用哪台设备」定死（云机端口是动态的，见 ensure_device 的三档说明），
+    # 再看设备配置有没有问题。顺序不能反：ensure_device 可能刚把 ANDROID_SERIAL 补上。
+    device_denied = ensure_device()
+    if device_denied:
+        print(f"[skip] {name}: {device_denied}")
         return 0
     # 手机配置不对就别启动 Pi——那种状态下每条 adb 命令都会失败，而 Pi 会照跑一轮
     problem = device_problem()
