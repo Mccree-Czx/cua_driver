@@ -1,10 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Alert, Empty, Table, Tag, Typography } from "antd";
+import { Empty, Table } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import { OutcomeCapsule } from "../status";
 
-/** 轮次运行记录。纯只读——猎聘那边也是只读表。 */
+/**
+ * 运行日志。**结构照猎聘**（`.page talent-page` + page-heading + 表格）。
+ *
+ * ★ 结果那一列的取值集是 **BOSS 自己的**（`success` / `failed_needs_manual` /
+ *   `acked` / `timeout` / `skipped`），跟猎聘不完全一样——猎聘有 `degraded`
+ *   （打分服务降级），BOSS 没有打分所以也没有它。映射表在 `status.tsx`
+ *   的 `OUTCOME_CAPSULE` 里，**照搬猎聘那张会得到「有值的没颜色」**。
+ */
 type Row = {
   id: number;
   task_id: string;
@@ -18,69 +26,66 @@ type Row = {
   created_at: string;
 };
 
-/** 结果色。★ `failed_needs_manual` 与 `acked` 要区分开：前者还没人管。 */
-const OUTCOME_COLOR: Record<string, string> = {
-  success: "green",
-  failed_needs_manual: "red",
-  acked: "blue",
-  timeout: "orange",
-  skipped: "default",
-};
-
 export default function LogsPage() {
-  const [rows, setRows] = useState<Row[]>([]);
+  const [items, setItems] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/hr/tasklogs")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((d) => setRows(d.items))
-      .catch((e) => setErr(String(e)))
+    fetch("/api/hr/tasklogs?limit=500")
+      .then((r) => r.json())
+      .then((b) => setItems(b.items ?? []))
+      .catch(() => setItems([]))
       .finally(() => setLoading(false));
   }, []);
 
   const columns: ColumnsType<Row> = [
     {
-      title: "时间", dataIndex: "created_at", width: 170,
-      render: (t: string) => t.slice(0, 19).replace("T", " "),
+      title: "时间", dataIndex: "created_at", key: "created_at", width: 170,
+      render: (v: string | null) => (v ? v.replace("T", " ").slice(0, 19) : "—"),
     },
-    { title: "轮次", dataIndex: "round_name", width: 140 },
+    // ★ 猎聘这一列是 `task_id`（原子任务）。BOSS 的任务粒度是**轮次**，
+    //   所以显示轮次名 + task_id——名字比一串 uuid 有用。
     {
-      title: "结果", dataIndex: "outcome", width: 160,
-      render: (o: string) => <Tag color={OUTCOME_COLOR[o] ?? "default"}>{o}</Tag>,
-    },
-    { title: "轮次次数", dataIndex: "attempt", width: 100 },
-    {
-      title: "耗时", dataIndex: "duration", width: 100,
-      render: (d: number) => (d ? `${d.toFixed(1)}s` : "—"),
-    },
-    {
-      title: "tokens / 花费", width: 160,
-      render: (_: unknown, r: Row) =>
-        r.tokens || r.cost ? `${r.tokens} / ¥${r.cost.toFixed(4)}` : "—",
+      title: "任务", key: "task", width: 240, ellipsis: true,
+      render: (_: unknown, r: Row) => (
+        <span>
+          {r.round_name || "—"}
+          <span style={{ color: "var(--text-muted)", fontSize: 12 }}>　{r.task_id}</span>
+        </span>
+      ),
     },
     {
-      title: "说明", dataIndex: "note", ellipsis: true,
-      render: (n: string) => <Typography.Text type="secondary">{n || "—"}</Typography.Text>,
+      title: "结果", dataIndex: "outcome", key: "outcome", width: 150,
+      render: (v: string) => <OutcomeCapsule outcome={v} />,
     },
+    { title: "尝试", dataIndex: "attempt", key: "attempt", width: 60 },
+    { title: "tokens", dataIndex: "tokens", key: "tokens", width: 90 },
+    {
+      title: "耗时(s)", dataIndex: "duration", key: "duration", width: 90,
+      render: (v: number) => (v ? Math.round(v) : 0),
+    },
+    { title: "注记", dataIndex: "note", key: "note", ellipsis: true, render: (v: string) => v || "—" },
   ];
 
   return (
-    <>
-      <h2 className="page-title">运行日志</h2>
-      {err && <Alert type="error" showIcon message={err} style={{ marginBottom: 16 }} />}
-      {!loading && rows.length === 0 && !err && <Empty description="还没有轮次记录" />}
-      {rows.length > 0 && (
-        <Table<Row>
-          rowKey="id"
-          size="small"
-          loading={loading}
-          columns={columns}
-          dataSource={rows}
-          pagination={{ pageSize: 50, showSizeChanger: false }}
-        />
-      )}
-    </>
+    <div className="page talent-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Logs</p>
+          <h2>运行日志</h2>
+          <p>轮次执行与成本记录</p>
+        </div>
+      </div>
+
+      <Table
+        rowKey="id"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={items}
+        locale={{ emptyText: <Empty description="还没有轮次记录" /> }}
+        pagination={{ pageSize: 50, showSizeChanger: false }}
+      />
+    </div>
   );
 }

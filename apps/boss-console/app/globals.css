@@ -1179,20 +1179,6 @@ body {
    才好合到同一个门户里）。下面这些类只有 BOSS 这边用。
    —————————————————————————————————————————————————————————————— */
 
-.page-title {
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin: 0 0 16px;
-}
-
-/* 卡片底部那行小字 */
-.stat-hint {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
 /* 展开的 JD 正文。★ 必须 overflow-x:auto —— JD 里常有超长行，
    不裹住的话会把整个页面撑出横向滚动条。 */
 .jd-pre {

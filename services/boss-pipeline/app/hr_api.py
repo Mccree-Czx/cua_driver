@@ -53,6 +53,13 @@ def overview(session: SessionDep) -> dict[str, Any]:
             "resume_received": n(models.JobCandidate, models.JobCandidate.status == "resume_received"),
             "closed": n(models.JobCandidate, models.JobCandidate.status == "closed"),
         },
+        #: 按状态逐个数。★ 照猎聘的 `status_counts`——它驾驶舱的「状态分布」栏
+        #: 就是拿这个渲染成一排胶囊。列**全部 11 个态**（哪怕是 0），
+        #: 这样前端不用自己拼、也不会因为某个态没人而少一格。
+        "status_counts": {
+            s.value: n(models.JobCandidate, models.JobCandidate.status == s.value)
+            for s in CandidateStatus
+        },
         "conversations": {
             "total": n(models.Conversation),
             "unread": n(models.Conversation, models.Conversation.unread > 0),
@@ -350,7 +357,32 @@ def tasklogs(session: SessionDep, limit: int = Query(200, ge=1, le=1000)) -> dic
 
 @router.get("/daily")
 def daily(session: SessionDep, days: int = Query(14, ge=1, le=90)) -> dict[str, Any]:
-    """近 N 天。★ BOSS 这边没有「收到简历」这种明确漏斗，所以按**消息**和**状态**算。"""
+    """近 N 天。
+
+    ## ★ 列名照猎聘，数据是 BOSS 能算出来的；算不出来的给 `null`
+
+    前端按猎聘的表头渲染（日期/新增/直索要/打招呼/收到简历/转化率/转人工），
+    `null` 显示成「—」。**不硬造数字**——一个编出来的 0 比一个「—」有害得多。
+
+    | 列 | BOSS 能不能算 | 依据 |
+    |---|---|---|
+    | 新增 | ✅ | `job_candidate.created_at` |
+    | 打招呼 | ✅ | `greet_log.greeted_at` |
+    | 转人工 | ✅ | `task_log.failed_needs_manual` |
+    | 直索要 | ❌ 恒 `null` | BOSS 没有「直索要」这一步（它的「求简历」是聊天页上的动作，也没采到时间） |
+    | 收到简历 | ❌ 恒 `null` | BOSS 没有「收到简历」这个事件，消息里也判断不出来 |
+    | 转化率 | ❌ 恒 `null` | 依赖上面那个数 |
+
+    另外**多给两个 BOSS 自己的数**（`messages_in` / `messages_out`）：
+    它们不占表头，放在表格 footer 里显示——这是 BOSS 最实在的每日指标。
+    """
+
+    def count(model: Any, *where: Any, start: datetime, end: datetime, field: Any) -> int:
+        stmt = select(func.count()).select_from(model).where(field >= start).where(field < end)
+        for clause in where:
+            stmt = stmt.where(clause)
+        return session.scalar(stmt) or 0
+
     today = date.today()
     out = []
     for i in range(days - 1, -1, -1):
@@ -359,30 +391,35 @@ def daily(session: SessionDep, days: int = Query(14, ge=1, le=90)) -> dict[str, 
         end = start + timedelta(days=1)
         out.append({
             "date": day.isoformat(),
-            "messages_in": session.scalar(
-                select(func.count()).select_from(models.Message)
-                .where(models.Message.direction == "in")
-                .where(models.Message.first_seen_at >= start)
-                .where(models.Message.first_seen_at < end)
-            ) or 0,
-            "messages_out": session.scalar(
-                select(func.count()).select_from(models.Message)
-                .where(models.Message.direction == "out")
-                .where(models.Message.first_seen_at >= start)
-                .where(models.Message.first_seen_at < end)
-            ) or 0,
-            "greeted": session.scalar(
-                select(func.count()).select_from(models.GreetLog)
-                .where(models.GreetLog.greeted_at >= start)
-                .where(models.GreetLog.greeted_at < end)
-            ) or 0,
+            "new_jc": count(models.JobCandidate, start=start, end=end,
+                            field=models.JobCandidate.created_at),
+            "greet_request": count(models.GreetLog, start=start, end=end,
+                                   field=models.GreetLog.greeted_at),
+            "manual": count(models.TaskLog,
+                            models.TaskLog.outcome == "failed_needs_manual",
+                            start=start, end=end, field=models.TaskLog.created_at),
+            # —— BOSS 上算不出来的三列 ——
+            "direct_request": None,
+            "received": None,
+            "conversion": None,
+            # —— 表头之外的补充（footer 里显示）——
+            "messages_in": count(models.Message, models.Message.direction == "in",
+                                 start=start, end=end, field=models.Message.first_seen_at),
+            "messages_out": count(models.Message, models.Message.direction == "out",
+                                  start=start, end=end, field=models.Message.first_seen_at),
         })
+
+    def total(key: str) -> int:
+        return sum(d[key] or 0 for d in out)
+
     return {
         "days": out,
         "totals": {
-            "messages_in": sum(d["messages_in"] for d in out),
-            "messages_out": sum(d["messages_out"] for d in out),
-            "greeted": sum(d["greeted"] for d in out),
+            "new_jc": total("new_jc"), "greet_request": total("greet_request"),
+            "manual": total("manual"), "messages_in": total("messages_in"),
+            "messages_out": total("messages_out"),
+            # 依赖 null 列的合计也是 null，不假装是 0
+            "received": None, "conversion": None,
         },
     }
 

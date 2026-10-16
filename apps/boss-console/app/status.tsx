@@ -65,3 +65,61 @@ export const REACHABLE_STATUSES = [
   "new", "greeted", "resume_requested", "awaiting_resume",
   "resume_received", "no_response", "hr_reviewed", "closed",
 ] as const;
+
+/**
+ * 轮次结果 → 胶囊配色。
+ *
+ * ★ 这张表是 **BOSS 自己的**——猎聘那份（`success/failed_needs_manual/failed/degraded`）
+ *   跟 BOSS 的取值集不一样：BOSS 没有 `degraded`（那是打分服务的降级态），
+ *   但多了 `acked`（人工销过账）、`timeout`（轮次超时）、`skipped`（闸门拦下）。
+ *   照搬会得到「有值的没颜色、有颜色的没值」。
+ */
+export const OUTCOME_CAPSULE: Record<string, string> = {
+  success: "status-capsule-qualified",
+  failed_needs_manual: "status-capsule-pending",
+  acked: "status-capsule-running",
+  timeout: "status-capsule-pending",
+  skipped: "status-capsule-queued",
+  failed: "status-capsule-rejected",
+};
+
+export function outcomeCapsuleClass(outcome: string): string {
+  return OUTCOME_CAPSULE[outcome] ?? "status-capsule-rejected";
+}
+
+/** 胶囊：状态。★ 全站统一用它，不再用 antd `<Tag>`（对齐猎聘的观感）。 */
+export function StatusCapsule({ status }: { status: string }) {
+  return (
+    <span className={`capsule-pill ${statusCapsuleClass(status)}`}>
+      <span className="capsule-pill-dot" />
+      {statusLabel(status)}
+    </span>
+  );
+}
+
+/** 胶囊：轮次结果。 */
+export function OutcomeCapsule({ outcome }: { outcome: string }) {
+  return (
+    <span className={`capsule-pill ${outcomeCapsuleClass(outcome)}`}>
+      <span className="capsule-pill-dot" />
+      {outcome}
+    </span>
+  );
+}
+
+/** 星级。★ BOSS 还没打分，所以现在只会渲染出一排空位——**结构先对齐**。 */
+export function StarRating({ score }: { score: number | null }) {
+  if (!score) return <span className="stars">{"☆☆☆☆☆"}</span>;
+  return (
+    <span className="stars">
+      {"★".repeat(score)}
+      {"☆".repeat(Math.max(0, 5 - score))}
+    </span>
+  );
+}
+
+/** 时间戳统一格式（猎聘用的是 `T`→空格、截到分）。 */
+export function fmtTime(v: string | null | undefined): string {
+  if (!v) return "—";
+  return v.replace("T", " ").slice(0, 16);
+}

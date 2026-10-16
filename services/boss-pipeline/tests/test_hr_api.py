@@ -241,9 +241,37 @@ def test_alerts_shows_login_gate(client, seeded):
 # ——— 日报 ———
 
 def test_daily(client, seeded):
+    """列名照猎聘，数据是 BOSS 能算出来的；**算不出来的恒为 null，不假装是 0**。
+
+    前端把 null 显示成「—」。一个编出来的 0 比一个「—」有害得多——
+    前者看起来像「今天真的没人投」。
+    """
     body = client.get("/api/hr/daily?days=7").json()
     assert len(body["days"]) == 7
-    assert set(body["totals"]) == {"messages_in", "messages_out", "greeted"}
+    assert set(body["totals"]) == {
+        "new_jc", "greet_request", "manual", "messages_in", "messages_out",
+        "received", "conversion",
+    }
+
+    # BOSS 上算不出来的三列：**必须恒为 null**，不是 0
+    for d in body["days"]:
+        assert d["direct_request"] is None, "BOSS 没有「直索要」这一步，不该编出个数"
+        assert d["received"] is None, "BOSS 没有「收到简历」事件"
+        assert d["conversion"] is None
+    assert body["totals"]["received"] is None
+    assert body["totals"]["conversion"] is None
+
+
+def test_daily_counts_what_boss_can(client, session, seeded):
+    """能算的三列要真的算出来。"""
+    _, _, jc = seeded                    # seeded 建了一条 jc（今天）
+    hr_tools.tasklog_add(session, task_id="t-d", round_name="main_round",
+                         outcome="failed_needs_manual", note="掉登录")
+
+    day = client.get("/api/hr/daily?days=1").json()["days"][0]
+    assert day["new_jc"] == 1, "今天的 jc 应当被数到"
+    assert day["manual"] == 1, "今天的 failed_needs_manual 应当被数到"
+    assert day["greet_request"] == 0, "还没打过招呼"
 
 
 # ——— 评分偏好（保留形状，暂无消费者）———

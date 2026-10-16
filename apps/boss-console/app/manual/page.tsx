@@ -1,20 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Button, Empty, Input, Space, Table, Tag, Typography, message } from "antd";
+import { Button, Empty, Table, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import { OutcomeCapsule, fmtTime } from "../status";
 
 /**
- * 人工队列。
+ * 人工队列。**结构照猎聘**（`.page talent-page` + 计数行 + 表格）。
  *
- * ★ **BOSS 上这一页有真内容**（猎聘那边其实是半成品——它的「重跑」端点
- *   根本不存在，按钮早删了）。BOSS 落在这里的是：
- *
- * - **手机停在风控关卡前等人**（滑块 / 短信 / 人脸）——这是最常见的
- * - 采集失败（职位/候选人/会话抓一半）
- * - 轮次超时
- *
- * 处置是 `ack`：**不删行**，把 outcome 改成 acked 并追加备注，留痕。
+ * ★ 这一页是**唯一不完全照搬**的：猎聘那边其实是个半成品——它的「重跑」按钮
+ *   因为后端端点从来不存在，2026-10-15 就被删了，页面只剩一个只读表。
+ *   而 BOSS 这边队列里是**真有东西**的（手机停在风控关卡前等人、采集失败、
+ *   轮次超时），所以保留「已处理」按钮——没它就没法销账。
  */
 type Item = {
   id: number;
@@ -26,64 +23,56 @@ type Item = {
 };
 
 export default function ManualQueuePage() {
-  const [rows, setRows] = useState<Item[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [note, setNote] = useState("");
-  const [busy, setBusy] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(() => {
     setLoading(true);
-    try {
-      const r = await fetch("/api/hr/manual-queue");
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      setRows((await r.json()).items);
-      setErr(null);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setLoading(false);
-    }
+    fetch("/api/hr/manual-queue?limit=50")
+      .then((r) => r.json())
+      .then((b) => setItems(b.items ?? []))
+      .catch(() => setItems([]))
+      .finally(() => setLoading(false));
   }, []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  useEffect(load, [load]);
 
   async function ack(taskId: string) {
-    setBusy(taskId);
-    try {
-      const r = await fetch(`/api/hr/manual-queue/${taskId}/ack`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ note }),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      message.success("已确认");
-      setNote("");
-      await load();
-    } catch (e) {
-      message.error(String(e));
-    } finally {
-      setBusy(null);
-    }
+    const r = await fetch(`/api/hr/manual-queue/${taskId}/ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ note: "工作台已确认" }),
+    });
+    if (r.ok) message.success("已注记（acked）");
+    else message.error(`注记失败（HTTP ${r.status}）`);
+    load();
   }
 
   const columns: ColumnsType<Item> = [
-    { title: "轮次", dataIndex: "round_name", width: 140 },
     {
-      title: "说明", dataIndex: "note",
-      render: (n: string) => <Typography.Text>{n || "（没写原因）"}</Typography.Text>,
-    },
-    { title: "task_id", dataIndex: "task_id", width: 220, ellipsis: true },
-    {
-      title: "时间", dataIndex: "created_at", width: 170,
-      render: (t: string) => t.slice(0, 16).replace("T", " "),
+      title: "时间", dataIndex: "created_at", width: 160,
+      render: (v: string) => fmtTime(v),
     },
     {
-      title: "操作", width: 110,
+      // ★ 猎聘这一列是原子任务类型（check_attachment…）。BOSS 没有那套任务队列，
+      //   它有的是**轮次名**（main_round / daily_round）——同样是「哪类任务出的事」。
+      title: "任务类型", dataIndex: "round_name", key: "round_name",
+      render: (v: string) => v || "—",
+    },
+    {
+      title: "候选人", key: "candidate",
+      // BOSS 的 TaskLog 没挂到候选人上（它不是按候选人入队的）——照约定显示「—」
+      render: () => "—",
+    },
+    {
+      title: "状态", dataIndex: "outcome", width: 170,
+      render: (v: string) => <OutcomeCapsule outcome={v} />,
+    },
+    { title: "注记", dataIndex: "note", render: (v: string) => v || "—" },
+    {
+      title: "操作", width: 100,
       render: (_: unknown, r: Item) => (
-        <Button size="small" loading={busy === r.task_id} onClick={() => void ack(r.task_id)}>
+        <Button size="small" onClick={() => void ack(r.task_id)}>
           已处理
         </Button>
       ),
@@ -91,42 +80,31 @@ export default function ManualQueuePage() {
   ];
 
   return (
-    <>
-      <h2 className="page-title">人工队列</h2>
+    <div className="page talent-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Manual Queue</p>
+          <h2>人工队列</h2>
+          <p>需要人工介入处理的任务</p>
+        </div>
+      </div>
 
-      <Alert
-        type="info"
-        showIcon
-        style={{ marginBottom: 16 }}
-        message="这里放的是机器做不了的事"
-        description="最常见的是「手机停在滑块/短信/人脸认证页上」——那三关必须你本人在手机上过。过完之后回到这里点「已处理」。"
+      <div style={{ color: "var(--text-secondary)", fontSize: 12, marginBottom: 12 }}>
+        {items.length} 项（failed_needs_manual 落账）
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          最常见的是「手机停在滑块/短信/人脸认证页上」——那三关必须你本人在手机上过。
+        </Typography.Text>
+      </div>
+
+      <Table
+        rowKey="id"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={items}
+        locale={{ emptyText: <Empty description="没有待处理的事" /> }}
+        pagination={{ pageSize: 50, showSizeChanger: false }}
       />
-
-      <Space style={{ marginBottom: 16 }} wrap>
-        <Input
-          placeholder="处理备注（留下干嘛了，方便回溯）"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          style={{ width: 360 }}
-        />
-        <Button onClick={() => void load()}>刷新</Button>
-      </Space>
-
-      {err && <Alert type="error" showIcon message={err} style={{ marginBottom: 16 }} />}
-      {!loading && rows.length === 0 && !err && (
-        <Empty description="没有待处理的事 —— 挺好" />
-      )}
-
-      {rows.length > 0 && (
-        <Table<Item>
-          rowKey="id"
-          size="middle"
-          loading={loading}
-          columns={columns}
-          dataSource={rows}
-          pagination={{ pageSize: 20, showSizeChanger: false }}
-        />
-      )}
-    </>
+    </div>
   );
 }
