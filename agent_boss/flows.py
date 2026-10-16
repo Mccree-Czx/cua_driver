@@ -30,6 +30,7 @@ BOSS 上这些动作**会给真实的人/账号产生不可逆后果**：
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -455,11 +456,147 @@ def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
     return detail
 
 
+# —— 打招呼（写操作，默认干跑）——
+
+#: 打过招呼的账本。★ 防的是「同一个人被打两次招呼」——那对真实的人是打扰。
+GREETED_PATH = Path(__file__).resolve().parent / ".greeted.json"
+
+
+def _load_greeted() -> dict[str, Any]:
+    if GREETED_PATH.exists():
+        try:
+            return json.loads(GREETED_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+def _save_greeted(data: dict[str, Any]) -> None:
+    GREETED_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _greet_key(detail: dict[str, Any]) -> str:
+    """账本主键。
+
+    ★ BOSS 的候选人卡片与详情页里**没有稳定的候选人 id**（猎聘那边至少 logcat 里有
+      `oppositeUserId`，这里连那个都没有），所以只能用「姓名 + 当前公司」拼一个。
+      重名 + 同公司的概率很低，但**不是零**——所以账本只是「防重复」的第一道，
+      真正的保证是**同一次会话里不重复点**。
+    """
+    return f"{detail.get('name','')}｜{detail.get('job_and_company','')}"
+
+
+def _find_greet_button(xml: str) -> dict[str, Any] | None:
+    """严格定位「立即沟通」。三重条件，缺一不可。
+
+    ★ 这是**唯一**会给真实的人发消息的按钮，宁可找不到也不能找错：
+      必须 class=Button、文字精确等于「立即沟通」、且 clickable=true。
+    """
+    return next(
+        (
+            n for n in phone.nodes(xml)
+            if n["cls"] == "Button" and phone.label(n) == "立即沟通" and n["clickable"]
+        ),
+        None,
+    )
+
+
+def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
+    """给候选人打招呼。★ **写操作**：会给真实的人发一条消息。
+
+    ## 行为
+
+    实测（2026-10-16）：点「立即沟通」会**自动发送一条账号预设的招呼语**
+    （本次见到的是「您好，有兴趣的话可以发一份简历看看，我将转交业务部门。」），
+    然后落到 `ChatRoomActivity`。所以「打招呼」在这里就是**一步**，
+    招呼语**不能按候选人定制**。
+
+    ## 两道保险
+
+    1. **默认干跑**：不传 `allow_send=True`，就只走到按钮前、把「将要发给谁」
+       打出来，**不点**。调用方必须先干跑、确认目标无误，再真发。
+    2. **本地账本**：打过招呼的人记在 `.greeted.json`，同一个「姓名｜公司」
+       第二次直接跳过。★ 但这不是绝对保险——见 `_greet_key` 的注释。
+
+    ## 做完之后
+
+    不回读聊天页内容（那会带出双方的全部对话），只确认**落在聊天页**、
+    且**有一条我们发出去的消息**。然后退回主界面。
+
+    前提：`candidate` 必须**此刻就在牛人列表的当前屏**上
+    （列表往回滚会刷新，见文件里那段注释）。
+    """
+    xml = goto_tab("牛人")
+    card = phone.find_exact(xml, candidate)
+    if not card:
+        raise FlowMismatch(
+            "打招呼", f"「{candidate}」不在当屏（本函数不会往回滚去找，那会刷新推荐流）",
+            phone.texts(xml),
+        )
+
+    x1, y1, x2, y2 = card["bounds"]
+    phone.tap((x1 + 40, (y1 + y2) // 2), pause=8)
+    xml = phone.dump_stable()
+    _guard_risk(xml, "打招呼")
+    _guard_not_paywall(xml, "打招呼")
+    if "ViewGeekResume" not in phone.current_activity():
+        raise FlowMismatch("打招呼", "没进到候选人详情页", phone.texts(xml))
+
+    def one(rid: str) -> str:
+        node = phone.find_rid(xml, rid)
+        return phone.label(node).strip() if node else ""
+
+    detail = {"name": one("tv_geek_name"), "job_and_company": one("tv_job_and_com")}
+    key = _greet_key(detail)
+
+    book = _load_greeted()
+    if key in book:
+        phone.tap(tuple(_m("候选人详情", "back", "center")), pause=5)
+        return {"ok": True, "skipped": "already_greeted", "candidate": key,
+                "first_at": book[key].get("at")}
+
+    button = _find_greet_button(xml)
+    if button is None:
+        raise FlowMismatch("打招呼", "候选人详情页上没有「立即沟通」按钮", phone.texts(xml))
+
+    if not allow_send:
+        phone.tap(tuple(_m("候选人详情", "back", "center")), pause=5)
+        return {
+            "ok": True, "dry_run": True, "candidate": key,
+            "would_tap": button["center"], "button_bounds": button["bounds"],
+            "note": "干跑：没有点。确认目标无误后传 allow_send=True 才真发。",
+        }
+
+    # ——— 真发 ———
+    phone.tap_node(button, pause=12)
+    after = phone.dump_stable()
+    in_chat = "ChatRoomActivity" in phone.current_activity()
+    outgoing = [phone.label(n) for n in phone.nodes(after)
+                if n["rid"].endswith("tv_content") and phone.label(n)]
+    if not in_chat:
+        raise FlowMismatch("打招呼", "点了「立即沟通」但没进聊天页，**不知是否发出**",
+                           phone.texts(after))
+
+    book[key] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "job": detail.get("job_and_company", "")}
+    _save_greeted(book)
+
+    # 从聊天页回到主界面（BACK：聊天页 → 候选人详情 → 主界面）
+    for _ in range(3):
+        if phone.current_activity().endswith("MainActivity"):
+            break
+        phone.back()
+    return {"ok": True, "sent": True, "candidate": key, "in_chat_room": True,
+            "messages_on_screen": len(outgoing)}
+
+
 # —— ★ 没有的东西（写给下一个改这个文件的人）——
 #
-# 本文件**故意不实现**：打招呼（立即沟通）、开放/关闭职位、发布职位、编辑职位、
-# 退出登录、解绑实名。它们都会对真实的人或账号产生不可逆后果，
-# 要写得单独来、要带授权闸门与更严的双重校验（见 phone.find_rid_text 的注释）。
+# 本文件**故意不实现**：开放/关闭职位、发布职位、编辑职位、退出登录、解绑实名，
+# 以及聊天页上的「求简历 / 换电话·微信 / 约面试 / 不合适」。它们都会对真实的
+# 人或账号产生不可逆后果，要写得单独来、要带授权闸门与更严的双重校验。
 #
-# 尤其「立即沟通」：它点下去到底发生什么（直接发消息？进聊天页？有没有默认招呼语？）
-# **还没有在真机上验证过**，写之前必须先问清楚，别照着猜。
+# 「打招呼」（立即沟通）**已经实现**（见 greet，默认干跑）——因为它虽然也是写操作，
+# 但是整条链路的核心，而且实测就是一步、行为已经摸清。
+#
+# 特别提醒「不合适」：它和「立即沟通」在聊天页上离得不远，是把候选人标记掉的操作。
+# 碰聊天页的任何流程都要先把它的位置钉死，别用文字模糊匹配。
