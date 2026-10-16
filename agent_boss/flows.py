@@ -515,6 +515,56 @@ def _collect_conversations(xml: str, out: dict[str, dict[str, Any]]) -> None:
             current["last_msg"] = text
 
 
+#: 时间分隔可能是「16:36」或「10月16日」这类。
+_CHAT_TIME_RE = re.compile(r"^\d{1,2}:\d{2}$|^\d{1,2}月\d{1,2}日")
+
+
+def _chat_messages(xml: str) -> list[dict[str, Any]]:
+    """聊天页里的消息，带方向。**踩过两个坑，别退回老写法。**
+
+    ## 坑一：`tv_content` 不是消息
+
+    它出现在底部 `chat_suggest_view`（y 1872~2061）里，是**输入框上方的建议语气泡**
+    （「您好，我们公司提供生日福利…可以聊聊吗？」）。我第一版把它当「发出的消息」，
+    结果报出一堆**根本没发过的话**。所以必须按位置把底部输入区排除掉。
+
+    ## 坑二：方向不能靠 rid 判断
+
+    收发用的是**同一个 rid**（`tv_content_text`）。真正的线索是几何：
+    发出消息的头像 `iv_avatar` 在**右侧**（x 中心 > 540），收到的在左侧。
+    发出消息旁边还会多一个 `mMsgTvStatus`（实测见到「送达」）。
+    我第一版写成「`tv_content_text` 就是收到」，于是把自己发的招呼语标成了「收到」。
+    """
+    nodes = phone.nodes(xml)
+    # 底部输入区的上沿（找不到就退一个保守值）
+    bottom = next((n["bounds"][1] for n in nodes if n["rid"].endswith("fl_bottom")), 1850)
+    avatars = [n for n in nodes if n["rid"].endswith("iv_avatar")]
+
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        if not node["rid"].endswith("tv_content_text"):
+            continue
+        text = phone.label(node).strip()
+        if not text or node["bounds"][1] >= bottom:
+            continue
+        y1, y2 = node["bounds"][1], node["bounds"][3]
+        near = [a for a in avatars if a["bounds"][1] < y2 and a["bounds"][3] > y1]
+        outgoing = any(a["center"][0] > 540 for a in near)
+        out.append({"direction": "out" if outgoing else "in", "text": text, "y": y1})
+    out.sort(key=lambda m: m["y"])
+    return out
+
+
+def _chat_time_marks(xml: str) -> list[str]:
+    """时间分隔。★ `tv_text` 也用来放平台提示语（「此牛人近日被开聊较多…」），
+    所以必须按**时间格式**过滤，不能把 `tv_text` 全收。"""
+    return [
+        phone.label(n).strip()
+        for n in phone.nodes(xml)
+        if n["rid"].endswith("tv_text") and _CHAT_TIME_RE.match(phone.label(n).strip())
+    ]
+
+
 def read_conversation(name: str) -> dict[str, Any]:
     """打开一个会话，读消息。**纯只读**。
 
@@ -539,17 +589,8 @@ def read_conversation(name: str) -> dict[str, Any]:
         node = phone.find_rid(xml, rid)
         return phone.label(node).strip() if node else ""
 
-    messages = [
-        {"direction": "in" if n["rid"].endswith("tv_content_text") else "out",
-         "text": phone.label(n).strip(), "y": n["bounds"][1]}
-        for n in phone.nodes(xml)
-        if n["rid"].endswith(("tv_content_text", "tv_content")) and phone.label(n).strip()
-    ]
-    times = [phone.label(n).strip() for n in phone.nodes(xml)
-             if n["rid"].endswith("tv_text") and phone.label(n).strip()]
-
     detail = {"name": one("tv_title"), "position": one("tv_sub_title"),
-              "messages": messages, "time_marks": times}
+              "messages": _chat_messages(xml), "time_marks": _chat_time_marks(xml)}
 
     phone.tap(tuple(_m("候选人详情", "back", "center")), pause=6)
     if "ChatRoomActivity" in phone.current_activity():
@@ -672,8 +713,9 @@ def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
     phone.tap_node(button, pause=12)
     after = phone.dump_stable()
     in_chat = "ChatRoomActivity" in phone.current_activity()
-    outgoing = [phone.label(n) for n in phone.nodes(after)
-                if n["rid"].endswith("tv_content") and phone.label(n)]
+    # ★ 用 _chat_messages 而不是自己扫 rid——`tv_content` 是底部的建议语气泡，
+    #   不是已发消息（第一版就是在这儿数错的，见 _chat_messages 的注释）。
+    outgoing = [m for m in _chat_messages(after) if m["direction"] == "out"]
     if not in_chat:
         raise FlowMismatch("打招呼", "点了「立即沟通」但没进聊天页，**不知是否发出**",
                            phone.texts(after))
