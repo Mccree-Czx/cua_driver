@@ -35,14 +35,20 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+# ★ 状态枚举**复用猎聘那份**（packages/contracts），不在这里另立一份：
+#   两边前端都要按状态上色/上标签，枚举一旦分叉就会各说各话。
+from hr_workbuddy import CandidateStatus
 
 from app.db import Base
 
@@ -54,6 +60,21 @@ JOB_STATES = ("开放中", "待开放", "已关闭", "审核未通过")
 #: 消息方向。in = 候选人发来的，out = 我们发出去的。
 #: ★ 这个值**不是从 rid 读的**（收发同一个 rid），是 flows 按头像左右位置判出来的。
 MESSAGE_DIRECTIONS = ("in", "out")
+
+# ——— 系统侧的职位状态（跟 BOSS 原生的 `state` 是**两件事**）———
+#
+# `state` 是 BOSS 说的（开放中/待开放/已关闭）；`status` 是**我们敢不敢用**。
+# 一个职位可以 BOSS 那边「开放中」而我们这边仍是 draft——因为 JD 还没读全。
+#
+# 照猎聘的联锁：**非 active 的职位在工具层就看不见**，流程不会拿一个空 JD
+# 去给真实候选人发消息。联锁焊在代码里，不在提示词里。
+JOB_STATUS_ACTIVE = "active"
+JOB_STATUS_DRAFT = "draft"
+
+#: 系统动作流水的类型。★ **收窄到 BOSS 真有的**：
+#: 猎聘有 4 种（greet_request/reply/attachment/direct_request），BOSS 没有
+#: 「直索简历」那条语义——BOSS 的「求简历」是聊天页上的一个动作。
+INTERACTION_MSG_TYPES = ("greet", "request_resume", "reply", "attachment")
 
 
 class Job(Base):
@@ -78,6 +99,18 @@ class Job(Base):
     jd_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     #: 职位标签（`btn_word`），例如 ["要求数据开发经验", "PostgreSQL", ...]
     tags: Mapped[list] = mapped_column(JSON, default=list)
+
+    #: 系统侧启用状态：active / draft。见文件上方 JOB_STATUS_* 的说明——
+    #: 它跟 BOSS 原生的 `state` **并存**，不是一回事。
+    #:
+    #: ★ 这里**同时**有 Python 侧 `default` 与 DB 侧 `server_default`，而且两边必须一致：
+    #:   只写 Python 侧的话，`alembic check` 会因为迁移里建了 DB 默认值而报
+    #:   `modify_default` 漂移（猎聘当年在 `scoring_prefs` 上栽过同一跤）；
+    #:   只写 DB 侧的话，ORM 构造期读不到值。
+    status: Mapped[str] = mapped_column(
+        String(16), default=JOB_STATUS_ACTIVE,
+        server_default=text(f"'{JOB_STATUS_ACTIVE}'"), index=True,
+    )
 
     scanned_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -199,3 +232,111 @@ class GreetLog(Base):
     boss_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     job_title: Mapped[str] = mapped_column(String(128), default="")
     greeted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# ————————————————————————————————————————————————————————————————
+# 下面四张是照猎聘的形状补的（P1）。
+# ————————————————————————————————————————————————————————————————
+
+class JobCandidate(Base):
+    """某人在某个职位下。**状态机跑在这一行上**（见 `app/state_machine.py`）。
+
+    ★ BOSS 的牛人推荐**天然按职位**——牛人 tab 顶部就有个职位筛选器，
+    列表是按某个在招职位推的（`agent_boss/flows.py::scan_candidates()` 也是
+    按那个职位采的）。所以这边本来就是 jc 形状，**不是硬套猎聘的模型**。
+    """
+
+    __tablename__ = "job_candidate"
+    __table_args__ = (
+        UniqueConstraint("job_id", "candidate_id", name="uq_job_candidate_job_id_candidate_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), nullable=False, index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidates.id"), nullable=False, index=True
+    )
+    #: CandidateStatus 的**字符串值**（不建 MySQL enum：状态机会演进）
+    #: Python 侧与 DB 侧的默认值必须一致，理由同 `Job.status`。
+    status: Mapped[str] = mapped_column(
+        String(32), default=CandidateStatus.NEW.value,
+        server_default=text(f"'{CandidateStatus.NEW.value}'"), index=True,
+    )
+    judge_reason: Mapped[str] = mapped_column(Text, default="")
+    last_touch_at: Mapped[datetime | None] = mapped_column(DateTime)
+    #: 「求过简历」的时刻。**72h 无人回应的锚点**（照猎聘的 sweep）。
+    resume_requested_at: Mapped[datetime | None] = mapped_column(DateTime)
+    resume_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    job: Mapped["Job"] = relationship()
+    candidate: Mapped["Candidate"] = relationship()
+    interactions: Mapped[list["Interaction"]] = relationship(back_populates="job_candidate")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<JobCandidate job={self.job_id} cand={self.candidate_id} {self.status}>"
+
+
+class Interaction(Base):
+    """**系统动作流水**——只记「系统对候选人做了什么」。
+
+    ## ★ 跟 `messages` 的分工（别合并）
+
+    | | `messages` | `interactions` |
+    |---|---|---|
+    | 是什么 | **手机聊天镜像**（in + out） | **系统动作账本** |
+    | 谁写的 | 采集流程照抄屏幕 | 系统自己在动作前后写 |
+    | 干什么用 | 前端展示、判「对方回没回」 | 状态机推进 + **一人一消息联锁** |
+
+    两者有交集（我们发出去的招呼语两边都有），但**消费者不同**。
+    把对方说的话并进安全账本会**污染联锁**——联锁只该看我们做过什么。
+    """
+
+    __tablename__ = "interactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("job_candidate.id"), nullable=False, index=True
+    )
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)   # out | in
+    msg_type: Mapped[str] = mapped_column(String(32), nullable=False)   # 见 INTERACTION_MSG_TYPES
+    content: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    job_candidate: Mapped["JobCandidate"] = relationship(back_populates="interactions")
+
+
+class ReviewOverride(Base):
+    """人工复核流水。每次 `/api/hr/candidates/{id}/review` 落一条。"""
+
+    __tablename__ = "review_overrides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("job_candidate.id"), nullable=False, index=True
+    )
+    old_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    operator: Mapped[str] = mapped_column(String(64), default="hr")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TaskLog(Base):
+    """轮次运行记录。
+
+    ★ **没有 account_id**——BOSS 单账号，猎聘那个按账号分片的维度在这里不存在。
+    """
+    __tablename__ = "task_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True)
+    #: 轮次名：main_round / daily_round / backfill_round / login_round
+    round_name: Mapped[str] = mapped_column(String(32), default="", index=True)
+    outcome: Mapped[str] = mapped_column(String(32), default="")   # success / failed_needs_manual / timeout
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost: Mapped[float] = mapped_column(Float, default=0.0)
+    duration: Mapped[float] = mapped_column(Float, default=0.0)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -7,6 +7,9 @@ dependencies = [
     "alembic>=1.13",
     "cryptography>=42", # PyMySQL 需要它完成 MySQL 8 默认的 caching_sha2_password 首次认证
     "fastapi>=0.115",
+    # ★ 复用猎聘那份 `CandidateStatus` 枚举，**不在这里另立一份**。
+    #   两边前端都要按状态上色/上标签，枚举一旦分叉就会各说各话。
+    "hr-workbuddy-contracts==0.1.0",
     "pydantic-settings>=2.2",
     "pymysql>=1.1",
     "sqlalchemy>=2.0",
@@ -15,3 +18,6 @@ dependencies = [
 
 [dependency-groups]
 dev = ["httpx>=0.27", "pytest>=8"]
+
+[tool.uv.sources]
+hr-workbuddy-contracts = { workspace = true }

@@ -1,17 +1,42 @@
-"""boss-pipeline 应用入口。
+"""boss-pipeline 入口：启动前执行迁移 + FastAPI 装配。
+
+跟猎聘的 `services/pipeline/app/main.py` 同构：**Alembic 是本服务 schema 的唯一 owner**，
+应用启动前 `alembic upgrade head`（幂等；失败即抛错，拒绝带旧 schema 启动）。
+
+`script_location` 显式指到绝对路径，与进程 cwd 无关——
+猎聘那边踩过：alembic 的 `env_file=".env"` 是按 CWD 解析的，从别处跑会静默读到默认值。
 
 启动：
     cd services/boss-pipeline && uv run uvicorn app.main:app --port 8100
 
-★ 端口用 **8100**，跟猎聘的 8000 错开——两套同机部署，
+★ 端口用 **8100**，跟猎聘的 8000 错开——两套会跑在同一台机器上，
   一次敲错命令的 `systemctl restart` 就会打到另一套。
-
-schema 由 Alembic 管理，应用不 create_all（跟猎聘同一条规矩）。
 """
 
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 
-from app.api import router
+from app.config import get_settings
+
+SERVICE_DIR = Path(__file__).resolve().parents[1]
+
+
+def run_migrations() -> None:
+    """启动前把 schema 迁移到 head（幂等；失败即抛错）。"""
+    alembic_cfg = Config(str(SERVICE_DIR / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(SERVICE_DIR / "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", get_settings().database_url)
+    command.upgrade(alembic_cfg, "head")
+
+
+settings = get_settings()
+run_migrations()
 
 app = FastAPI(title="BOSS 招聘 控制面", version="0.1.0")
+
+from app.api import router  # noqa: E402  （路由装配在迁移之后）
+
 app.include_router(router)
