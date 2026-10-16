@@ -37,6 +37,9 @@ run_migrations()
 
 app = FastAPI(title="BOSS 招聘 控制面", version="0.1.0")
 
-from app.api import router  # noqa: E402  （路由装配在迁移之后）
+# 路由装配在迁移之后（下面这两个 import 挪上来就会在迁移前碰 DB）
+from app.api import router as api_router  # noqa: E402
+from app.hr_api import router as hr_router  # noqa: E402
 
-app.include_router(router)
+app.include_router(api_router)
+app.include_router(hr_router)

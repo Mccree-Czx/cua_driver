@@ -112,6 +112,15 @@ class Job(Base):
         server_default=text(f"'{JOB_STATUS_ACTIVE}'"), index=True,
     )
 
+    #: 评分偏好。形状照猎聘（`{boosters, veto, requirements, min_stars}`）。
+    #:
+    #: ★ **现在没有消费者**——BOSS 的打分链路还没做（用户已定「先不做打分」）。
+    #:   保留这一列是因为：① 前端那个「评分偏好」页要编辑它（用户明确要保留形状）；
+    #:   ② 真接上打分时，它就是 scoring 服务的输入，不用再改表。
+    #:   照猎聘的教训：**这一列刻意不设 server_default**（它当年就是因为
+    #:   MySQL 反射出 `(_utf8mb4'{}')` 而 `alembic check` 漂了五天）。
+    scoring_prefs: Mapped[dict] = mapped_column(JSON, default=dict)
+
     scanned_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

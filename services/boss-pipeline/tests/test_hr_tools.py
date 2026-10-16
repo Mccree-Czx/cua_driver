@@ -9,62 +9,9 @@
 from datetime import date
 
 import pytest
-import redis as redis_lib
 
 from app import hr_tools, keys, models
 from app.state_machine import INBOUND, RECOMMENDED, StateEvent, TransitionContext
-
-
-class FakeRedis:
-    """够用的内存实现：exists / set / get / delete / incrby / decrby / expire。"""
-
-    def __init__(self):
-        self.store: dict[str, str] = {}
-        self.ttl: dict[str, int] = {}
-
-    def exists(self, k):
-        return 1 if k in self.store else 0
-
-    def set(self, k, v):
-        self.store[k] = str(v)
-
-    def get(self, k):
-        return self.store.get(k)
-
-    def delete(self, k):
-        self.store.pop(k, None)
-
-    def incrby(self, k, n):
-        self.store[k] = str(int(self.store.get(k, 0)) + n)
-        return int(self.store[k])
-
-    def decrby(self, k, n):
-        self.store[k] = str(int(self.store.get(k, 0)) - n)
-        return int(self.store[k])
-
-    def expire(self, k, s):
-        self.ttl[k] = s
-
-
-class BrokenRedis:
-    """连不上的 Redis。★ 用来验「fail-closed」。"""
-
-    def __getattr__(self, name):
-        def boom(*a, **kw):
-            raise redis_lib.RedisError("连不上")
-        return boom
-
-
-@pytest.fixture()
-def fake_redis(monkeypatch):
-    fake = FakeRedis()
-    monkeypatch.setattr(hr_tools, "redis_client", lambda: fake)
-    return fake
-
-
-@pytest.fixture()
-def use_broken_redis(monkeypatch):
-    monkeypatch.setattr(hr_tools, "redis_client", lambda: BrokenRedis())
 
 
 # ——— 数据 ———

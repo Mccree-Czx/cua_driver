@@ -36,8 +36,12 @@ def test_ingest_job_then_read_and_count(client):
     detail = client.get(f"/api/jobs/{items[0]['id']}").json()
     assert detail["jd_text"].startswith("负责大数据平台")
 
-    ov = client.get("/api/overview").json()
-    assert ov["jobs"] == {"total": 1, "开放中": 1, "待开放": 0, "jd_ready": 1}
+    ov = client.get("/api/hr/overview").json()
+    assert ov["jobs"]["total"] == 1
+    assert ov["jobs"]["开放中"] == 1
+    assert ov["jobs"]["jd_ready"] == 1
+    # 「可用」比「开放中」严：还要系统启用过 + JD 读全（见 hr_tools.job_list_active）
+    assert "usable" in ov["jobs"]
 
 
 def test_ingest_job_upserts_by_title(client):
@@ -61,25 +65,31 @@ def test_half_read_jd_must_not_overwrite_a_good_one(client):
 
 
 def test_ingest_candidates_and_empty_values_do_not_clobber(client):
-    full = {
-        "boss_key": "杜延龙｜腾讯音乐娱乐科技（深圳）·数据架构师",
-        "name": "杜延龙", "job_and_company": "腾讯音乐娱乐科技（深圳）·数据架构师",
+    """★ 列表页推上来的候选人**没有详情字段**——不能用空值盖掉详情页采到的。"""
+    _ingest_job(client)          # 候选人现在是 jc 维度，得先有职位
+    key = "杜延龙｜腾讯音乐娱乐科技（深圳）·数据架构师"
+    client.post("/api/ingest/candidates", json=[{
+        "boss_key": key, "name": "杜延龙", "job_title": "高级大数据开发工程师",
+        "job_and_company": "腾讯音乐娱乐科技（深圳）·数据架构师",
         "work_year": "10年以上", "degree": "本科", "age": "37岁",
         "description": "多年大数据平台研发经验", "expect_salary": "面议",
         "tags": ["数据平台搭建"],
-    }
-    client.post("/api/ingest/candidates", json=[full])
+    }])
 
     # 列表页推上来的：没有详情字段
     client.post("/api/ingest/candidates", json=[
-        {"boss_key": full["boss_key"], "name": "杜延龙",
+        {"boss_key": key, "name": "杜延龙", "job_title": "高级大数据开发工程师",
          "summary": "10年以上 ｜ 本科 ｜ 面议", "active": "刚刚活跃"}
     ])
 
-    row = client.get("/api/candidates").json()["items"][0]
+    row = client.get("/api/hr/candidates").json()["items"][0]
     assert row["summary"] == "10年以上 ｜ 本科 ｜ 面议", "新的非空值应该写进去"
-    assert row["description"] == "多年大数据平台研发经验", "空值把详情字段盖掉了"
     assert row["work_year"] == "10年以上"
+
+    # 详情字段（description 只在详情里给）——★ 这一条才是本测试的重点
+    detail = client.get(f"/api/hr/candidates/{row['id']}").json()
+    assert detail["description"] == "多年大数据平台研发经验", "空值把详情字段盖掉了"
+    assert detail["company_history"] == [] or isinstance(detail["company_history"], list)
 
 
 def test_ingest_conversations_dedupes_messages(client):
@@ -106,12 +116,12 @@ def test_ingest_conversations_dedupes_messages(client):
     r = client.post("/api/ingest/conversations", json=[conv]).json()
     assert r["messages_created"] == 1 and r["messages_skipped"] == 2
 
-    cid = client.get("/api/conversations").json()["items"][0]["id"]
-    msgs = client.get(f"/api/conversations/{cid}").json()["messages"]
+    cid = client.get("/api/hr/conversations").json()["items"][0]["id"]
+    msgs = client.get(f"/api/hr/conversations/{cid}").json()["messages"]
     assert [m["direction"] for m in msgs] == ["out", "in", "in"], "应按 boss_y 排出先后"
     assert msgs[0]["text"].startswith("您好，有兴趣")
 
-    ov = client.get("/api/overview").json()
+    ov = client.get("/api/hr/overview").json()
     assert ov["messages"] == {"total": 3, "in": 2, "out": 1}
 
 
@@ -119,7 +129,7 @@ def test_greet_log_is_idempotent(client):
     key = {"boss_key": "张雄瑜｜云南白药集团·数据开发", "job": "云南白药集团·数据开发"}
     assert client.post("/api/ingest/greet-log", json=[key]).json() == {"added": 1}
     assert client.post("/api/ingest/greet-log", json=[key]).json() == {"added": 0}
-    assert client.get("/api/overview").json()["greeted"] == 1
+    assert client.get("/api/hr/overview").json()["greeted"] == 1
 
 
 def test_missing_ids_are_404_not_500(client):

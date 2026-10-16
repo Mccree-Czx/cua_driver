@@ -1,9 +1,13 @@
-"""boss-pipeline 的 HTTP 接口。
+"""职位接口 + 采数端写入接口。
 
-分两半：
+分两块：
 
-- **只读**（`/api/*`）：给前端看。
-- **写入**（`/api/ingest/*`）：给 Mac 上的 `agent_boss` 采数端推送用，带令牌。
+- **`/api/health`、`/api/jobs*`**：跟猎聘的 `api.py` 对位（它也有这两个）。
+- **`/api/ingest/*`**：给 Mac 上的 `agent_boss` 采数端推数据用，带令牌。
+  ★ 猎聘**没有**这一层——它的执行端跟服务端同机、直接写库。
+    BOSS 的采数端在 Mac 上，所以走 HTTP。
+
+HR 面（驾驶舱/候选人/会话/人工队列/日志/日报/评分偏好）都在 `hr_api.py`。
 
 ★ 这里**没有账号/角色体系**——那是「统一身份」（飞书登录 + admin/user）那条线的事，
   还没开始。现在跑在本机/内网上，别把它暴露到公网。
@@ -18,55 +22,38 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import models
+from app import hr_tools, models
 from app.deps import get_session, require_ingest_token
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-# ——— 只读 ———
-
 @router.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/api/overview")
-def overview(session: SessionDep) -> dict[str, Any]:
-    """驾驶舱要的那几个数。"""
-    def count(model: Any, *where: Any) -> int:
-        stmt = select(func.count()).select_from(model)
-        for clause in where:
-            stmt = stmt.where(clause)
-        return session.scalar(stmt) or 0
+# ——— 职位（只读；改职位的系统侧属性在 /api/hr/jobs/{id}）———
 
-    return {
-        "jobs": {
-            "total": count(models.Job),
-            "开放中": count(models.Job, models.Job.state == "开放中"),
-            "待开放": count(models.Job, models.Job.state == "待开放"),
-            # ★ 有 JD 且**确认读全**的才算可打分。半截 JD 打出来的分是错的。
-            "jd_ready": count(models.Job, models.Job.jd_complete.is_(True)),
-        },
-        "candidates": count(models.Candidate),
-        "conversations": {
-            "total": count(models.Conversation),
-            "unread": count(models.Conversation, models.Conversation.unread > 0),
-        },
-        "messages": {
-            "total": count(models.Message),
-            "in": count(models.Message, models.Message.direction == "in"),
-            "out": count(models.Message, models.Message.direction == "out"),
-        },
-        "greeted": count(models.GreetLog),
+def _job_out(job: models.Job, *, with_jd: bool) -> dict[str, Any]:
+    out = {
+        "id": job.id, "title": job.title, "state": job.state, "details": job.details,
+        "status": job.status, "jd_complete": job.jd_complete, "tags": job.tags or [],
+        "jd_chars": len(job.jd_text or ""),
+        "scanned_at": job.scanned_at.isoformat() if job.scanned_at else None,
     }
+    if with_jd:
+        out["jd_text"] = job.jd_text
+        out["scoring_prefs"] = job.scoring_prefs or {}
+    return out
 
 
 @router.get("/api/jobs")
 def list_jobs(
     session: SessionDep,
     state: str | None = None,
+    status: str | None = None,
     q: str | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -74,6 +61,8 @@ def list_jobs(
     stmt = select(models.Job)
     if state:
         stmt = stmt.where(models.Job.state == state)
+    if status:
+        stmt = stmt.where(models.Job.status == status)
     if q:
         stmt = stmt.where(models.Job.title.contains(q))
     total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
@@ -88,112 +77,24 @@ def get_job(job_id: int, session: SessionDep) -> dict[str, Any]:
     job = session.get(models.Job, job_id)
     if job is None:
         raise HTTPException(404, "没有这个职位")
-    return _job_out(job, with_jd=True)
-
-
-@router.get("/api/candidates")
-def list_candidates(
-    session: SessionDep,
-    q: str | None = None,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-) -> dict[str, Any]:
-    stmt = select(models.Candidate)
-    if q:
-        stmt = stmt.where(
-            models.Candidate.name.contains(q)
-            | models.Candidate.job_and_company.contains(q)
-        )
-    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    out = _job_out(job, with_jd=True)
+    # 这个职位下的 jc，给「职位详情页」用
     rows = session.scalars(
-        stmt.order_by(models.Candidate.last_seen_at.desc()).limit(limit).offset(offset)
+        select(models.JobCandidate).where(models.JobCandidate.job_id == job_id)
     ).all()
-    return {"total": total, "items": [_candidate_out(r) for r in rows]}
-
-
-@router.get("/api/candidates/{candidate_id}")
-def get_candidate(candidate_id: int, session: SessionDep) -> dict[str, Any]:
-    row = session.get(models.Candidate, candidate_id)
-    if row is None:
-        raise HTTPException(404, "没有这个候选人")
-    out = _candidate_out(row)
-    out["conversations"] = [
-        {"id": c.id, "job_title": c.job_title, "last_msg": c.last_msg,
-         "status": c.status, "boss_time": c.boss_time}
-        for c in row.conversations
+    out["candidates"] = [
+        {"jc_id": r.id, "candidate_id": r.candidate_id, "status": r.status,
+         "name": r.candidate.name if r.candidate else ""}
+        for r in rows
     ]
     return out
-
-
-@router.get("/api/conversations")
-def list_conversations(
-    session: SessionDep,
-    q: str | None = None,
-    unread_only: bool = False,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-) -> dict[str, Any]:
-    stmt = select(models.Conversation)
-    if q:
-        stmt = stmt.where(models.Conversation.boss_name.contains(q))
-    if unread_only:
-        stmt = stmt.where(models.Conversation.unread > 0)
-    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    rows = session.scalars(
-        stmt.order_by(models.Conversation.last_synced_at.desc()).limit(limit).offset(offset)
-    ).all()
-    return {"total": total, "items": [_conversation_out(r) for r in rows]}
-
-
-@router.get("/api/conversations/{conversation_id}")
-def get_conversation(conversation_id: int, session: SessionDep) -> dict[str, Any]:
-    row = session.get(models.Conversation, conversation_id)
-    if row is None:
-        raise HTTPException(404, "没有这个会话")
-    out = _conversation_out(row)
-    out["messages"] = [
-        {"id": m.id, "direction": m.direction, "text": m.text,
-         "first_seen_at": m.first_seen_at.isoformat()}
-        # ★ 按 boss_y 排：BOSS 不给消息时间戳，屏幕顺序是唯一可得的先后关系。
-        for m in sorted(row.messages, key=lambda m: (m.boss_y, m.id))
-    ]
-    return out
-
-
-def _job_out(job: models.Job, *, with_jd: bool) -> dict[str, Any]:
-    out = {
-        "id": job.id, "title": job.title, "state": job.state, "details": job.details,
-        "jd_complete": job.jd_complete, "tags": job.tags or [],
-        "jd_chars": len(job.jd_text or ""),
-        "scanned_at": job.scanned_at.isoformat() if job.scanned_at else None,
-    }
-    if with_jd:
-        out["jd_text"] = job.jd_text
-    return out
-
-
-def _candidate_out(row: models.Candidate) -> dict[str, Any]:
-    return {
-        "id": row.id, "name": row.name, "boss_key": row.boss_key,
-        "job_and_company": row.job_and_company, "work_status": row.work_status,
-        "work_year": row.work_year, "degree": row.degree, "age": row.age,
-        "description": row.description, "summary": row.summary,
-        "expect_job_city": row.expect_job_city, "expect_salary": row.expect_salary,
-        "expect_industry": row.expect_industry,
-        "tags": row.tags or [], "company_history": row.company_history or [],
-        "active": row.active,
-    }
-
-
-def _conversation_out(row: models.Conversation) -> dict[str, Any]:
-    return {
-        "id": row.id, "candidate_id": row.candidate_id, "boss_name": row.boss_name,
-        "job_title": row.job_title, "last_msg": row.last_msg, "status": row.status,
-        "boss_time": row.boss_time, "unread": row.unread,
-    }
 
 
 # ——— 写入：采数端推上来的 ———
+
+def _token_header(x_ingest_token: Annotated[str | None, Header()] = None) -> None:
+    require_ingest_token(x_ingest_token)
+
 
 class JobIn(BaseModel):
     title: str
@@ -207,6 +108,9 @@ class JobIn(BaseModel):
 class CandidateIn(BaseModel):
     boss_key: str
     name: str
+    #: ★ 这个候选人是**从哪个职位的推荐流里采到的**。BOSS 的牛人推荐按职位，
+    #:   所以有它才能建 job_candidate 那行。留空则不建（比如从会话列表看到的）。
+    job_title: str = ""
     job_and_company: str = ""
     work_status: str = ""
     work_year: str = ""
@@ -238,13 +142,9 @@ class ConversationIn(BaseModel):
     messages: list[MessageIn] = Field(default_factory=list)
 
 
-def _token_header(x_ingest_token: Annotated[str | None, Header()] = None) -> None:
-    require_ingest_token(x_ingest_token)
-
-
 @router.post("/api/ingest/jobs", dependencies=[Depends(_token_header)])
 def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
-    """采数端推职位。按 `title` upsert（BOSS 的职位名发布后不可修改）。"""
+    """采数端推职位。按 `title` upsert（BOSS 的职位名发布后不可修改，拿它当业务键是安全的）。"""
     created = updated = 0
     for item in items:
         row = session.scalar(select(models.Job).where(models.Job.title == item.title))
@@ -258,7 +158,7 @@ def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
         row.details = item.details
         row.tags = item.tags
         # ★ JD 只在**这次读到、且读全了**的时候覆盖。
-        #   否则一次失败的抓取会把好 JD 冲成半截。
+        #   否则一次失败的抓取会把好 JD 冲成半截——半截 JD 打出来的分是错的。
         if item.jd_text and item.jd_complete:
             row.jd_text = item.jd_text
             row.jd_complete = True
@@ -268,8 +168,8 @@ def ingest_jobs(items: list[JobIn], session: SessionDep) -> dict[str, int]:
 
 @router.post("/api/ingest/candidates", dependencies=[Depends(_token_header)])
 def ingest_candidates(items: list[CandidateIn], session: SessionDep) -> dict[str, int]:
-    """采数端推候选人。按 `boss_key` upsert。"""
-    created = updated = 0
+    """采数端推候选人。按 `boss_key` upsert；带了 `job_title` 就顺带建 job_candidate。"""
+    created = updated = jc_created = 0
     for item in items:
         row = session.scalar(
             select(models.Candidate).where(models.Candidate.boss_key == item.boss_key)
@@ -280,13 +180,26 @@ def ingest_candidates(items: list[CandidateIn], session: SessionDep) -> dict[str
             created += 1
         else:
             updated += 1
-        for field, value in item.model_dump(exclude={"boss_key"}).items():
-            # 详情页才有的字段，列表页推上来是空的——别用空值盖掉已有的
+        for field, value in item.model_dump(exclude={"boss_key", "job_title"}).items():
+            # 详情页才有的字段，列表页推上来是空的——**别用空值盖掉已有的**
             if value in (None, "", [], {}) and getattr(row, field, None):
                 continue
             setattr(row, field, value)
+        session.flush()
+
+        if item.job_title:
+            job = session.scalar(select(models.Job).where(models.Job.title == item.job_title))
+            if job is not None:
+                before = session.scalar(
+                    select(func.count()).select_from(models.JobCandidate)
+                    .where(models.JobCandidate.job_id == job.id)
+                    .where(models.JobCandidate.candidate_id == row.id)
+                )
+                hr_tools.jc_get_or_create(session, job.id, row.id)
+                if not before:
+                    jc_created += 1
     session.commit()
-    return {"created": created, "updated": updated}
+    return {"created": created, "updated": updated, "jc_created": jc_created}
 
 
 @router.post("/api/ingest/conversations", dependencies=[Depends(_token_header)])
@@ -310,6 +223,14 @@ def ingest_conversations(items: list[ConversationIn], session: SessionDep) -> di
             conv_updated += 1
         row.job_title, row.last_msg = item.job_title, item.last_msg
         row.status, row.boss_time, row.unread = item.status, item.boss_time, item.unread
+
+        # 顺手把会话挂到候选人上（如果这个人采过）
+        if row.candidate_id is None:
+            cand = session.scalar(
+                select(models.Candidate).where(models.Candidate.name == item.boss_name)
+            )
+            if cand is not None:
+                row.candidate_id = cand.id
 
         existing = {(m.direction, m.text) for m in row.messages}
         for msg in item.messages:

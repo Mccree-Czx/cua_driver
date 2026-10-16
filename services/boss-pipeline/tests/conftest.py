@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import redis as redis_lib
 
 # ★ 本服务**没有装进 venv**（跟猎聘的 pipeline 一样，`uv pip list` 里只有 contracts）。
 #   所以得自己把服务目录塞进 sys.path，否则 `import app` 在 pytest 下找不到。
@@ -72,3 +73,63 @@ def client(session):
             yield c
     finally:
         app.dependency_overrides.clear()
+
+
+# ——— Redis 替身 ———
+#
+# ★ 用内存实现而不是引 `fakeredis`：需要的原语只有六个。
+#   另外 `BrokenRedis` 是拿来验「连不上时必须 fail-closed」的——
+#   那是这套安全闸门里最容易写反的一条（读不到就当没事 = 出事）。
+
+class FakeRedis:
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.ttl: dict[str, int] = {}
+
+    def exists(self, k):
+        return 1 if k in self.store else 0
+
+    def set(self, k, v):
+        self.store[k] = str(v)
+
+    def get(self, k):
+        return self.store.get(k)
+
+    def delete(self, k):
+        self.store.pop(k, None)
+
+    def incrby(self, k, n):
+        self.store[k] = str(int(self.store.get(k, 0)) + n)
+        return int(self.store[k])
+
+    def decrby(self, k, n):
+        self.store[k] = str(int(self.store.get(k, 0)) - n)
+        return int(self.store[k])
+
+    def expire(self, k, s):
+        self.ttl[k] = s
+
+
+class BrokenRedis:
+    """连不上的 Redis。``__getattr__`` 让任何方法调用都抛 `RedisError`。"""
+
+    def __getattr__(self, name):
+        def boom(*a, **kw):
+            raise redis_lib.RedisError("连不上")
+        return boom
+
+
+@pytest.fixture()
+def fake_redis(monkeypatch):
+    import app.hr_tools as hr_tools
+
+    fake = FakeRedis()
+    monkeypatch.setattr(hr_tools, "redis_client", lambda: fake)
+    return fake
+
+
+@pytest.fixture()
+def use_broken_redis(monkeypatch):
+    import app.hr_tools as hr_tools
+
+    monkeypatch.setattr(hr_tools, "redis_client", lambda: BrokenRedis())
