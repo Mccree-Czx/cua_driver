@@ -148,6 +148,7 @@ dependencies = [
     { name = "hr-workbuddy-contracts" },
     { name = "pydantic-settings" },
     { name = "pymysql" },
+    { name = "redis" },
     { name = "sqlalchemy" },
     { name = "uvicorn" },
 ]
@@ -166,6 +167,7 @@ requires-dist = [
     { name = "hr-workbuddy-contracts", editable = "packages/contracts" },
     { name = "pydantic-settings", specifier = ">=2.2" },
     { name = "pymysql", specifier = ">=1.1" },
+    { name = "redis", specifier = ">=5.0" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]

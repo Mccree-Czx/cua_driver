@@ -12,6 +12,7 @@ dependencies = [
     "hr-workbuddy-contracts==0.1.0",
     "pydantic-settings>=2.2",
     "pymysql>=1.1",
+    "redis>=5.0",
     "sqlalchemy>=2.0",
     "uvicorn>=0.30",
 ]
