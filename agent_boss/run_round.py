@@ -220,19 +220,37 @@ def _get(path: str) -> dict:
         return json.load(resp)
 
 
-def usable_jobs() -> list[dict]:
-    """服务端认定的「可用」职位（启用过 + BOSS 在招 + JD 读全）。
-
-    ★ 判定在**服务端**做（`hr_tools.job_list_active`），这里只是取结果。
-      联锁只该有一份，两边各判一次迟早会分叉。
-    """
+def _all_jobs() -> list[dict]:
     try:
-        return [j for j in _get("/api/jobs").get("items", [])
-                if j.get("status") == "active" and j.get("state") in ("开放中", "")
-                and j.get("jd_complete")]
+        return _get("/api/jobs?limit=200").get("items", [])
     except Exception as exc:
-        log(f"取可用职位失败（fail-open，照常跑）：{exc}")
+        log(f"取职位失败（fail-open，照常跑）：{exc}")
         return []
+
+
+def _is_on(job: dict) -> bool:
+    """系统启用过 + BOSS 那边确实在招。**不含 JD 条件**。"""
+    return job.get("status") == "active" and job.get("state") in ("开放中", "")
+
+
+def usable_jobs() -> list[dict]:
+    """服务端认定的「可用」职位（启用过 + BOSS 在招 + **JD 读全**）。
+
+    ★ 判定口径与服务端 `hr_tools.job_list_active` 一致。
+      （联锁的权威在服务端，这里只是为了少跑几趟。）
+    """
+    return [j for j in _all_jobs() if _is_on(j) and j.get("jd_complete")]
+
+
+def jobs_needing_jd() -> list[dict]:
+    """**JD 还没读全**的在招职位——这才是该去抓 JD 的那批。
+
+    ★★ 这里是修一个**死锁**：原来 `daily_round` 只给 `usable_jobs()` 抓 JD，
+      而 usable **要求** `jd_complete`。于是新扫进来的职位永远轮不到抓 JD、
+      也永远变不成 usable——**JD 一辈子抓不到**。
+      判断条件是「在招 **且** 还没读全」，不是「已经读全了」。
+    """
+    return [j for j in _all_jobs() if _is_on(j) and not j.get("jd_complete")]
 
 
 # ——— 采集 ———
@@ -357,7 +375,8 @@ def main_round() -> int:
 def daily_round() -> int:
     log("daily_round 开始")
     collect_jobs()
-    for job in usable_jobs()[:3]:
+    # ★ 抓的是「在招但 JD 还没读全」的那批，不是「已经可用的」——否则死锁，见 jobs_needing_jd
+    for job in jobs_needing_jd()[:5]:
         try:
             collect_jd(job["title"])
         except flows.FlowMismatch as exc:
@@ -393,7 +412,7 @@ def login_round() -> int:
 def backfill_round() -> int:
     log("backfill_round 开始")
     collect_jobs()
-    for job in usable_jobs():
+    for job in jobs_needing_jd():
         try:
             collect_jd(job["title"])
         except flows.FlowMismatch as exc:
