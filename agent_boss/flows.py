@@ -566,6 +566,18 @@ def _chat_time_marks(xml: str) -> list[str]:
     ]
 
 
+def _card_message_row(xml: str, name_node: dict[str, Any]) -> dict[str, Any] | None:
+    """会话卡里「消息预览」那一行的节点（= 该点的地方）。
+
+    取姓名**正下方最近**的那个 `tv_msg`。找不到就返回 None，调用方退回点姓名节点——
+    但那条路实测会开出设置页，所以正常情况都该找得到。
+    """
+    top = name_node["bounds"][1]
+    rows = [n for n in phone.nodes(xml)
+            if n["rid"].endswith("tv_msg") and n["bounds"][1] > top]
+    return min(rows, key=lambda n: n["bounds"][1]) if rows else None
+
+
 def read_conversation(name: str) -> dict[str, Any]:
     """打开一个会话，读消息。**纯只读**。
 
@@ -580,11 +592,22 @@ def read_conversation(name: str) -> dict[str, Any]:
     if not card:
         raise FlowMismatch("读会话", f"消息列表里没有「{name}」", phone.texts(xml))
 
-    phone.tap_node(card, pause=9)
+    # ★★ **绝不能点姓名**（2026-10-16 实测踩到）：点会话的 `tv_name` 会打开
+    #    `ChatSettingsNewActivity`——那一页上有「加入黑名单」「标记为不合适」
+    #    「举报对方」，全是不可逆的。改成点**消息预览那一行**（同一张卡里、
+    #    姓名下方的 `tv_msg`），实测能正常进聊天页。
+    target = _card_message_row(xml, card) or card
+    phone.tap_node(target, pause=9)
     xml = phone.dump_stable()
     _guard_risk(xml, "开会话")
-    if "ChatRoomActivity" not in phone.current_activity():
-        raise FlowMismatch("读会话", "没进到聊天页", phone.texts(xml))
+    activity = phone.current_activity()
+    if "ChatSettings" in activity:
+        phone.back()
+        raise FlowMismatch(
+            "读会话", "点进了「聊天设置」页（含黑名单/举报/标记不合适），已退出", phone.texts(xml)
+        )
+    if "ChatRoomActivity" not in activity:
+        raise FlowMismatch("读会话", f"没进到聊天页（当前 {activity}）", phone.texts(xml))
 
     def one(rid: str) -> str:
         node = phone.find_rid(xml, rid)
