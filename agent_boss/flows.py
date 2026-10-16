@@ -269,31 +269,28 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
 
 # —— 候选人（牛人 tab）——
 
-def _find_in_list(xml: str, name: str, *, step: str, max_scroll: int = 6) -> dict[str, Any] | None:
-    """在候选人列表里找某个人，先**滚回顶部**再往下找。
+# ★★ 「牛人」列表**绝不能往回滚**（2026-10-16 实测，代价是搞错了两次）
+#
+# 在这条列表上做一次「往下滑」（= 往回滚到更靠前的条目），BOSS 会**注入一批新的
+# 候选人**——实测：`潘志/谌祥/卞志超` → 滑一下 → `孙志亮/周语洁/郝炤烁`
+# → 再滑一下 → `张帅/孙志亮/何江龙`。**根本不是幂等的**。
+#
+# 后果：我一开始写了个「先滚回顶部再找人」的 `_find_in_list`，它把
+# `scan_candidates()` 刚扫到的人**全换掉了**，于是「扫到 A/B/C，读 A 时屏幕上
+# 已经是 D」——连着两次 FlowMismatch，而且原因看起来像「列表不稳定」，
+# 其实是我自己把它刷新了。
+#
+# **规则：这条列表只能往下走（`swipe((540,1600),(540,700))`），永不往回滚。**
+# 想读某个人，就在**当屏**读（见 `read_candidates`）；人已经滚过去了就认了，
+# 别试图回去找——回不去，还会顺手污染整条流。
 
-    ★ 为什么必须滚回顶部：`scan_candidates()` 会把列表**滚下去**，
-      紧接着调 `read_candidate(第一名的名字)` 时那人早被滚出屏幕了——
-      真机上连着跑必撞（实测：扫到「顾国庆/聂白甜/刘晓尚」，再读「顾国庆」时
-      屏幕上已经是「赵川」了，直接 FlowMismatch）。
-      列表滚上去是幂等的（到顶就不动了），所以这里放心滚。
-    """
-    for _ in range(max_scroll):
-        phone.swipe((540, 700), (540, 1700))          # 往上翻 = 回到更靠前的条目
-    xml = phone.dump_stable()
-    card = phone.find_exact(xml, name)
-    if card:
-        return card
-    for _ in range(max_scroll):                        # 还没找到就往下找
-        phone.swipe((540, 1600), (540, 700))
-        after = phone.dump_stable()
-        if after == xml:
-            break
-        xml = after
-        card = phone.find_exact(xml, name)
-        if card:
-            return card
-    return None
+def _visible_cards(xml: str) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """当屏可见的候选人卡：[(姓名, bounds)]。"""
+    return [
+        (phone.label(n).strip(), n["bounds"])
+        for n in phone.nodes(xml)
+        if n["rid"].endswith("tv_geek_name") and phone.label(n).strip()
+    ]
 
 
 
@@ -367,21 +364,62 @@ def _collect_candidates(xml: str, out: dict[str, dict[str, Any]]) -> None:
 
 
 def read_candidate(name: str) -> dict[str, Any]:
-    """读某个候选人的详情页。**纯只读——绝不点「立即沟通」。**
+    """读某个候选人的详情页——**前提是他此刻就在屏幕上**。
+
+    **纯只读，绝不点「立即沟通」。**
 
     实测（2026-10-16）详情页是 `BossViewGeekResumePagerActivity`，
     「立即沟通」在底部 `cl_bottom_actions` 里（无 rid，是 Button）。
 
     ★ 打开会**给候选人一次「被查看」**。这是只读流程里唯一一个有外部可见副作用的动作，
       调用方应该知情。
+    ★ **不会往回滚去找人**——往回滚会刷新整条推荐流（见文件里那段注释）。
+      要连着读多个人，用 `read_candidates()`。
     """
     xml = goto_tab("牛人")
-    card = _find_in_list(xml, name, step="读候选人")
+    card = phone.find_exact(xml, name)
     if not card:
-        raise FlowMismatch("读候选人", f"牛人列表里没有「{name}」", phone.texts(xml))
+        raise FlowMismatch(
+            "读候选人",
+            f"「{name}」不在当屏——★ 本函数**不会往回滚**去找它（那会刷新整条推荐流，"
+            f"见文件里那段注释）。要么改用 read_candidates() 边走边读，"
+            f"要么确认它此刻就在屏幕上",
+            phone.texts(xml),
+        )
+    return _read_card(card["bounds"])
 
-    x1, y1, x2, y2 = card["bounds"]
-    # 落点取卡片中部，避开右上角的 iv_close（它是卡片级的 X）
+
+def read_candidates(*, limit: int = 5, max_move: int = 30) -> list[dict[str, Any]]:
+    """沿「牛人」列表**边走边读**若干个候选人的详情。
+
+    ★ 为什么不能「先 scan 再逐个 read」：`scan_candidates()` 会把列表滚下去，
+      等回头读某个已滚过去的人时——**回不去**（往回滚会刷新整条流，见上面的注释）。
+      所以正确用法是这一条：看到谁读谁，只往下走。
+    """
+    goto_tab("牛人")
+    out: list[dict[str, Any]] = []
+    tried: set[str] = set()
+    stale = 0
+    while len(out) < limit and stale < 3:
+        xml = phone.dump_stable()
+        target = next((c for c in _visible_cards(xml) if c[0] not in tried), None)
+        if target is None:
+            phone.swipe((540, 1600), (540, 700))       # ★ 只往下走
+            stale += 1
+            continue
+        name, bounds = target
+        tried.add(name)
+        stale = 0
+        out.append(_read_card(bounds))
+        if len(tried) > max_move:
+            break
+    return out
+
+
+def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
+    """点开一张候选人卡、读详情、退回来。**绝不点「立即沟通」。**"""
+    x1, y1, x2, y2 = bounds
+    # 落点取卡片中部，避开右上角的 iv_close（卡片级的 X）
     phone.tap((x1 + 40, (y1 + y2) // 2), pause=8)
 
     xml = phone.dump_stable()
