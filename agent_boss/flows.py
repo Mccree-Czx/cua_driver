@@ -301,7 +301,13 @@ def scan_candidates(*, limit: int = 10, max_scroll: int = 4) -> list[dict[str, A
         if after == xml:
             break
         xml = after
-    return list(out.values())[:limit]
+
+    # ★ 丢掉**只读到一半**的卡：滚到屏幕上下边缘的那几张，`tv_geek_name` 出来了
+    #   但 `tv_work_edu_other_desc` 还没渲染（实测见到「周**」「黄哆哆」两条空壳）。
+    #   宁可少两条，也不要把空字段喂给下游——猎聘那边有同样的教训：
+    #   「解析不出内容 → 报 0 个 → 系统静默空转，和『这个号真没职位』长得一样」。
+    full = [c for c in out.values() if c["summary"]]
+    return full[:limit]
 
 
 def _collect_candidates(xml: str, out: dict[str, dict[str, Any]]) -> None:
