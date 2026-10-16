@@ -38,6 +38,7 @@ from android_ui import (  # noqa: F401  显式列出，让 IDE 与静态检查�
     current_activity,
     current_device,
     current_package,
+    discover_cloud_phone,
     dump,
     dump_stable,
     edittexts,

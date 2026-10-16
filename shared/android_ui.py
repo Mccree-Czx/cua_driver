@@ -178,6 +178,74 @@ def ensure_connected(*, pause: float = 2.0, tries: int = 3) -> bool:
     return False
 
 
+def discover_cloud_phone(process_name: str = "ddyun") -> str | None:
+    """在 Windows 上找出云手机客户端**当前**暴露 adb 的那个端口。
+
+    ★ 为什么需要它：多多云的 adb 端口**不固定**。2026-10-16 一次会话里实测它就换了
+      三次（63833 → 51639 → 51672）——每结束一次 adb 会话就换一个。所以**任何地方
+      写死端口都会静默失效**，只能每次重新发现。（同一台机器上还有一个一直不变的
+      64343，那个不是 adb。）
+
+    做法：`netstat -ano` 拿本机监听端口 → `tasklist` 拿客户端 PID → 取二者交集里
+    的 127.0.0.1 端口。返回 `"127.0.0.1:<端口>"`，找不到返回 None。
+
+    非 Windows 返回 None：云机只在 Windows 上跑，别的平台不需要它。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        listing = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
+        ).stdout
+        tasks = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {process_name}.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    pids = {m.group(1) for m in re.finditer(r'"[^"]+","(\d+)"', tasks)}
+    if not pids:
+        return None
+    ports: list[int] = []
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[-2] != "LISTENING" or parts[-1] not in pids:
+            continue
+        match = re.fullmatch(r"127\.0\.0\.1:(\d+)", parts[1])
+        if match:
+            ports.append(int(match.group(1)))
+    if not ports:
+        return None
+    # 有多个就按端口从大到小试——实测 adb 那个端点总是较大的那个（小的那个 refuse）
+    for port in sorted(ports, reverse=True):
+        target = f"127.0.0.1:{port}"
+        try:
+            # 裸调 adb（不走 adb()）：connect 不该被 _DEVICE 污染成 `-s X connect`
+            output = subprocess.run(
+                [ADB, "connect", target],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            ).stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            continue
+        time.sleep(1.0)
+        if any(d["serial"] == target and d["state"] == "device" for d in list_devices()):
+            return target
+        # 明确连不上（英文 "failed to connect" / 中文 "cannot connect to ... 积极拒绝"）
+        # → 清掉这个假条目，否则 adb devices 里会越积越多 offline。
+        # **只清明确失败的**：连上了只是还没就绪的情况不能断，那会误杀真端点。
+        if "cannot connect" in output or "failed" in output.lower():
+            try:
+                subprocess.run(
+                    [ADB, "disconnect", target],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return None
+
+
 def dump(retries: int = 3, pause: float = 1.5) -> str:
     """取当前界面的 uiautomator dump。
 

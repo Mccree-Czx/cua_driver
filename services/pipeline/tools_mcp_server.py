@@ -639,7 +639,9 @@ def adb_selftest() -> dict:
     确认这条路是通的，避免「探测阶段全绿、真动手时才发现连不上」。
     """
     try:
-        out = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=30)
+        out = subprocess.run(
+            [ADB, "devices"], capture_output=True, text=True, encoding="utf-8", timeout=30
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "adb_path": ADB, "devices": [], "reason": type(exc).__name__}
     devices = [
@@ -887,16 +889,29 @@ def login_req_claim_code() -> dict:
 
 
 def _login_map_path() -> Path:
-    """从本文件向上找 agent/login_map.json。
+    """找锚点表。**按设备选文件**，与 `agent/flows.map_path()` 同一条规则。
 
     不用数 parents 层数：数错一层不会报错，只会静默返回 map_missing，
     到时候排查的是「探查没做」而不是「路径写错了」。
+
+    ★ 云手机（`ANDROID_SERIAL` 形如 `host:port`）用的是另一份表
+      `login_map.cloud.json`——分辨率与 App 版本都不同，坐标不通用。
+      这条规则**必须与 agent 侧保持一致**（`agent/flows.map_path()` 是同一份逻辑的
+      另一半，改一处要改两处），否则 Pi 读到的锚点和执行端实际点的不是同一份。
     """
+    explicit = os.environ.get("HR_LOGIN_MAP")
+    if explicit:
+        return Path(explicit)
+    name = (
+        "login_map.cloud.json"
+        if ":" in (os.environ.get("ANDROID_SERIAL") or "")
+        else "login_map.json"
+    )
     for base in Path(__file__).resolve().parents:
-        candidate = base / "agent" / "login_map.json"
+        candidate = base / "agent" / name
         if candidate.exists():
             return candidate
-    return Path(__file__).resolve().parents[2] / "agent" / "login_map.json"
+    return Path(__file__).resolve().parents[2] / "agent" / name
 
 
 LOGIN_MAP_STALE_DAYS = 90
@@ -1039,6 +1054,7 @@ def gated_tap(x: int, y: int, touch: bool = False, daily_cap: int = DAILY_TOUCH_
         [ADB, "shell", "input", "tap", str(int(x)), str(int(y))],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=15,
     )
     if result.returncode != 0:
@@ -1188,6 +1204,11 @@ def _screencap() -> bytes:
     return result.stdout
 
 
+# ★★ 下面这一整批坐标（滑屏起止、PDF 翻页/转发按钮）都是 **1080x2244 的真机**测出来的，
+#   换设备（例如 720x1280 的云手机）会**滑出屏外或点空，而且不报错**。
+#   锚点表已经按设备分文件了（`_login_map_path()` / `agent/flows.map_path()`），
+#   但**这几个常量还没接进去**——云机要走「收附件简历 → PDF 归档」这条路之前，
+#   必须先按设备重探（用 `agent/probe_anchors.py` 的人机配合范式，别现场试错）。
 def _swipe_up() -> None:
     subprocess.run(
         [ADB, "shell", "input", "swipe", "540", "1800", "540", "400", "500"],

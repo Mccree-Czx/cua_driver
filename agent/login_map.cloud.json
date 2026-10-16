@@ -1,5 +1,6 @@
 {
-  "_说明": "云手机（多多云）的猎聘锚点表。设备 = adb 127.0.0.1:63833（Redmi 2201116SC 伪装型，Android 11），坐标基于 720x1280。与真机表 login_map.json **互不通用**：分辨率与 App 版本都不同。flows.map_path() 会在 ANDROID_SERIAL 形如 host:port 时自动选这份。",
+  "_说明": "云手机（多多云）的猎聘锚点表。设备 = 多多云客户端暴露的 adb 端点（Redmi 2201116SC 伪装型，Android 11），坐标基于 720x1280。与真机表 login_map.json **互不通用**：分辨率与 App 版本都不同。flows.map_path() 会在 ANDROID_SERIAL 形如 host:port 时自动选这份。",
+  "_端口不固定": "★★ 云机的 adb 端口**不是固定的**（2026-10-16 实测：从 63833 变成了 51639，同一次会话内）。而且 `adb disconnect` 很可能就是触发它关闭/换端口的原因——**不要 disconnect 云机**。端口变了这样找（管理员 PowerShell）：`Get-NetTCPConnection -State Listen | Where-Object { $_.OwningProcess -eq (Get-Process ddyun).Id }`，再对每个端口试 `adb connect 127.0.0.1:<端口>`；能连上的那个就是它。所以本文件**不记端口**，端口由 ANDROID_SERIAL 传。",
   "app": {
     "package": "com.lietou.mishu",
     "version_code": 13060,

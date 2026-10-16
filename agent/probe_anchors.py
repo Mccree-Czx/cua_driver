@@ -239,12 +239,27 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")
 
     parser = argparse.ArgumentParser(description="按设备重探猎聘锚点（只报告，不主动点）")
-    parser.add_argument("--serial", help="设备序列号（如 127.0.0.1:63833）；不传则用默认设备")
+    parser.add_argument("--serial", help="设备序列号（如 127.0.0.1:51672）；不传则用默认设备")
+    parser.add_argument(
+        "--find-device",
+        action="store_true",
+        help="只做一件事：找出云手机当前的 adb 端点并打印（端口不固定，会变）",
+    )
     parser.add_argument("--tap", metavar="X,Y", help="点这个坐标（**由你决定**），再 dump")
     parser.add_argument("--back", action="store_true", help="按 BACK，再 dump")
     parser.add_argument("--raw", action="store_true", help="附带打印原始 XML")
     parser.add_argument("--out", metavar="PATH", help="把候选片段写成 JSON（默认只打印，不落盘）")
     args = parser.parse_args()
+
+    if args.find_device:
+        # 云机的 adb 端口**不固定**（实测一次会话里换了三次），写死端口必然静默失效
+        found = phone.discover_cloud_phone()
+        if found:
+            print(f"云机当前端点: {found}")
+            print(f'用法: ANDROID_SERIAL={found} python agent/probe_anchors.py --serial {found}')
+        else:
+            print("没找到云机的 adb 端点——检查多多云客户端是否在运行、云机是否已开机")
+        return 0 if found else 1
 
     if args.serial:
         phone.use_device(args.serial)

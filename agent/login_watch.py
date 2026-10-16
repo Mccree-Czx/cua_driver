@@ -59,6 +59,8 @@ def _reexec_under_venv() -> None:
     for cand in (
         REPO_ROOT / ".venv" / "bin" / "python",
         REPO_ROOT / ".venv" / "bin" / "python3",
+        # Windows 的 venv 布局是 Scripts/python.exe（2026-10-16 云机接入时补）
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",
         Path("/opt/homebrew/bin/python3"),
     ):
         if cand.exists() and Path(cand).resolve() != Path(sys.executable).resolve():

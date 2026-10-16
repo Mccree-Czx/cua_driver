@@ -122,13 +122,53 @@ def login_in_flight() -> bool:
         return False
 
 
+def device_problem() -> str | None:
+    """手机配置有问题吗？有问题返回一句原因，没问题返回 None。
+
+    ★ 只拦**一种确定的错误配置**：接着多台设备、又没指定用哪台（`ANDROID_SERIAL`
+      或 use_device()）。这种状态下**每一条 adb 命令都会报
+      `more than one device/emulator`**，而 Pi 会照常启动、瞎点一轮、把 token
+      烧光——日志里看起来还像「猎聘页面变了」。所以要在启动 Pi 之前拦下来。
+      （2026-10-16 云机接入：本机从此同时挂着真机与云机两台。）
+
+    ★ **fail-open**：读不到设备列表一律放行。一次 adb 抖动不该让整轮静默跳过
+      ——那种跳过和「正常跳过」长得一模一样，没人会发现系统停了
+      （`has_active_jobs` 的注释里说过同一件事）。只接一台设备时也直接放行：
+      Mac 上就是这种，行为与从前完全一致。
+    """
+    import phone  # 延迟到调用时再导入，避免改变本脚本的导入期行为
+
+    try:
+        devices = phone.list_devices()
+    except (phone.AdbError, OSError):
+        return None
+    if phone.current_device():
+        # 指定了设备：顺手把可能已断的 adb connect 补回来（断没断都不拦这一轮）
+        phone.ensure_connected()
+        return None
+    if len([d for d in devices if d["state"] == "device"]) > 1:
+        return (
+            "接着多台设备却没指定用哪台——设 ANDROID_SERIAL=<序列号>"
+            "（云机是 127.0.0.1:端口），否则每条 adb 命令都会报 more than one device"
+        )
+    return None
+
+
 def _job_query_python() -> Path | None:
     """能 `import app.job_sync` 的解释器；找不到返回 None（调用方 fail-open）。
 
     launchd 拉的本来就是仓库 venv 的 python；但本脚本的设计前提是「只用标准库」，
     也可能被人用裸 python3 手动跑——那种解释器没有 pipeline 的依赖，所以两个都试。
+
+    ★ venv 解释器的路径**两个平台都要试**：`bin/python` 是 POSIX，Windows 是
+      `Scripts/python.exe`。只写前者的话 Windows 上会静默退回 `sys.executable`，
+      而那个解释器多半没有 pipeline 的依赖（2026-10-16 云机接入时补）。
     """
-    for candidate in (REPO_ROOT / ".venv" / "bin" / "python", Path(sys.executable)):
+    for candidate in (
+        REPO_ROOT / ".venv" / "bin" / "python",
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",
+        Path(sys.executable),
+    ):
         if candidate.exists():
             return candidate
     return None
@@ -457,6 +497,11 @@ def main() -> int:
     # 两者都可跨工作窗口运行
     if name not in WINDOW_EXEMPT_ROUNDS and not within_window(now):
         print(f"[skip] {name}: 工作窗口外（{now:%H:%M}）")
+        return 0
+    # 手机配置不对就别启动 Pi——那种状态下每条 adb 命令都会失败，而 Pi 会照跑一轮
+    problem = device_problem()
+    if problem:
+        print(f"[skip] {name}: {problem}")
         return 0
     if name in ("main_round", "daily_round") and login_in_flight():
         print(f"[skip] {name}: 有登录在途（手机停在登录页，跑本轮会误判成掉登录）")
