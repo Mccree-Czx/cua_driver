@@ -29,11 +29,21 @@ from __future__ import annotations
 
 import argparse
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import phone  # noqa: E402
+
+
+def _width(s: str) -> int:
+    """显示宽度。★ 中文是双宽：按 len() 补齐会让含中文的行整体错位。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def _pad(s: str, n: int) -> str:
+    return s + " " * max(0, n - _width(s))
 
 
 def _report(xml: str, *, raw: bool, save: str | None, only_rid: str | None) -> None:
@@ -44,7 +54,8 @@ def _report(xml: str, *, raw: bool, save: str | None, only_rid: str | None) -> N
         print("  " + "!" * 68)
         print("  !! 这一屏上有「点了有真实后果」的按钮：")
         for node in dangers:
-            print(f"  !!   {phone.label(node):<20} rid={node['rid'] or '(无)'}")
+            rid = node["rid"].split("/")[-1] if node["rid"] else "(无 rid)"
+            print(f"  !!   {_pad(phone.label(node)[:20], 22)} {rid}  中心{node['center']}")
         print("  !!     —— 立即沟通 = 给候选人发消息；开放职位 = 对外公开；")
         print("  !!        立即开启 = 扣直豆；编辑/关闭职位 = 改动在跑的职位。")
         print("  !!     **本工具不会替你点它们。**")
@@ -69,11 +80,12 @@ def _report(xml: str, *, raw: bool, save: str | None, only_rid: str | None) -> N
         # ★ 不截断内容。猎聘那边曾写死 [:58]，于是 543 字的 JD 只显示前 58 字，
         #   看起来像被 uiautomator 截断了，差点据此得出「读不全」的错误结论。
         #   **探查工具必须如实呈现全部内容。**
-        if len(shown) > 46:
-            print(f"  {mark} {rid:<24} {shown[:46]}… ({len(shown)} 字)")
+        if _width(shown) > 46:
+            print(f"  {mark} {_pad(rid, 24)} {shown[:30]}… ({_width(shown)} 宽)")
             print(f"      {shown}")
         else:
-            print(f"  {mark} {rid:<24} {shown:<48} ({node['center'][0]:>4},{node['center'][1]:>4})  {x2-x1}x{y2-y1}")
+            pos = f"({node['center'][0]:>4},{node['center'][1]:>4})"
+            print(f"  {mark} {_pad(rid, 24)} {_pad(shown, 48)} {pos}  {x2-x1}x{y2-y1}")
 
     print()
     print(f"=== 节点总数 {len(phone.nodes(xml))} ===")

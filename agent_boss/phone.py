@@ -110,11 +110,27 @@ RISK_TEXTS = (
 )
 
 
+#: 按钮标签的长度上限。★ 这个上限是**被误报逼出来的**（2026-10-16）：
+#: 只做子串匹配的话，候选人自我介绍里那句「独立**完成**场景化智能方案设计」会命中
+#: RISK_TEXTS 里的「完成」，于是几百字的简历正文被当成危险按钮弹了出来。
+#: 按钮标签都很短，用长度把它和正文分开。
+DANGER_LABEL_MAX = 20
+
+
 def danger_nodes(xml: str) -> list[dict]:
-    """屏上所有「点了有真实后果」的节点。探查工具与写流程都拿它做自检。"""
+    """屏上所有「点了有真实后果」的节点。探查工具与写流程都拿它做自检。
+
+    ★ 双重过滤，缺一不可：
+      1. `clickable == true`（按钮的可点容器）
+      2. 文字长度 ≤ `DANGER_LABEL_MAX`（把正文排除掉——见上面那段注释）
+    """
     out = []
     for node in nodes(xml):
         text = label(node)
-        if text and any(risk in text for risk in RISK_TEXTS):
+        if not text or len(text) > DANGER_LABEL_MAX:
+            continue
+        if not node["clickable"]:
+            continue
+        if any(risk in text for risk in RISK_TEXTS):
             out.append(node)
     return out
