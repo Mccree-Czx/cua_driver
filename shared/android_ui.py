@@ -41,6 +41,10 @@ _ADB_CANDIDATES = (
     "/opt/homebrew/bin/adb",
     str(Path.home() / "Library/Android/sdk/platform-tools/adb"),
     os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
+    # 云机执行端（.66）把 platform-tools 解压在这里——不加这条的话
+    # resolve_adb() 会退化成字符串 "adb"，然后 CreateProcess 报「找不到指定的文件」
+    # （2026-10-16 在 .66 上实测踩到）。
+    r"C:\platform-tools\adb.exe",
 )
 
 

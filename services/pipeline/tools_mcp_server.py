@@ -91,6 +91,8 @@ def _resolve_adb() -> str:
         str(Path.home() / "Library/Android/sdk/platform-tools/adb"),
         # Windows（旧的部署形态，保留兼容）
         os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
+        # 云机执行端（.66）把 platform-tools 解压在这里（2026-10-16 实测补）
+        r"C:\platform-tools\adb.exe",
         shutil.which("adb"),
     ]
     for exe in candidates:
