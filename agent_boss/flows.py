@@ -487,10 +487,13 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str
         #   它不是人、没有职位、点进去是 `ChatNoticeActivity` 而不是聊天页——
         #   `read_conversation` 会在它身上白跑一次并抛 FlowMismatch。
         #
-        #   区分标记（实测）：**它有 `tv_desc`（值如「道具通知」），而真人会话都没有**；
-        #   真人会话另有 `tv_position`（关联职位），它也没有。
-        #   两个条件一起用，比只认名字「通知」稳（名字是 BOSS 写的，会变）。
-        out = {k: v for k, v in out.items() if not v.get("_sys_desc") and v.get("position")}
+        #   区分标记（实测）：**它有 `tv_desc`（值如「道具通知」），而真人会话都没有这个字段**。
+        #
+        #   ★ 只用这一个条件。第一版我加了「**且** 有 tv_position」当第二重保险，
+        #     结果把真人会话也误伤了（17 个掉到 5 个）——**部分渲染的卡片
+        #     `tv_position` 可能还没抓到**，于是一条好好的会话被当成系统通知丢掉。
+        #     判断「不是人」只要一个确凿的负向证据就够了，多加条件只会误杀。
+        out = {k: v for k, v in out.items() if not v.get("_sys_desc")}
         if len(out) >= limit:
             break
         phone.swipe((540, 1600), (540, 700))          # ★ 只往下走
