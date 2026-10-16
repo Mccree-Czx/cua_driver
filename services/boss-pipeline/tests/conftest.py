@@ -36,6 +36,13 @@ os.environ.setdefault(
     f"sqlite+pysqlite:///{Path(tempfile.mkdtemp()) / 'conftest_boot.db'}",
 )
 
+# ★ 同理，`INGEST_TOKEN` 也必须在导入前定死。
+#   服务端 `.env` 里一配上真令牌，`require_ingest_token` 就开始生效，
+#   于是所有 `/api/ingest/*` 的测试全被 403 拦掉——**这恰恰说明联锁是好的**，
+#   但测试里不该去维护一个真令牌。空串 = 不校验（`deps.require_ingest_token`
+#   里写明了这个语义，仅限本机开发）。
+os.environ["INGEST_TOKEN"] = ""
+
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402

@@ -35,6 +35,7 @@ schema 的唯一 owner 是 Alembic；本文件与迁移须逐列一致。
    因为反过来（重复入库）会让每一次同步都产生重复。
 """
 
+import hashlib
 from datetime import datetime
 
 from sqlalchemy import (
@@ -48,7 +49,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
-    text,
+    # ★ 别名，**不能直接用 `text`**：`Message` 类里有一个列就叫 `text`，
+    #   它会在那个类的作用域里把 sqlalchemy 的 `text` 遮蔽掉，
+    #   于是同一类里后面的 `text("CURRENT_TIMESTAMP")` 变成在调用列对象 →
+    #   `TypeError: 'MappedColumn' object is not callable`。
+    #   （2026-10-16 真撞上，只有 Message 这个类会中招。）
+    text as _text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -115,7 +121,7 @@ class Job(Base):
     #:   只写 DB 侧的话，ORM 构造期读不到值。
     status: Mapped[str] = mapped_column(
         String(16), default=JOB_STATUS_ACTIVE,
-        server_default=text(f"'{JOB_STATUS_ACTIVE}'"), index=True,
+        server_default=_text(f"'{JOB_STATUS_ACTIVE}'"), index=True,
     )
 
     #: 评分偏好。形状照猎聘（`{boosters, veto, requirements, min_stars}`）。
@@ -127,9 +133,9 @@ class Job(Base):
     #:   MySQL 反射出 `(_utf8mb4'{}')` 而 `alembic check` 漂了五天）。
     scoring_prefs: Mapped[dict] = mapped_column(JSON, default=dict)
 
-    scanned_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    scanned_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime, server_default=_text("CURRENT_TIMESTAMP"), onupdate=func.now()
     )
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -165,9 +171,9 @@ class Candidate(Base):
     #: 列表页的活跃度标记（如「刚刚活跃」「3日内活跃」）
     active: Mapped[str] = mapped_column(String(32), default="")
 
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
     last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime, server_default=_text("CURRENT_TIMESTAMP"), onupdate=func.now()
     )
 
     conversations: Mapped[list["Conversation"]] = relationship(back_populates="candidate")
@@ -197,7 +203,7 @@ class Conversation(Base):
     unread: Mapped[int] = mapped_column(Integer, default=0)
 
     last_synced_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime, server_default=_text("CURRENT_TIMESTAMP"), onupdate=func.now()
     )
 
     candidate: Mapped["Candidate | None"] = relationship(back_populates="conversations")
@@ -207,13 +213,34 @@ class Conversation(Base):
         return f"<Conversation {self.id} {self.boss_name!r}>"
 
 
+def content_hash(text: str) -> str:
+    """消息内容的哈希（sha256 hex）。**去重用的键，不是给人看的。**
+
+    ★★ 为什么要哈希而不是直接拿 `text` 做唯一键（2026-10-16 撞的）：
+      **MySQL 不允许 `TEXT` 列直接进唯一键**——
+      `ERROR 1170 (42000): BLOB/TEXT column 'text' used in key specification
+      without a key length`。SQLite 允许，所以本地一路跑得好好的，
+      直到第一次对着 MySQL 跑迁移才炸。
+
+      三条路里选了哈希：
+      - 加前缀长度 `text(191)` —— **错的**：两条前 191 字相同、后面不同的消息
+        会被当成同一条而**被丢掉**。消息是要给人看的原始证据，丢不得。
+      - 改成 VARCHAR(512) —— 消息长度没上界（候选人可能把简历正文贴进来），会截断。
+      - **存哈希** —— 长度固定、无上界问题、语义就是「内容相同即同一行」。
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class Message(Base):
     """聊天页里的一条消息。"""
 
     __tablename__ = "messages"
     __table_args__ = (
         # ★ BOSS 不给消息 id，只能用内容去重，见模块文档第 2 条妥协。
-        UniqueConstraint("conversation_id", "direction", "text", name="uq_message_dedupe"),
+        #   ★ 落在 `content_hash` 上而不是 `text` 上——MySQL 不接受 TEXT 进唯一键，
+        #     理由见 `content_hash()`。
+        UniqueConstraint("conversation_id", "direction", "content_hash",
+                         name="uq_message_dedupe"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -221,11 +248,13 @@ class Message(Base):
     #: in = 候选人发来的；out = 我们发出去的（flows 按头像左右位置判定）
     direction: Mapped[str] = mapped_column(String(8), index=True)
     text: Mapped[str] = mapped_column(Text)
+    #: `text` 的 sha256。唯一键落在它上面——见 `content_hash()`。
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     #: 抓取时这条消息在屏幕上的 y 坐标。**只用来排序**——
     #: BOSS 不给消息时间戳，屏幕顺序是唯一可得的先后关系。
     boss_y: Mapped[int] = mapped_column(Integer, default=0)
 
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
@@ -246,7 +275,7 @@ class GreetLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     boss_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     job_title: Mapped[str] = mapped_column(String(128), default="")
-    greeted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    greeted_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
 
 # ————————————————————————————————————————————————————————————————
@@ -275,14 +304,14 @@ class JobCandidate(Base):
     #: Python 侧与 DB 侧的默认值必须一致，理由同 `Job.status`。
     status: Mapped[str] = mapped_column(
         String(32), default=CandidateStatus.NEW.value,
-        server_default=text(f"'{CandidateStatus.NEW.value}'"), index=True,
+        server_default=_text(f"'{CandidateStatus.NEW.value}'"), index=True,
     )
     judge_reason: Mapped[str] = mapped_column(Text, default="")
     last_touch_at: Mapped[datetime | None] = mapped_column(DateTime)
     #: 「求过简历」的时刻。**72h 无人回应的锚点**（照猎聘的 sweep）。
     resume_requested_at: Mapped[datetime | None] = mapped_column(DateTime)
     resume_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
     job: Mapped["Job"] = relationship()
     candidate: Mapped["Candidate"] = relationship()
@@ -316,7 +345,7 @@ class Interaction(Base):
     direction: Mapped[str] = mapped_column(String(8), nullable=False)   # out | in
     msg_type: Mapped[str] = mapped_column(String(32), nullable=False)   # 见 INTERACTION_MSG_TYPES
     content: Mapped[str] = mapped_column(Text, default="")
-    sent_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    sent_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
     job_candidate: Mapped["JobCandidate"] = relationship(back_populates="interactions")
 
@@ -334,7 +363,7 @@ class ReviewOverride(Base):
     new_status: Mapped[str] = mapped_column(String(32), nullable=False)
     operator: Mapped[str] = mapped_column(String(64), default="hr")
     reason: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
 
 class TaskLog(Base):
@@ -354,4 +383,4 @@ class TaskLog(Base):
     cost: Mapped[float] = mapped_column(Float, default=0.0)
     duration: Mapped[float] = mapped_column(Float, default=0.0)
     note: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))

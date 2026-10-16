@@ -92,13 +92,17 @@ def upgrade() -> None:
                   nullable=False),
         sa.Column("direction", sa.String(length=8), nullable=False),
         sa.Column("text", sa.Text(), nullable=False),
+        #: text 的 sha256。唯一键落在它上面——**MySQL 不接 TEXT 进唯一键**
+        #: （ERROR 1170），见 models.py 的 content_hash()。
+        sa.Column("content_hash", sa.String(length=64), nullable=False),
         sa.Column("boss_y", sa.Integer(), nullable=False),
         sa.Column("first_seen_at", sa.DateTime(), nullable=False,
                   server_default=sa.text("CURRENT_TIMESTAMP")),
         # ★ BOSS 不给消息 id，只能用内容去重（见 models.py 模块文档第 2 条妥协）。
         #   同一个人把同一句话发两遍会被并成一条——这是可接受的代价，
         #   因为反过来（每次同步都产生重复）代价更大。
-        sa.UniqueConstraint("conversation_id", "direction", "text", name="uq_message_dedupe"),
+        sa.UniqueConstraint("conversation_id", "direction", "content_hash",
+                            name="uq_message_dedupe"),
         **_MYSQL,
     )
     op.create_index("ix_messages_conversation_id", "messages", ["conversation_id"])

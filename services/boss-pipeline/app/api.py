@@ -267,16 +267,20 @@ def ingest_conversations(items: list[ConversationIn], session: SessionDep) -> di
             if cand is not None:
                 row.candidate_id = cand.id
 
-        existing = {(m.direction, m.text) for m in row.messages}
+        # 去重键是 (direction, content_hash) 而**不是** (direction, text)：
+        # 唯一键落在哈希上（MySQL 不接 TEXT 进唯一键），这里跟着走，
+        # 免得「应用层判重」和「DB 层唯一键」两套口径对不上。
+        existing = {(m.direction, m.content_hash) for m in row.messages}
         for msg in item.messages:
-            if (msg.direction, msg.text) in existing:
+            h = models.content_hash(msg.text)
+            if (msg.direction, h) in existing:
                 msg_skipped += 1
                 continue
             session.add(models.Message(
                 conversation_id=row.id, direction=msg.direction,
-                text=msg.text, boss_y=msg.boss_y,
+                text=msg.text, content_hash=h, boss_y=msg.boss_y,
             ))
-            existing.add((msg.direction, msg.text))
+            existing.add((msg.direction, h))
             msg_created += 1
     session.commit()
     return {"conversations_created": conv_created, "conversations_updated": conv_updated,
