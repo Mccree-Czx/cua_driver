@@ -492,9 +492,34 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 4) -> list[dict[str
     return list(out.values())[:limit]
 
 
+def _unread_at(nodes: list[dict[str, Any]], y: int) -> int:
+    """某个 y 位置上那条会话的未读数。
+
+    ★ 未读红点是 `badge_view`（头像左上角那个圆），**数字是它的子节点**，
+      而且那个子节点**没有 rid**——只能按「落在 badge 的框里、且是纯数字」找。
+      第一版漏了这条，`scan_conversations()` 的返回里根本没有 `unread`，
+      于是 `run_round` 一取就 KeyError。
+    """
+    for badge in nodes:
+        if not badge["rid"].endswith("badge_view"):
+            continue
+        bx1, by1, bx2, by2 = badge["bounds"]
+        if not (by1 <= y <= by2):
+            continue
+        for child in nodes:
+            cx1, cy1, cx2, cy2 = child["bounds"]
+            if bx1 <= cx1 and cx2 <= bx2 and by1 <= cy1 and cy2 <= by2:
+                label = phone.label(child).strip()
+                if label.isdigit():
+                    return int(label)
+        return 1          # 有红点但读不到数字 → 当作至少 1 条未读（宁可多读也别漏）
+    return 0
+
+
 def _collect_conversations(xml: str, out: dict[str, dict[str, Any]]) -> None:
+    nodes = phone.nodes(xml)
     current: dict[str, Any] | None = None
-    for node in phone.nodes(xml):
+    for node in nodes:
         rid = node["rid"].rsplit("/", 1)[-1]
         text = phone.label(node).strip()
         if rid == "tv_name":
@@ -502,8 +527,10 @@ def _collect_conversations(xml: str, out: dict[str, dict[str, Any]]) -> None:
                 continue
             current = out.setdefault(
                 text,
-                {"name": text, "position": "", "time": "", "status": "", "last_msg": ""},
+                {"name": text, "position": "", "time": "", "status": "",
+                 "last_msg": "", "unread": 0},
             )
+            current["unread"] = _unread_at(nodes, node["center"][1])
         elif current is None:
             continue
         elif rid == "tv_position":
