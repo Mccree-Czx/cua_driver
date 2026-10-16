@@ -88,6 +88,35 @@ def test_candidate_detail_has_interactions_and_overrides(client, session, seeded
     assert detail["overrides"] == []
 
 
+def test_candidate_detail_carries_conversations(client, seeded):
+    """★ 候选人详情要带**会话**（双方实际说了什么）。
+
+    前端现在没有独立的「会话」页了（对齐猎聘的 5 项导航），沟通记录挂在
+    候选人详情里。所以这个出口必须有——否则采到的消息没有地方看。
+    """
+    _, _, jc = seeded
+    client.post("/api/ingest/conversations", json=[{
+        "boss_name": "张雄瑜", "job_title": "高级大数据开发工程师",
+        "last_msg": "好的", "status": "[送达]", "boss_time": "16:36", "unread": 0,
+        "messages": [
+            {"direction": "out", "text": "您好，有兴趣的话可以发一份简历看看。", "boss_y": 1064},
+            {"direction": "in", "text": "好的，我看看", "boss_y": 1300},
+        ],
+    }])
+
+    detail = client.get(f"/api/hr/candidates/{jc.id}").json()
+    assert len(detail["conversations"]) == 1
+    conv = detail["conversations"][0]
+    assert conv["job_title"] == "高级大数据开发工程师"
+    assert [m["direction"] for m in conv["messages"]] == ["out", "in"], "应按 boss_y 排先后"
+    assert conv["messages"][0]["text"].startswith("您好，有兴趣")
+
+
+def test_candidate_without_conversation_gets_empty_list(client, seeded):
+    _, _, jc = seeded
+    assert client.get(f"/api/hr/candidates/{jc.id}").json()["conversations"] == []
+
+
 def test_candidate_404(client):
     assert client.get("/api/hr/candidates/9999").status_code == 404
 
@@ -232,6 +261,28 @@ def test_scoring_list_and_patch(client, session, seeded):
     assert client.get("/api/hr/scoring").json()["items"][0]["scoring_prefs"]["min_stars"] == 3
 
     assert client.patch("/api/hr/scoring/9999", json={"scoring_prefs": {}}).status_code == 404
+
+
+def test_scoring_usable_only(client, session, seeded):
+    """★ `usable_only` 走服务端的 `hr_tools.job_list_active`，不是在前端重写判定。
+
+    评分卡只该给**在招的**职位调——跟猎聘一样。
+    """
+    job, _, _ = seeded
+    assert len(client.get("/api/hr/scoring?usable_only=true").json()["items"]) == 1
+
+    # 把 JD 标成没读全 → 立刻从「可用」里消失
+    job.jd_complete = False
+    session.commit()
+    assert client.get("/api/hr/scoring?usable_only=true").json()["items"] == []
+    # 不带参数时仍然列全部（人工补 JD 要用）
+    assert len(client.get("/api/hr/scoring").json()["items"]) == 1
+
+
+def test_scoring_includes_jd_text(client, seeded):
+    """卡片上要展示 JD，所以 usable_only 的返回里得带上正文。"""
+    item = client.get("/api/hr/scoring?usable_only=true").json()["items"][0]
+    assert item["jd_text"].startswith("负责大数据平台研发")
 
 
 # ——— 改职位（只能改系统侧两样）———

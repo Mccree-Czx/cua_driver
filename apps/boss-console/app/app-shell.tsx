@@ -9,10 +9,8 @@ import {
   DashboardOutlined,
   ProfileOutlined,
   TeamOutlined,
-  MessageOutlined,
   InboxOutlined,
   FileTextOutlined,
-  SlidersOutlined,
   MenuOutlined,
   ThunderboltOutlined,
 } from "@ant-design/icons";
@@ -29,10 +27,15 @@ import AlertBar from "./alert-bar";
  * BOSS 这边还没有对应的东西。等统一身份那条线做完再说。
  */
 /**
- * 导航。★ 顺序照「人一天里怎么用」排，不是照字母：
- * 先看驾驶舱，再看职位（今天招什么），再是候选人（谁在投），
- * 然后会话（谁回话了），人工队列（哪里卡住了），日志（出什么事了），
- * 评分偏好排最后（现在还没接打分，是保留形状的页）。
+ * 导航：**逐项对齐猎聘的 5 项**（2026-10-16 改）。
+ *
+ * 曾经这里是 7 项，多出「会话」和「评分偏好」。看了线上猎聘才发现两处都不对：
+ *
+ * - **猎聘根本没有「会话」这一栏**——它的沟通记录挂在**候选人详情**里
+ * - **「评分偏好」也不是独立一栏**——它是**驾驶舱里每个在招职位卡片**的一部分
+ *   （猎聘的 `app/scoring/page.tsx` 其实是个孤儿页，全站没有任何链接指向它）
+ *
+ * 所以这两项都并走了：评分偏好 → 驾驶舱的职位卡；会话 → 候选人详情的 Tab。
  *
  * 没有「账号」相关项——BOSS 无密码、单账号（用户已定不复刻那套）。
  */
@@ -40,10 +43,8 @@ const NAV = [
   { key: "/", icon: <DashboardOutlined />, label: <Link href="/">驾驶舱</Link> },
   { key: "/jobs", icon: <ProfileOutlined />, label: <Link href="/jobs">职位</Link> },
   { key: "/candidates", icon: <TeamOutlined />, label: <Link href="/candidates">候选人</Link> },
-  { key: "/conversations", icon: <MessageOutlined />, label: <Link href="/conversations">会话</Link> },
   { key: "/manual", icon: <InboxOutlined />, label: <Link href="/manual">人工队列</Link> },
   { key: "/logs", icon: <FileTextOutlined />, label: <Link href="/logs">运行日志</Link> },
-  { key: "/scoring", icon: <SlidersOutlined />, label: <Link href="/scoring">评分偏好</Link> },
 ];
 
 function BrandMark() {

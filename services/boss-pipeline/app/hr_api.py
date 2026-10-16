@@ -169,7 +169,37 @@ def get_candidate(jc_id: int, session: SessionDep) -> dict[str, Any]:
             ), key=lambda o: o.id,
         )
     ]
+    out["conversations"] = _candidate_conversations(session, jc.candidate_id)
     return out
+
+
+def _candidate_conversations(session: Session, candidate_id: int | None) -> list[dict[str, Any]]:
+    """这个人的**会话**（双方实际说了什么）。
+
+    ★ 与上面的 `interactions`（**系统动作流水**——我们对候选人做了什么）
+      **分开呈现**，这正是当初不合并 `messages` / `interactions` 两张表的理由。
+      猎聘只有一个「互动时间线」（是前者）；BOSS 两个都有，就该两个都给出来。
+
+    会话是按**人**存的、jc 是按**职位×人**，所以这里可能返回多条
+    （同一个人在多个职位下聊过）。
+    """
+    if not candidate_id:
+        return []
+    rows = session.scalars(
+        select(models.Conversation).where(models.Conversation.candidate_id == candidate_id)
+    ).all()
+    return [
+        {
+            "id": c.id, "job_title": c.job_title, "status": c.status,
+            "boss_time": c.boss_time, "unread": c.unread,
+            # ★ 按 boss_y 排：BOSS 不给消息时间戳，屏幕顺序是唯一可得的先后关系。
+            "messages": [
+                {"direction": m.direction, "text": m.text}
+                for m in sorted(c.messages, key=lambda m: (m.boss_y, m.id))
+            ],
+        }
+        for c in rows
+    ]
 
 
 class ReviewIn(BaseModel):
@@ -360,16 +390,24 @@ def daily(session: SessionDep, days: int = Query(14, ge=1, le=90)) -> dict[str, 
 # ——— 评分偏好 ———
 
 @router.get("/scoring")
-def list_scoring(session: SessionDep) -> dict[str, Any]:
+def list_scoring(session: SessionDep, usable_only: bool = False) -> dict[str, Any]:
     """每个职位的评分偏好。
 
-    ★ **现在没有消费者**——打分链路还没做。这一页是**保留形状**用的
-      （用户明确要求），接上打分时它就是输入。
+    ★ **打分链路还没做**，所以这些设置暂时不影响任何行为。它存在是因为
+      猎聘的「评分偏好」就长在职位上（驾驶舱的职位卡里），BOSS 跟着对齐；
+      真接上打分时它就是输入。
+
+    `usable_only=true` 只给**可用职位**（启用过 + BOSS 在招 + JD 读全）。
+
+    ★ 判定走 `hr_tools.job_list_active()`，**不在调用方重写一遍**——
+      「可用」的定义只该有一份（联锁焊在代码里，两边各判一次迟早分叉）。
     """
-    rows = session.scalars(select(models.Job).order_by(models.Job.title)).all()
+    rows = hr_tools.job_list_active(session) if usable_only else list(
+        session.scalars(select(models.Job).order_by(models.Job.title)).all()
+    )
     return {"items": [
         {"job_id": j.id, "title": j.title, "state": j.state, "status": j.status,
-         "jd_complete": j.jd_complete, "scoring_prefs": j.scoring_prefs or {}}
+         "jd_complete": j.jd_complete, "jd_text": j.jd_text, "scoring_prefs": j.scoring_prefs or {}}
         for j in rows
     ]}
 

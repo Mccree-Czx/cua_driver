@@ -2,10 +2,53 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
-  Alert, Button, Descriptions, Drawer, Input, Select, Space, Table, Tag, Typography, message,
+  Alert, Button, Descriptions, Drawer, Empty, Input, Select, Space, Table, Tabs, Tag,
+  Typography, message,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { REACHABLE_STATUSES, STATUS_COLOR, statusLabel } from "../status";
+
+/**
+ * 「沟通记录」Tab：**双方实际说了什么**（`messages` 的镜像）。
+ *
+ * ★ 它和「系统动作」那一栏是**两件事**，刻意分开：
+ *   - 这一栏 = 聊天记录（in + out），是唯一可信的原始证据
+ *   - 「系统动作」= 我们对候选人做过什么（打招呼 / 求简历 / 收简历）
+ *
+ *   这也正是后端不把 `messages` 和 `interactions` 合成一张表的理由：
+ *   混起来会**污染「一人一消息」的联锁判断**（联锁只该看我们做过什么）。
+ */
+function ChatTab({ conversations }: { conversations: Detail["conversations"] }) {
+  if (conversations.length === 0) {
+    return <Empty description="还没有沟通记录" />;
+  }
+  return (
+    <>
+      {conversations.map((c) => (
+        <div key={c.id} style={{ marginBottom: 24 }}>
+          <div style={{ marginBottom: 8 }}>
+            <Tag>{c.job_title}</Tag>
+            {c.status && <Tag>{c.status}</Tag>}
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {c.boss_time}
+            </Typography.Text>
+          </div>
+          <div className="chat-preview">
+            {c.messages.length === 0 ? (
+              <Typography.Text type="secondary">（这个会话里还没有消息）</Typography.Text>
+            ) : (
+              c.messages.map((m, i) => (
+                <div key={i} className={`bubble bubble-${m.direction}`}>
+                  <div className="bubble-text">{m.text}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
 
 /**
  * 候选人。★ **jc 维度**（某人在某个职位下）——BOSS 的牛人推荐按职位，
@@ -36,8 +79,18 @@ type Detail = Row & {
   boss_key: string;
   description: string | null;
   company_history: string[];
+  /** 系统动作流水 —— **我们对候选人做了什么** */
   interactions: { direction: string; msg_type: string; content: string; sent_at: string }[];
   overrides: { old_status: string; new_status: string; operator: string; reason: string; created_at: string }[];
+  /** 会话 —— **双方实际说了什么**。与上面那张表刻意分开（见详情里的 Tab 说明） */
+  conversations: {
+    id: number;
+    job_title: string;
+    status: string;
+    boss_time: string;
+    unread: number;
+    messages: { direction: string; text: string }[];
+  }[];
 };
 
 export default function CandidatesPage() {
@@ -156,56 +209,100 @@ export default function CandidatesPage() {
         }
       >
         {open && (
-          <>
-            <Descriptions column={1} size="small" bordered>
-              <Descriptions.Item label="状态">
-                <Tag color={STATUS_COLOR[open.status] ?? "default"}>{statusLabel(open.status)}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="boss_key">
-                <Typography.Text code copyable>{open.boss_key}</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="当前公司·职位">{open.job_and_company || "—"}</Descriptions.Item>
-              <Descriptions.Item label="经验 / 学历 / 年龄">
-                {[open.work_year, open.degree, open.age].filter(Boolean).join(" · ") || "—"}
-              </Descriptions.Item>
-              <Descriptions.Item label="期望">
-                {open.expect_job_city || "—"} · {open.expect_salary || "—"}
-              </Descriptions.Item>
-              <Descriptions.Item label="工作经历">
-                {(open.company_history ?? []).join(" / ") || "—"}
-              </Descriptions.Item>
-              <Descriptions.Item label="自我描述">
-                {open.description || "—"}
-              </Descriptions.Item>
-            </Descriptions>
-
-            <h4 style={{ marginTop: 20 }}>系统动作流水</h4>
-            {/* ★ 这里**只有系统做过什么**，不含对方说的话——那是 /conversations 的事。
-                两者刻意分开：把对方说的话并进安全账本会污染「一人一消息」的联锁判断。 */}
-            {open.interactions.length === 0 ? (
-              <Typography.Text type="secondary">（还没有系统动作）</Typography.Text>
-            ) : (
-              open.interactions.map((i, idx) => (
-                <div key={idx} className="cand-line">
-                  {i.direction === "out" ? "→" : "←"} {i.msg_type}：{i.content || "—"}
-                  <Typography.Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
-                    {i.sent_at.slice(0, 16).replace("T", " ")}
-                  </Typography.Text>
-                </div>
-              ))
-            )}
-
-            {open.overrides.length > 0 && (
-              <>
-                <h4 style={{ marginTop: 20 }}>人工复核</h4>
-                {open.overrides.map((o, idx) => (
-                  <div key={idx} className="cand-line">
-                    {statusLabel(o.old_status)} → {statusLabel(o.new_status)}：{o.reason || "—"}
-                  </div>
-                ))}
-              </>
-            )}
-          </>
+          <Tabs
+            defaultActiveKey="basic"
+            items={[
+              {
+                key: "basic",
+                label: "基本信息",
+                children: (
+                  <Descriptions column={1} size="small" bordered>
+                    <Descriptions.Item label="状态">
+                      <Tag color={STATUS_COLOR[open.status] ?? "default"}>{statusLabel(open.status)}</Tag>
+                    </Descriptions.Item>
+                    <Descriptions.Item label="boss_key">
+                      <Typography.Text code copyable>{open.boss_key}</Typography.Text>
+                    </Descriptions.Item>
+                    <Descriptions.Item label="当前公司·职位">{open.job_and_company || "—"}</Descriptions.Item>
+                    <Descriptions.Item label="经验 / 学历 / 年龄">
+                      {[open.work_year, open.degree, open.age].filter(Boolean).join(" · ") || "—"}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="期望">
+                      {open.expect_job_city || "—"} · {open.expect_salary || "—"}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="职位">{open.job_title}</Descriptions.Item>
+                  </Descriptions>
+                ),
+              },
+              {
+                key: "resume",
+                label: "简历资料",
+                children: (
+                  <>
+                    <h4 style={{ marginTop: 0 }}>自我描述</h4>
+                    <Typography.Paragraph style={{ whiteSpace: "pre-wrap" }}>
+                      {open.description || "—"}
+                    </Typography.Paragraph>
+                    <h4>工作经历</h4>
+                    {(open.company_history ?? []).length === 0 ? (
+                      <Typography.Text type="secondary">—</Typography.Text>
+                    ) : (
+                      (open.company_history ?? []).map((c, i) => (
+                        <div key={i} className="cand-line">{c}</div>
+                      ))
+                    )}
+                    <h4>标签</h4>
+                    {(open.tags ?? []).length === 0 ? (
+                      <Typography.Text type="secondary">—</Typography.Text>
+                    ) : (
+                      (open.tags ?? []).map((t) => <Tag key={t} style={{ marginBottom: 4 }}>{t}</Tag>)
+                    )}
+                  </>
+                ),
+              },
+              {
+                key: "chat",
+                label: `沟通记录${open.conversations.length ? ` (${open.conversations.length})` : ""}`,
+                children: <ChatTab conversations={open.conversations} />,
+              },
+              {
+                // ★ 第 4 个 Tab 是 BOSS 比猎聘**多**的一栏：猎聘只有「互动时间线」
+                //   （= 系统动作），而 BOSS 两边都有数据，就该两边都给出来。
+                key: "actions",
+                label: "系统动作",
+                children: (
+                  <>
+                    <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+                      这一栏记的是**我们对候选人做过什么**（打招呼 / 求简历 / 收简历）。
+                      对方说的话在「沟通记录」里——两者刻意分开。
+                    </Typography.Paragraph>
+                    {open.interactions.length === 0 ? (
+                      <Empty description="还没有系统动作" />
+                    ) : (
+                      open.interactions.map((i, idx) => (
+                        <div key={idx} className="cand-line">
+                          {i.direction === "out" ? "→" : "←"} {i.msg_type}：{i.content || "—"}
+                          <Typography.Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                            {i.sent_at.slice(0, 16).replace("T", " ")}
+                          </Typography.Text>
+                        </div>
+                      ))
+                    )}
+                    {open.overrides.length > 0 && (
+                      <>
+                        <h4 style={{ marginTop: 20 }}>人工复核</h4>
+                        {open.overrides.map((o, idx) => (
+                          <div key={idx} className="cand-line">
+                            {statusLabel(o.old_status)} → {statusLabel(o.new_status)}：{o.reason || "—"}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </>
+                ),
+              },
+            ]}
+          />
         )}
       </Drawer>
     </>

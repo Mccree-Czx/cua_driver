@@ -49,6 +49,21 @@ corepack pnpm --filter boss-console build
 `console.cmd` 只在**没有 build 产物**时自动 build 一次，不负责每次重建。
 （猎聘那边 2026-10-15 因为这条丢掉了一整天的前端改动。）
 
+### ★ 重启要用 `schtasks /end` + `/run`，别直接 taskkill 子进程
+
+实测（2026-10-16）：为了加载新的前端构建，我 `taskkill /F` 掉了 `next start` 的 node 进程。
+**结果后端（另一个任务）也跟着 `^C` 掉了**——它的日志停在 `^C` 上，端口不再监听。
+
+两个包装脚本的进程树看起来是独立的（不同的父进程、不同的控制台），
+所以**原因我没有查实**，只记现象。稳妥做法：
+
+```powershell
+schtasks /end /tn BossConsole
+schtasks /run /tn BossConsole
+```
+
+`/end` 会让包装脚本整体退出，`/run` 再干净地拉起一个。
+
 ## Mac 侧
 
 三个 plist 在 `~/Library/LaunchAgents/com.outin.boss-round-*.plist`。
