@@ -243,6 +243,15 @@ def main() -> int:
         _clear_sentinel()
         return 0
 
+    # 设备没定死就别动手（与 run_round 同一条前置，见 run_round.ensure_device）。
+    # ★ 放在超时处理**之后**、写哨兵**之前**：终态与超时是与设备无关的记账，照旧要做；
+    #   而设备不可用时我们既推不动登录，也就别声称「有登录在途」。
+    #   放在这里还有一个好处：这条 20 秒一跑的路径上，云机端口漂了会在这里被拦下。
+    device_denied = run_round.ensure_device()
+    if device_denied:
+        print(f"[login_watch] {device_denied}")
+        return 0
+
     _write_sentinel(req)
 
     if not needs_action(req):
