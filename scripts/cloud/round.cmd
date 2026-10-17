@@ -57,7 +57,18 @@ REM     sized for the real phone and cannot finish inside the 3600s timeout.
 REM     Cap the scope rather than raising the timeout: the timeout also sets
 REM     LOCK_STALE_SECONDS, i.e. how long one stuck round can monopolise the phone.
 REM     HR_ROUND_MAX_GREETS is NOT set here -- pass it only for a bounded test.
-set "HR_ROUND_MAX_ITEMS=5"
+REM
+REM     Per-round default, and the caller may override it by setting
+REM     HR_ROUND_MAX_ITEMS before invoking this script. backfill keeps 5: its
+REM     large-list scrolling is the only shape measured to blow the 3600s timeout.
+REM     main/daily use 10, matching rounds.md's inbound limit.
+if not defined HR_ROUND_MAX_ITEMS (
+  if /i "%ROUND%"=="backfill_round" (
+    set "HR_ROUND_MAX_ITEMS=5"
+  ) else (
+    set "HR_ROUND_MAX_ITEMS=10"
+  )
+)
 
 REM httpx trust_env would otherwise route 127.0.0.1 calls through a proxy.
 set "NO_PROXY=127.0.0.1,localhost,::1"

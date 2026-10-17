@@ -520,10 +520,23 @@ DEFAULT_ROUND_TIMEOUT = 3600
 ROUND_MAX_ITEMS = os.environ.get("HR_ROUND_MAX_ITEMS", "").strip()
 ROUND_MAX_GREETS = os.environ.get("HR_ROUND_MAX_GREETS", "").strip()
 
+#: 人工指定本轮只走 inbound（处理未读）。rounds.md 的规则是「remaining > 0 只走
+#: outbound」，这个开关就是给「打招呼先停一停、我要看未读链路」这种测试用的。
+#: ★ 只影响本轮的提示词，不碰任何计数或库里的配额——所以不会让 dashboard 上的
+#:   「今日已打招呼」变成假数。
+FORCE_INBOUND = os.environ.get("HR_FORCE_INBOUND", "").strip() == "1"
+
 
 def _append_round_caps(prompt: str) -> str:
     """把可选上限拼到本轮提示词末尾；没设就原样返回（真机行为零变化）。"""
     caps: list[str] = []
+    if FORCE_INBOUND:
+        caps.append(
+            "**本轮强制走 1b inbound（处理未读消息），跳过 1a outbound。**"
+            "即使 `quota_status()` 返回 remaining > 0 也照此执行——这是人工指定的测试轮。"
+            "不要为了消耗额度去打招呼；先把未读会话按 1b 的流程处理完，"
+            "再按 `@@RESULT@@` 格式报告（inbound 填实际处理数、outbound 填 0）。"
+        )
     if ROUND_MAX_ITEMS:
         caps.append(
             f"本轮最多处理 {ROUND_MAX_ITEMS} 个候选人/会话，超出的**留待下一轮**"
