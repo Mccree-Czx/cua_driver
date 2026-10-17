@@ -185,6 +185,49 @@ Pi 实跑时的判断是对的：它 tap 之后进聊天页核对——
 `_append_round_caps()` 会把它拼进本轮提示词），让 Pi 自己数着做、
 按顺序落账后收尾。
 
+## 调度（Windows 计划任务）
+
+两个任务，**登录后常驻**；所有环境变量都由 `round.cmd` 自己设，任务里不用写。
+
+```powershell
+schtasks /create /tn "HrCloudMain" `
+  /tr "cmd /c \"C:\cua_driver\scripts\cloud\round.cmd\" main_round" `
+  /sc minute /mo 10 /st 08:00 /du 15:00 /rl highest /f
+
+schtasks /create /tn "HrCloudDaily" `
+  /tr "cmd /c \"C:\cua_driver\scripts\cloud\round.cmd\" daily_round" `
+  /sc daily /st 19:50 /rl highest /f
+```
+
+| 任务 | 触发 | 跑什么 |
+|---|---|---|
+| `HrCloudMain` | 08:00 起每 **600 秒**，持续 15 小时（到 23:00） | `main_round` |
+| `HrCloudDaily` | 每天 **19:50** | `daily_round` |
+
+- **不建 `login_watch` 的计划任务**：云机登录/退出锚点是 `★未探`，跑起来必然 KeyError
+- 工作窗口 08:00–23:00 由 `agent/run_round.py` 自己守，窗口外只打印 `[skip]` 并退出 0
+- 查：`schtasks /query /tn HrCloudMain /v /fo list`　手动跑一次：`schtasks /run /tn HrCloudMain`　停：`schtasks /end /tn HrCloudMain`
+
+### ★ 为什么是 600 秒
+
+一轮 inbound 实测 **533 秒**（10 个会话）。600 秒只剩 **67 秒余量**——碰上云机卡顿、
+或多做了几个候选人，就会撞上 `.round.lock` 被 `[skip]`。**不致命**（下一轮继续），
+但那一轮等于空转。若观察几天发现经常撞锁，把 `/mo` 调到 `15`（= 900 秒）。
+
+（BOSS 那边的原教训是 415 秒的轮次配 300 秒间隔，几乎每轮都撞——见
+[`scripts/boss/README.md`](../boss/README.md)。）
+
+### 任务依赖登录态
+
+`schtasks` 没提供 `/RP` 时，任务默认「仅用户登录时运行」。.66 是专用机、
+Administrator 常驻登录，符合这个前提；**重启后要登录才会恢复**。
+
+### 日志里日期前缀可能乱码
+
+`round.cmd` 用 `%date%` 写时间戳，而计划任务的代码页与交互式 shell 可能不同，
+于是同一个 `cloud-round.log` 里会出现两种编码（数字仍可读，只有星期几会乱码）。
+排查时看时间点和后面的 `start/exit` 即可；要彻底干净可改成固定格式的时间戳。
+
 ## ★ 还没有的东西（用之前必须知道）
 
 - **云机上登录 / 换号不可用。** `login_map.cloud.json` 的「登录」「退出」两节是
