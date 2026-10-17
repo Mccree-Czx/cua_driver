@@ -61,7 +61,7 @@ gated_tap 返回 rate_limited 时**立即停止打招呼、转 1b inbound**。
 3. 对每个候选：点进会话 → 确认有「**附件简历**」气泡/按钮：
    - **有附件** → 点对方头像进资料页 → 划到底 → 点「附件简历」进 PDF 查看器（右上角有「转发」按钮）→ `download_attachment(job_id, liepin_user_id, name, job_title)` 下载真 PDF。
    - **无附件**（只有在线简历/打招呼，没有附件气泡）→ 跳过，报告「误判：{name} 无附件」。
-4. 单轮上限 20 个，超出的留待下一轮（下一轮再调 `list_backfill_candidates()` 会只剩未完成的）。
+4. 单轮上限 20 个，超出的留待下一轮（下一轮再调 `list_backfill_candidates()` 会只剩未完成的）。★ 这个上限可由环境变量 `HR_ROUND_MAX_ITEMS` 覆盖（云机单次手机操作比真机慢 2–3 倍，那边设 5）；触达次数也可由 `HR_ROUND_MAX_GREETS` 覆盖。
 5. 输出：本轮回填几人、成功几人、误判几人（列出误判名单）。
 
 ## 4. login_round（**人工兜底入口**，不再自动拉起）

@@ -323,7 +323,12 @@ def _session_tokens_since(sdir: Path | None, before_mtime: float) -> tuple[int, 
 
 
 def _write_token_summary(
-    name: str, tokens: int, cost: float, outcome: str, account_id: int | None = None
+    name: str,
+    tokens: int,
+    cost: float,
+    outcome: str,
+    account_id: int | None = None,
+    duration: float = 0.0,
 ) -> None:
     """用项目 python 写一条 token 汇总 TaskLog。
 
@@ -351,7 +356,7 @@ def _write_token_summary(
         "    s.add(TaskLog(\n"
         "        task_id=p['name'] + '_token_' + datetime.now().strftime('%Y%m%d%H%M%S'),\n"
         "        outcome=p['outcome'], tokens=p['tokens'], cost=p['cost'],\n"
-        "        account_id=p['account_id']))\n"
+        "        duration=p['duration'], account_id=p['account_id']))\n"
         "    s.commit()\n"
     )
     payload = json.dumps(
@@ -360,6 +365,7 @@ def _write_token_summary(
             "tokens": tokens,
             "cost": cost,
             "outcome": outcome,
+            "duration": duration,
             "account_id": account_id,
         }
     )
@@ -493,6 +499,52 @@ ROUND_SECTIONS = [
 ROUND_TIMEOUTS = {"login_round": 420}
 DEFAULT_ROUND_TIMEOUT = 3600
 
+# ─── 可选的单轮上限（默认不设 = 行为与真机完全一致）───────────────────
+#
+# 为什么从外面传、而不是写死在 rounds.md：`rounds.md` §3 的「单轮上限 20 个」是
+# 按真机写的，而云机**大列表滚动扫描**比真机慢约 2.3 倍（`docs/runbook.md` 记真机约
+# 60 秒，云机实测 137 秒）。20 个候选在那种慢速下做不完，一轮会撞满 3600s 超时——
+# 于是永远输出不了 @@RESULT@@，outcome 永远是 timeout，空轮退避的判定也跟着失真。
+#
+# ★ 但「云机慢」不能一概而论：2026-10-17 实测一轮 main_round（5 个候选），单次操作
+#   中位 **2.4 秒**，与真机的 2–3 秒基本持平，307 秒自然跑完。慢的是批量扫描，
+#   不是普通交互。所以这个上限主要给 backfill 那类批量轮次用。
+#   完整数据见 scripts/cloud/README.md。
+#
+# ★ 为什么用「提示词里的硬限制」而不是到点 kill 进程：
+#   硬中断可能打断一次**已经点出去、但还没写 interaction_log** 的触达，
+#   「一人一消息」在那条路径上无法保证（login_watch.py 里有同一条代价说明）。
+#   让 Pi 自己数着做、按顺序落账后收尾，账才是完整的。
+#
+# 例：云机执行端设 HR_ROUND_MAX_ITEMS=5；做带触达的验证时设 HR_ROUND_MAX_GREETS=3。
+ROUND_MAX_ITEMS = os.environ.get("HR_ROUND_MAX_ITEMS", "").strip()
+ROUND_MAX_GREETS = os.environ.get("HR_ROUND_MAX_GREETS", "").strip()
+
+
+def _append_round_caps(prompt: str) -> str:
+    """把可选上限拼到本轮提示词末尾；没设就原样返回（真机行为零变化）。"""
+    caps: list[str] = []
+    if ROUND_MAX_ITEMS:
+        caps.append(
+            f"本轮最多处理 {ROUND_MAX_ITEMS} 个候选人/会话，超出的**留待下一轮**"
+            "（下一轮会重新取到未完成的部分），不要为了做完而赶工。"
+        )
+    if ROUND_MAX_GREETS:
+        caps.append(
+            f"本轮**最多完成 {ROUND_MAX_GREETS} 次触达**（打招呼 / 索要简历等一切会触达真人的动作）。"
+            "数到上限就**立即停止一切触达**；已经发出去的那几次，务必按"
+            "「验证上屏 → interaction_log(out) → state_transition → tasklog_add」"
+            "顺序落完账再结束本轮。**不要重试、不要补发。**"
+        )
+    if not caps:
+        return prompt
+    lines = "\n".join(f"- {c}" for c in caps)
+    return (
+        f"{prompt}\n\n---\n\n## ★ 本轮硬限制（优先级高于上文的一般性描述）\n\n"
+        f"{lines}\n\n"
+        "达到限制后**不要继续操作手机**，按上述顺序落账，输出 `@@RESULT@@` 行后结束。"
+    )
+
 
 def within_window(now: datetime) -> bool:
     """现在在工作窗口内吗？窗口外直接跳过、不启动 Pi。
@@ -563,7 +615,9 @@ def main() -> int:
         print(f"[skip] {name}: 另一轮次正在运行（全局轮次锁）")
         return 0
     try:
-        prompt = extract_round_prompt(name)
+        # 可选上限拼在本轮提示词末尾（HR_ROUND_MAX_ITEMS / HR_ROUND_MAX_GREETS）；
+        # 都没设时原样返回，真机行为不变。
+        prompt = _append_round_caps(extract_round_prompt(name))
         timeout = ROUND_TIMEOUTS.get(name, DEFAULT_ROUND_TIMEOUT)
         cmd = [
             NODE, str(PI_CLI),
@@ -603,7 +657,13 @@ def main() -> int:
             got = _session_tokens_since(sdir, before_mtime)
             if got:
                 print(f"[{name}] tokens={got[0]}, cost={got[1]:.6f}（超时结束）")
-                _write_token_summary(name, got[0], got[1], outcome="timeout")
+                _write_token_summary(
+                    name,
+                    got[0],
+                    got[1],
+                    outcome="timeout",
+                    duration=time.time() - started,
+                )
             return 124
         output = log_path.read_text(encoding="utf-8")
         if output:
@@ -619,6 +679,7 @@ def main() -> int:
                 got[0],
                 got[1],
                 outcome="success" if result.returncode == 0 else "failed",
+                duration=time.time() - started,
             )
         if name == "main_round":
             parsed = parse_round_result(output)

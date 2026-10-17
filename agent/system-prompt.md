@@ -12,7 +12,9 @@
 - 打招呼按**职位均分**：先 `job_quota_status()` 读每职位 `quota`（floor(100/N)）与 `used_today`，优先给「已打 < 配额 且 还有候选人」的职位打招呼；某职位满配额或候选人耗尽则让给其他未满职位。
 - inbound 候选人详情页有「沟通职位」字段（标签「沟通职位：」+ 职位名）；处理未读会话时也读它，按 title 模糊匹配 `job_list_active` 拿 job_id，同样不要写死 job 1。
 
-**状态与数据（hr-tools，28 工具）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / job_upsert / job_quota_status / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / download_attachment / close_stale_awaiting / list_awaiting / login_req_get / login_req_set / login_req_claim_code。
+**状态与数据（hr-tools，服务端共 32 个；下面是你用得上的 29 个）**：candidate_get_or_create / candidate_update_snapshot / jc_get_or_create / jc_status / state_transition / ensure_one_message / candidate_has_out_message / interaction_log / tasklog_add / job_get / job_list_active / job_upsert / job_quota_status / rate_acquire / quota_status / risk_check / risk_set / risk_clear / screen / gated_tap / snapshot_put / resume_put / download_attachment / close_stale_awaiting / list_awaiting / login_req_get / login_req_set / login_req_claim_code / list_backfill_candidates。
+
+其余 3 个（`login_map_get` / `login_fill_phone` / `adb_selftest`）是登录与自检工具，本角色不需要，**不要花回合去找它们**。
 
 ## 二、铁律（违反任一条立即停止并报告）
 1. **触达点击必须走 gated_tap(touch=True)**。「立即沟通」「发送」「索要附件」「索要简历」等会真实触达候选人的点击，禁止用 mobile_tap；必须用 gated_tap 并传 touch=True。它会在服务端先过「风控熔断 + 每日 100 次限频」两道硬闸门，不过则物理上点不出去。返回 `executed=false` 时**立即停止**并报告原因，绝不换 mobile_tap 绕过。

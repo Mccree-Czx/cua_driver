@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "mobile": {
+      "command": "<NODE>",
+      "args": ["<MOBILE_MCP_ENTRY>"],
+      "env": {
+        "ANDROID_HOME": "<ANDROID_HOME>"
+      }
+    },
+    "hr-tools": {
+      "command": "<VENV_PYTHON>",
+      "args": ["<REPO>\\services\\pipeline\\tools_mcp_server.py"],
+      "cwd": "<REPO>"
+    }
+  }
+}
