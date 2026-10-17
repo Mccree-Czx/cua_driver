@@ -36,17 +36,22 @@
 - **状态机 11 态**（`packages/contracts` 的 `CandidateStatus`）：new → screened_pass / rejected_hard / rejected_llm → greeted → resume_requested → awaiting_resume → resume_received → hr_reviewed → closed（+ no_response）。
 - **多账号**：`accounts` 表 + `is_active`；**所有数据按 `account_id` 隔离**。换号只能走 `POST /api/hr/accounts/{id}/switch`（真的会去手机上退旧号、登新号）。
 
-## 2. 部署拓扑（三台机器）
+## 2. 部署拓扑（四台机器）
 
 | 机器 | 地址 | 跑什么 |
 |---|---|---|
-| Mac | `10.99.31.81`（用户 `outin`） | Pi + mobile-mcp + adb + 真手机；`agent/` 脚本；launchd 三个任务 |
+| Mac | `10.99.31.81`（用户 `outin`） | 猎聘 · **真机**执行端：Pi + mobile-mcp + adb + 真手机；`agent/` 脚本；launchd 三个任务（**现停用**——真机让给了 BOSS） |
+| 云机执行端（Windows） | `10.99.40.66` | 猎聘 · **云机**执行端：多多云（`ddyun.exe`）里的云手机 + `agent/` 脚本；启动与调度见 [`scripts/cloud/README.md`](../scripts/cloud/README.md) |
 | CT104 | `10.99.40.99`（主机名 `openviking`） | MySQL / Redis / MinIO + pipeline:8000 + screening:8001 + hr-console:3000（全 systemd） |
 | 开发机（Windows） | 本机 | 开发、测试；唯一能 push GitHub 的机器 |
 
 其他已知事实（2026-10-14 记录，TODO：部署变更时复核）：
 
 - 手机经 **WiFi adb over TCP** 连到 Mac（不是 USB）。
+- **云机执行端（2026-10-16 新增）**：云手机的 adb 端口**是动态的**（一次会话内就会变），
+  由 `run_round.ensure_device()` 现找；**不要 `adb disconnect` 云机**（会让客户端关掉端点）。
+  该机的 `.env` **指生产库**，所以在那台上跑 pipeline 测试会被 `tests/conftest.py` 的
+  数据源护栏拒跑（`HR_ALLOW_NONLOCAL_TESTS=1` 是逃生门，别随手开）。
 - CT104 的仓库路径 `/root/outin-hr`；Mac 的仓库在 `~/outin-hr`。
 - **发布流程**：开发机提交并 push → Mac `git pull` → CT104 `git pull` + `alembic upgrade head`（注意 §11 的 DATABASE_URL/CWD 坑）+ 重启 pipeline + 前端 `pnpm exec next build` + 重启 console。
 - **TODO：待确认**：CT104 上各服务的 systemd 单元名清单（使用记录中出现过 `hr-pipeline`、`hr-console`；screening 与 MySQL/Redis/MinIO 的单元名未见于仓库）；Mac 上三个 `com.hr-workbuddy.pi-*` plist 的内容（仓库内没有对应安装脚本）。

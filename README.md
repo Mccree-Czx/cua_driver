@@ -4,15 +4,19 @@
 
 > 第一代架构（桌面 Chrome + `services/cua-agent` / `services/scheduler` / arq 队列 / HTTP 回调编排）已随 commit `aeacfe5`（2026-10-10「Pi 全权内核重构」）整体删除。`services/` 下现在**只有** `pipeline` 与 `screening` 两个服务。
 
-## 三机分工
+## 四机分工
 
 | 机器 | 职责 |
 |---|---|
-| **Mac** | `agent/` 下的轮次脚本 + adb + 真手机；launchd 三个任务拉起 main（300s）/ 登录轮询（20s）/ daily（19:50） |
+| **Mac**（10.99.31.81） | `agent/` 下的轮次脚本 + adb + **真机**；launchd 三个任务拉起 main（300s）/ 登录轮询（20s）/ daily（19:50）——**现停用**，真机让给了 BOSS |
+| **云机执行端**（10.99.40.66） | 同一套 `agent/` 脚本，但驱动的是多多云里的**云手机**；启动与调度见 [`scripts/cloud/README.md`](scripts/cloud/README.md) |
 | **CT104**（10.99.40.99） | MySQL / Redis / MinIO + pipeline(:8000) + screening(:8001) + hr-console(:3000)，systemd 常驻 |
 | 开发机（Windows） | 编码、测试、git push；可本地起 compose 栈 + 服务做开发验证 |
 
 CT104 连不到 Mac（Mac 在 NAT 后），两边只靠 **Redis** 见面（登录请求、配额桶、风控熔断）。
+
+> 仓库里还有**第二套系统**（BOSS直聘，`agent_boss/` + `services/boss-pipeline` + `apps/boss-console`），
+> 与猎聘共用同一部真机。两套的库、Redis db、端口全部刻意错开，见 [`CLAUDE.md`](CLAUDE.md)。
 
 ## 仓库结构
 
