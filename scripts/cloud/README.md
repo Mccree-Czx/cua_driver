@@ -192,12 +192,30 @@ Pi 实跑时的判断是对的：它 tap 之后进聊天页核对——
 ```powershell
 schtasks /create /tn "HrCloudMain" `
   /tr "cmd /c \"C:\cua_driver\scripts\cloud\round.cmd\" main_round" `
-  /sc minute /mo 10 /st 08:00 /du 15:00 /rl highest /f
+  /sc daily /st 08:00 /ri 10 /du 15:00 /rl highest /f
 
 schtasks /create /tn "HrCloudDaily" `
   /tr "cmd /c \"C:\cua_driver\scripts\cloud\round.cmd\" daily_round" `
   /sc daily /st 19:50 /rl highest /f
 ```
+
+### ★★ 必须用 `/sc daily`，不能用 `/sc minute`
+
+`/sc minute` 生成的是**一次性 `TimeTrigger`**——只在创建当天从 `/st` 起重复
+`/du` 那么久，**第二天什么都不会发生**。而任务状态仍然显示 `Ready`，
+只有 `Next Run Time` 是空的，极难发现（2026-10-17 实测踩到，差点让第二天停摆）。
+
+`/sc daily` + `/ri <分钟>` + `/du <时长>` 才是「每天 + 日内重复」：
+
+```
+<CalendarTrigger>
+  <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+  <Repetition><Interval>PT10M</Interval><Duration>PT15H</Duration></Repetition>
+</CalendarTrigger>
+```
+
+**建完必须核对**：`schtasks /query /tn HrCloudMain /xml` 里必须是 `CalendarTrigger`，
+出现 `TimeTrigger` 就是错的。
 
 | 任务 | 触发 | 跑什么 |
 |---|---|---|
