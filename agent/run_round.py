@@ -592,6 +592,17 @@ def extract_round_prompt(name: str) -> str:
 
 
 def main() -> int:
+    # ★ Windows 计划任务下 stdout 是 GBK（cp936），而 Pi 的报告里常有 ✅ / ⚠️ 这类
+    #   字符。直接 print 会 UnicodeEncodeError —— 那一轮**所有活都干完了**，却在
+    #   打印收尾时崩掉、退出码 1，而且崩在写 token 汇总之前，成本与 outcome 双双丢失。
+    #   2026-10-17 在计划任务上实测踩到（交互式 shell 是 UTF-8，手动跑永远看不到）。
+    #   把编码错误降级成替换字符——别让「打印」把「业务」搞挂。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
     name = sys.argv[1] if len(sys.argv) > 1 else ""
     if name not in [n for n, _ in ROUND_SECTIONS]:
         print(f"用法: python run_round.py <{'|'.join(n for n, _ in ROUND_SECTIONS)}>")
