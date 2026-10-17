@@ -175,6 +175,12 @@ def candidate_get_or_create(
     liepin_user_id: str, name: str = "", source: str = "inbound"
 ) -> dict:
     """按 liepin_user_id 幂等取/建候选人（source: inbound|recommended）。仅当前账号。"""
+    # ★ 空 ID 直接拒绝。2026-10-17 实测：Pi 把返回字段 `candidate_id` 误当成
+    #   `candidate.id`，用一个空值建出一条 liepin_user_id="" 的孤儿候选人——
+    #   没有 jc、没有互动，前端看不到，却永久污染 candidates 表（而且没有删除工具）。
+    #   空 ID 没有任何合法语义：按数据契约它应当是 ts_YYYYMMDD_HHMMSS。
+    if not (liepin_user_id or "").strip():
+        return {"error": "liepin_user_id 不能为空（用抓取时间戳 ts_YYYYMMDD_HHMMSS）"}
     with SessionLocal() as session:
         acct = _active_account_id(session)
         cand = session.execute(
