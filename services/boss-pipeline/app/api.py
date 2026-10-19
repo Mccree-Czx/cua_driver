@@ -15,6 +15,7 @@ HR 面（驾驶舱/候选人/会话/人工队列/日志/日报/评分偏好）�
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -305,3 +306,44 @@ def ingest_greet_log(items: list[dict[str, str]], session: SessionDep) -> dict[s
         added += 1
     session.commit()
     return {"added": added}
+
+
+class TaskLogIn(BaseModel):
+    """一轮运行的记录（控制台的「运行日志」与「人工队列」都读它）。
+
+    ★ BOSS 的 `TaskLog` **没有 `account_id`**——BOSS 是单账号，猎聘那个按账号
+      分片的维度在这里不存在。
+    """
+
+    round_name: str
+    #: success / failed / **failed_needs_manual** / timeout
+    #: ★ `failed_needs_manual` 是人工队列的唯一筛选条件（hr_api.manual_queue）。
+    outcome: str = "success"
+    task_id: str = ""
+    attempt: int = 0
+    tokens: int = 0
+    cost: float = 0.0
+    duration: float = 0.0
+    note: str = ""
+
+
+@router.post("/api/ingest/tasklog", dependencies=[Depends(_token_header)])
+def ingest_tasklog(item: TaskLogIn, session: SessionDep) -> dict[str, int]:
+    """采数端推一轮的运行记录。
+
+    ★ 原先没有这个端点：`agent_boss` 不写 task_logs，于是控制台的「运行日志」
+      和「人工队列」两个页面**永远是空的**——掉登录/采集失败时人也不知道。
+    """
+    row = models.TaskLog(
+        task_id=item.task_id or f"{item.round_name}_{datetime.now():%Y%m%d_%H%M%S}",
+        round_name=item.round_name,
+        outcome=item.outcome,
+        attempt=item.attempt,
+        tokens=item.tokens,
+        cost=item.cost,
+        duration=item.duration,
+        note=item.note[:2000],
+    )
+    session.add(row)
+    session.commit()
+    return {"id": row.id}
