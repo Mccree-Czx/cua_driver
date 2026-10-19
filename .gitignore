@@ -37,3 +37,9 @@ exports/
 agent/.inbound_state.json
 agent/.round.lock
 agent/.round_*.log
+
+# BOSS 执行端运行时状态（同上，不提交）
+agent_boss/.inbound_state.json
+agent_boss/.round.lock
+agent_boss/.login_gate_in_flight
+agent_boss/.greeted.json

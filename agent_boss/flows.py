@@ -30,6 +30,7 @@ BOSS 上这些动作**会给真实的人/账号产生不可逆后果**：
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -39,6 +40,25 @@ import phone
 
 PKG = "com.hpbr.bosszhipin"
 MAP_PATH = Path(__file__).resolve().parent / "boss_map.json"
+MAP_PATH_CLOUD = Path(__file__).resolve().parent / "boss_map.cloud.json"
+
+
+def map_path() -> Path:
+    """按设备选锚点表——规则与猎聘的 `agent/flows.py:map_path()` 完全一致。
+
+    - `HR_BOSS_MAP` 显式指定（探针/调试用）
+    - `ANDROID_SERIAL` 含冒号 = 网络设备（云机 `127.0.0.1:端口`）→ 云机表
+    - 否则 → 真机表
+
+    ★ 云机表**不存在就报错，不静默退回真机表**：拿 1080x2244 的坐标去点 720x1280
+      的屏幕，每一步都会点空，而且看起来像「页面变了」。
+    """
+    explicit = os.environ.get("HR_BOSS_MAP")
+    if explicit:
+        return Path(explicit)
+    if ":" in (os.environ.get("ANDROID_SERIAL") or ""):
+        return MAP_PATH_CLOUD
+    return MAP_PATH
 
 
 class FlowMismatch(RuntimeError):
@@ -52,7 +72,15 @@ class FlowMismatch(RuntimeError):
 
 
 def load_map() -> dict[str, Any]:
-    return json.loads(MAP_PATH.read_text(encoding="utf-8"))
+    path = map_path()
+    if not path.exists():
+        raise FlowMismatch(
+            "锚点表",
+            f"找不到 {path.name}（当前设备 ANDROID_SERIAL="
+            f"{os.environ.get('ANDROID_SERIAL') or '<未设置>'}）——"
+            "云机表不存在就报错，不静默退回真机表",
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _m(*path: str) -> Any:
@@ -62,7 +90,9 @@ def _m(*path: str) -> Any:
     for key in path:
         walked.append(key)
         if not isinstance(node, dict) or key not in node:
-            raise FlowMismatch("锚点表", f"boss_map.json 里没有 {'/'.join(walked)}")
+            raise FlowMismatch(
+                "锚点表", f"{map_path().name} 里没有 {'/'.join(walked)}"
+            )
         node = node[key]
     return node
 
@@ -106,14 +136,23 @@ def _tap_safe(node: dict[str, Any], step: str, pause: float = 3.0) -> None:
     phone.tap_node(node, pause=pause)
 
 
-def _back_from_page(step: str, expect_activity: str | None = None) -> str:
-    """按返回并确认真的退掉了。
+def _tap_back(step: str = "返回", pause: float = 5.0) -> None:
+    """点左上角的返回。
 
-    ★ 返回键的位置从锚点表读 `center`（不是 `bounds`）——两个详情页的
-      `iv_back` 宽度实测不一样（职位详情 [36,100][144,220]、候选人详情 [36,100][180,220]），
-      但中心点都是 (90,160)，所以按中心点走最稳。
+    ★★ 按 rid `iv_back` 找（2026-10-19）：原来读锚点表里的 center (90,160)，
+      那是真机 1080x2244 的实测值——云机 720x1280 上会点到屏幕外。
+      rid 跨设备稳定，坐标不稳定。
     """
-    phone.tap(tuple(_m("候选人详情", "back", "center")), pause=5)
+    xml = phone.dump_stable()
+    node = phone.find_rid(xml, "iv_back")
+    if node is None:
+        raise FlowMismatch(step, "找不到返回按钮 iv_back", phone.texts(xml))
+    phone.tap_node(node, pause=pause)
+
+
+def _back_from_page(step: str, expect_activity: str | None = None) -> str:
+    """按返回并确认真的退掉了。"""
+    _tap_back(step)
     xml = phone.dump_stable()
     if expect_activity and expect_activity in phone.current_activity():
         raise FlowMismatch(step, f"按了返回但还在 {expect_activity} 上", phone.texts(xml))
@@ -149,12 +188,26 @@ def goto_tab(name: str) -> str:
       `郭鑫` 变 `郭宁`，精选计数 10→14）。所以操作列表里某个具体对象时
       不要用它，用 `phone.ensure_tab()`。
     """
-    if name not in phone.TAB_CENTERS:
-        raise FlowMismatch("切tab", f"没有这个 tab：{name}，可选 {sorted(phone.TAB_CENTERS)}")
+    if name not in phone.TAB_NAMES:
+        raise FlowMismatch("切tab", f"没有这个 tab：{name}，可选 {sorted(phone.TAB_NAMES)}")
     phone.goto_tab(name)
     xml = phone.dump_stable()
     _guard_risk(xml, f"切到{name}")
     return xml
+
+
+def _open_job_management(xml: str, step: str = "进职位管理") -> str:
+    """从「我的」页点进职位管理，返回进入后的 dump。
+
+    ★ 按 rid `rl_position` 找入口（2026-10-19 改）：原来读锚点表里的坐标
+      (540, 937)，那是真机 1080x2244 的实测值，云机 720x1280 上点不到。
+      锚点表自己就写着入口是「我的页 rl_position」——既然有 rid 就别赌坐标。
+    """
+    node = phone.find_rid(xml, "rl_position")
+    if node is None:
+        raise FlowMismatch(step, "「我的」页上找不到 rl_position（职位管理入口）", phone.texts(xml))
+    phone.tap_node(node, pause=8)
+    return phone.dump_stable()
 
 
 # —— 职位 ——
@@ -174,10 +227,7 @@ def scan_jobs(*, max_scroll: int = 4) -> list[dict[str, Any]]:
         raise FlowMismatch("扫描职位", f"退不回主界面：{result}", result.get("seen", []))
 
     phone.ensure_tab("我的")
-    xml = phone.dump_stable()
-    entry = _m("职位管理", "进入方式", "center")
-    phone.tap(tuple(entry), pause=8)
-    xml = phone.dump_stable()
+    xml = _open_job_management(phone.dump_stable())
     _guard_risk(xml, "进职位管理")
     if "职位管理" not in " ".join(phone.texts(xml)):
         raise FlowMismatch("扫描职位", "没进到职位管理页", phone.texts(xml))
@@ -185,7 +235,7 @@ def scan_jobs(*, max_scroll: int = 4) -> list[dict[str, Any]]:
     seen: dict[str, dict[str, Any]] = {}
     for _ in range(max_scroll + 1):
         _collect_jobs(xml, seen)
-        phone.swipe((540, 1500), (540, 900))
+        phone.swipe_v(0.5, 0.67, 0.40)
         after = phone.dump_stable()
         if after == xml:
             break
@@ -236,8 +286,7 @@ def fetch_jd(title: str, *, max_scroll: int = 3) -> dict[str, Any]:
         raise FlowMismatch("抓JD", f"退不回主界面：{result}", result.get("seen", []))
 
     phone.ensure_tab("我的")
-    phone.tap(tuple(_m("职位管理", "进入方式", "center")), pause=8)
-    xml = phone.dump_stable()
+    xml = _open_job_management(phone.dump_stable())
     _guard_risk(xml, "进职位管理")
 
     card = phone.find_exact(xml, title)
@@ -268,7 +317,7 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
     text = pick(phone.dump_stable())
     for _ in range(max_scroll):
         before = len(text)
-        phone.swipe((540, 1700), (540, 1000))
+        phone.swipe_v(0.5, 0.76, 0.45)
         text = pick(phone.dump_stable())
         if len(text) <= before:
             return text, True
@@ -288,7 +337,7 @@ def _extract_jd(max_scroll: int = 3) -> tuple[str, bool]:
 # 已经是 D」——连着两次 FlowMismatch，而且原因看起来像「列表不稳定」，
 # 其实是我自己把它刷新了。
 #
-# **规则：这条列表只能往下走（`swipe((540,1600),(540,700))`），永不往回滚。**
+# **规则：这条列表只能往下走（`swipe_v(0.5, 0.71, 0.31)`），永不往回滚。**
 # 想读某个人，就在**当屏**读（见 `read_candidates`）；人已经滚过去了就认了，
 # 别试图回去找——回不去，还会顺手污染整条流。
 
@@ -329,7 +378,7 @@ def scan_candidates(*, limit: int = 10, max_scroll: int = 4) -> list[dict[str, A
         _collect_candidates(xml, out)
         if len(out) >= limit:
             break
-        phone.swipe((540, 1600), (540, 700))
+        phone.swipe_v(0.5, 0.71, 0.31)
         after = phone.dump_stable()
         if after == xml:
             break
@@ -412,7 +461,7 @@ def read_candidates(*, limit: int = 5, max_move: int = 30) -> list[dict[str, Any
         xml = phone.dump_stable()
         target = next((c for c in _visible_cards(xml) if c[0] not in tried), None)
         if target is None:
-            phone.swipe((540, 1600), (540, 700))       # ★ 只往下走
+            phone.swipe_v(0.5, 0.71, 0.31)       # ★ 只往下走
             stale += 1
             continue
         name, bounds = target
@@ -456,8 +505,13 @@ def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
                             if n["rid"].endswith(("tv_work_company", "tv_time_range"))],
     }
 
-    # ★ 只用坐标点左上角返回，绝不用「底部按钮」那条路
-    phone.tap((90, 160), pause=6)
+    # ★ 只用左上角返回，绝不用「底部按钮」那条路。
+    # ★★ 改成按 rid 找（2026-10-19）：原来写死坐标 (90,160) 是 1080x2244 的，
+    #    云机 720x1280 上会点到屏幕外。rid 才是跨设备稳定的那个。
+    back = phone.find_rid(phone.dump_stable(), "iv_back")
+    if back is None:
+        raise FlowMismatch("读候选人", "找不到返回按钮 iv_back", phone.texts(phone.dump_stable()))
+    phone.tap_node(back, pause=6)
     if "ViewGeekResume" in phone.current_activity():
         raise FlowMismatch("读候选人", "按了返回但还在候选人详情页", phone.texts(phone.dump_stable()))
     return detail
@@ -494,7 +548,7 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 6) -> list[dict[str
     #      · 一旦发现这里的行为变了，把这段删掉、退回「读到哪算哪」也比写坏数据强
     for _ in range(6):
         before = phone.texts(phone.dump_stable())
-        phone.swipe((540, 700), (540, 1700))
+        phone.swipe_v(0.5, 0.31, 0.76)
         after = phone.texts(phone.dump_stable())
         if before == after:            # 到顶了（屏没变）
             break
@@ -516,7 +570,7 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 6) -> list[dict[str
         out = {k: v for k, v in out.items() if not v.get("_sys_desc")}
         if len(out) >= limit:
             break
-        phone.swipe((540, 1600), (540, 700))          # ★ 只往下走
+        phone.swipe_v(0.5, 0.71, 0.31)          # ★ 只往下走
         after = phone.dump_stable()
         if after == xml:
             break
@@ -657,7 +711,7 @@ def read_conversation(name: str) -> dict[str, Any]:
         card = phone.find_exact(xml, name)
         if card:
             break
-        phone.swipe((540, 1600), (540, 700))
+        phone.swipe_v(0.5, 0.71, 0.31)
         after = phone.dump_stable()
         if after == xml:
             break
@@ -689,7 +743,7 @@ def read_conversation(name: str) -> dict[str, Any]:
     detail = {"name": one("tv_title"), "position": one("tv_sub_title"),
               "messages": _chat_messages(xml), "time_marks": _chat_time_marks(xml)}
 
-    phone.tap(tuple(_m("候选人详情", "back", "center")), pause=6)
+    _tap_back("读会话", pause=6)
     if "ChatRoomActivity" in phone.current_activity():
         raise FlowMismatch("读会话", "按了返回但还在聊天页", phone.texts(phone.dump_stable()))
     return detail
@@ -790,7 +844,7 @@ def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
 
     book = _load_greeted()
     if key in book:
-        phone.tap(tuple(_m("候选人详情", "back", "center")), pause=5)
+        _tap_back("打招呼", pause=5)
         return {"ok": True, "skipped": "already_greeted", "candidate": key,
                 "first_at": book[key].get("at")}
 
@@ -799,7 +853,7 @@ def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
         raise FlowMismatch("打招呼", "候选人详情页上没有「立即沟通」按钮", phone.texts(xml))
 
     if not allow_send:
-        phone.tap(tuple(_m("候选人详情", "back", "center")), pause=5)
+        _tap_back("打招呼", pause=5)
         return {
             "ok": True, "dry_run": True, "candidate": key,
             "would_tap": button["center"], "button_bounds": button["bounds"],

@@ -108,6 +108,37 @@ def within_window(now: datetime | None = None) -> bool:
     return start <= now < end
 
 
+def ensure_device() -> str | None:
+    """跑轮次前把「用哪台设备」定死。返回 None = 可以跑；否则返回拒跑原因。
+
+    与猎聘的 `agent/run_round.py:ensure_device()` 同一套三档逻辑：
+
+    1. 已设 `ANDROID_SERIAL` → 直接用
+    2. 设了 `HR_CLOUD_PHONE=1`（.66 云机执行端）→ `discover_cloud_phone()` 找**当前**端点
+    3. 都没设（真机 / Mac）→ 什么都不做，保持原行为
+
+    ★ 云机的 adb 端口是动态的（实测一次会话换三次），写死必然失效。
+    ★ 找不到就拒跑，**不猜**——猜错会让 `flows.map_path()` 选回真机锚点表，
+      拿 1080x2244 的坐标点 720x1280 的屏。
+    """
+    if os.environ.get("ANDROID_SERIAL"):
+        return None
+    if os.environ.get("HR_CLOUD_PHONE") != "1":
+        return None
+
+    endpoint = phone.discover_cloud_phone()
+    if not endpoint:
+        return (
+            "HR_CLOUD_PHONE=1 但找不到云机的 adb 端点（多多云客户端没开？云机没开机？）。"
+            "不猜设备：猜错会让 map_path() 选到真机锚点表，拿 1080x2244 的坐标点云机的屏"
+        )
+    # ★ 两行都要：环境变量给子进程（这里没有子进程，但保持一致），
+    #   use_device() 给本进程——`android_ui._DEVICE` 在导入时读一次环境变量。
+    os.environ["ANDROID_SERIAL"] = endpoint
+    phone.use_device(endpoint)
+    return None
+
+
 def device_problem() -> str | None:
     """多设备又没指定 serial 才拦。**单设备时放行**（fail-open）——不能因为查不到就什么都不干。"""
     try:
@@ -444,7 +475,19 @@ RUNNERS = {
 }
 
 
+#: 本轮是否真的执行了（拿到全局锁才算）。闸门跳过的轮次不上报 task_logs。
+_ran_round = False
+
+
 def main(argv: list[str]) -> int:
+    # ★ Windows 计划任务下 stdout 是 GBK（cp936），日志里的 ✅ / ⚠️ 会 UnicodeEncodeError。
+    #   猎聘侧 2026-10-17 因此整轮误报 exit 1（且崩在落账之前），这里提前降级。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
     name = argv[1] if len(argv) > 1 else "main_round"
 
     # ① 轮次名
@@ -455,7 +498,12 @@ def main(argv: list[str]) -> int:
     if name not in WINDOW_EXEMPT and not within_window():
         log(f"[skip] 不在工作窗口 {WORK_WINDOW_START[0]:02d}:00–{WORK_WINDOW_END[0]:02d}:00 内")
         return 0
-    # ③ 设备
+    # ③ 设备：**先**把「用哪台」定死（云机端口动态），**再**看配置有没有问题。
+    #    顺序不能反——ensure_device 可能刚把 ANDROID_SERIAL 补上。
+    device_denied = ensure_device()
+    if device_denied:
+        log(f"[skip] 设备：{device_denied}")
+        return 0
     problem = device_problem()
     if problem:
         log(f"[skip] 设备有问题：{problem}")
@@ -487,6 +535,10 @@ def main(argv: list[str]) -> int:
     # ⑦ 全局锁
     try:
         with RoundLock():
+            # 记一笔「这轮真的跑了」——闸门跳过的轮次不该上报 task_logs，
+            # 否则控制台的运行日志会被 [skip] 刷满。
+            global _ran_round
+            _ran_round = True
             return RUNNERS[name]()
     except RuntimeError as exc:
         log(f"[skip] {exc}")
@@ -495,16 +547,45 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     started = time.time()
+    round_name = sys.argv[1] if len(sys.argv) > 1 else "main_round"
+    outcome = "success"
+    note = ""
     try:
         code = main(sys.argv)
     except flows.FlowMismatch as exc:
         # ★ 走到风控页 = 立刻标出来等人（铁律 3）。这不是「失败」，是「需要人」。
         if "风控" in str(exc) or "验证码" in str(exc) or "滑块" in str(exc):
             mark_login_gate(str(exc))
+            outcome = "failed_needs_manual"
+        else:
+            outcome = "failed"
+        note = str(exc)[:400]
         log(f"流程失配：{exc}")
         code = 1
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
+        outcome = "failed"
+        note = f"{type(exc).__name__}: {exc}"[:400]
         code = 1
-    log(f"退出码 {code}，耗时 {time.time() - started:.1f}s")
+    else:
+        if code != 0:
+            outcome = "failed"
+
+    duration = time.time() - started
+    log(f"退出码 {code}，耗时 {duration:.1f}s")
+
+    # 上报本轮运行记录（控制台的「运行日志」/「人工队列」读它）。
+    # ★ 只报真正跑过的轮次——闸门跳过的别报，否则日志会被 [skip] 刷满。
+    # ★ fail-soft：上报失败只记日志，绝不改退出码。
+    if _ran_round:
+        try:
+            _post("/api/ingest/tasklog", {
+                "round_name": round_name,
+                "outcome": outcome,
+                "duration": round(duration, 1),
+                "note": note,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log(f"（运行记录上报失败，不影响本轮：{exc}）")
+
     sys.exit(code)

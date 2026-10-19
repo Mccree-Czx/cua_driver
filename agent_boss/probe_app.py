@@ -103,7 +103,7 @@ def _report(xml: str, *, raw: bool, save: str | None, only_rid: str | None) -> N
 def main() -> int:
     parser = argparse.ArgumentParser(description="BOSS App 探查（只报告，不主动点）")
     parser.add_argument("--serial", help="设备序列号（多台设备时用）")
-    parser.add_argument("--tab", choices=sorted(phone.TAB_CENTERS), help="切到这个底部 tab")
+    parser.add_argument("--tab", choices=sorted(phone.TAB_NAMES), help="切到这个底部 tab")
     parser.add_argument("--tap", metavar="X,Y", help="点这个坐标（**由你决定**），再 dump")
     parser.add_argument("--back", action="store_true", help="按 BACK，再 dump")
     parser.add_argument("--rid", help="只显示 rid 含此子串的节点")

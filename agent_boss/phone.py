@@ -36,6 +36,7 @@ from android_ui import (  # noqa: F401
     current_activity,
     current_device,
     current_package,
+    discover_cloud_phone,
     dump,
     dump_stable,
     edittexts,
@@ -52,9 +53,11 @@ from android_ui import (  # noqa: F401
     open_app,
     reconnect,
     risk_markers,
+    screen_size,
     set_dump_path,
     shell,
     swipe,
+    swipe_v,
     tap,
     tap_node,
     texts,
@@ -79,12 +82,18 @@ DUMP_PATH = _DUMP
 #: 而 `nodes()` 会跳过零尺寸节点。只能按可点容器 `cl_tab_N` 的 rid 找。
 MAIN_TAB_RIDS = ("cl_tab_1", "cl_tab_2", "cl_tab_3", "cl_tab_4")
 
-#: 底部导航的位置，供直接点击用（cl_tab_N 的 bounds 实测值）。
-TAB_CENTERS = {
-    "牛人": (135, 2126),
-    "搜索": (405, 2126),
-    "消息": (675, 2126),
-    "我的": (945, 2126),
+#: 底部四个 tab 的名字（顺序即 cl_tab_N 的 rid 顺序）。
+TAB_NAMES = ("牛人", "搜索", "消息", "我的")
+
+#: tab 名 → 可点容器的 rid。
+#: ★★ 坐标**不再写死**（2026-10-19）：原来这里存的是真机 1080x2244 下
+#:    `cl_tab_N` 的实测中心（y=2126），而云机是 720x1280 —— 那个 y 在云机上
+#:    直接点出屏幕。rid 是稳定的、坐标不是，所以改成现场 dump 一次再取 bounds 中心。
+_TAB_RID = {
+    "牛人": "cl_tab_1",
+    "搜索": "cl_tab_2",
+    "消息": "cl_tab_3",
+    "我的": "cl_tab_4",
 }
 
 
@@ -98,8 +107,15 @@ def ensure_main_tabs(package: str = PKG, max_back: int = 5, settle: float = 6.0)
 
 
 def goto_tab(name: str, settle: float = 7.0) -> None:
-    """切底部 tab。★ 点的是 `cl_tab_N` 容器，不是文字节点（后者尺寸为 0）。"""
-    tap(TAB_CENTERS[name], pause=settle)
+    """切底部 tab。★ 点的是 `cl_tab_N` 容器，不是文字节点（后者尺寸为 0）。
+
+    ★★ 坐标现场取（2026-10-19）：rid 稳定、坐标不稳定——真机 1080x2244 的
+      y=2126 在云机 720x1280 上会点到屏幕外。所以先 dump、按 rid 找 bounds 中心。
+    """
+    node = find_rid(dump_stable(), _TAB_RID[name])
+    if node is None:
+        raise RuntimeError(f"当前屏上找不到底部 tab「{name}」（{_TAB_RID[name]}）")
+    tap_node(node, pause=settle)
 
 
 def active_tab(xml: str) -> str | None:

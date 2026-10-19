@@ -483,6 +483,37 @@ def swipe(
     time.sleep(pause)
 
 
+def screen_size() -> tuple[int, int]:
+    """当前设备的屏幕分辨率（`wm size`）。
+
+    不缓存：云机重连/换设备后可能变，缓存会让下一轮打到旧尺寸上。
+    """
+    out = shell("wm", "size")
+    match = re.search(r"(\d+)x(\d+)", out)
+    if not match:
+        raise AdbError(f"读不到屏幕尺寸：{out!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def swipe_v(
+    x_ratio: float,
+    y_from_ratio: float,
+    y_to_ratio: float,
+    duration_ms: int = 400,
+    pause: float = 1.5,
+) -> None:
+    """按**比例**做纵向滑动——分辨率无关。
+
+    ★ 坐标写死是跨设备时最容易踩的坑：`swipe((540,1600),(540,700))` 在真机
+      1080x2244 上正常，在云机 720x1280 上直接滑出屏幕（y=1600 > 1280），
+      而且**不报错**——列表只是没动，看起来像「内容本来就这么多」。
+    """
+    width, height = screen_size()
+    x = int(width * x_ratio)
+    swipe((x, int(height * y_from_ratio)), (x, int(height * y_to_ratio)),
+          duration_ms=duration_ms, pause=pause)
+
+
 def _locate_by_text(markers: tuple[str, ...]):
     def locate(xml: str) -> list[str]:
         return [m for m in markers if find_exact(xml, m)]
