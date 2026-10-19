@@ -76,6 +76,10 @@ GREET_ENABLED = os.environ.get("BOSS_GREET_ENABLED", "") == "1"
 #: 一轮里最多打招呼多少个。★ 保守占位，不是实测值（见 services/boss-pipeline/app/config.py）。
 GREET_CAP = int(os.environ.get("BOSS_GREET_CAP", "5"))
 
+#: 干跑开关：只走到「立即沟通」按钮前、打印将发给谁，**不点**。
+#: 开启 `BOSS_GREET_ENABLED=1` 之前先用它确认目标（`greet()` 自身默认也是干跑）。
+GREET_DRY_RUN = os.environ.get("BOSS_GREET_DRY_RUN", "") == "1"
+
 WORK_WINDOW_START = (8, 0)
 WORK_WINDOW_END = (23, 0)
 
@@ -311,7 +315,7 @@ def collect_jd(title: str) -> bool:
     return True
 
 
-def collect_candidates(job_title: str, limit: int = 10) -> int:
+def collect_candidates(job_title: str, limit: int = 10) -> list[dict]:
     """采一个职位下的推荐候选人（列表卡上的那些字段）。
 
     ★ **不发 `boss_key`**——由服务端用姓名兜底。
@@ -333,7 +337,70 @@ def collect_candidates(job_title: str, limit: int = 10) -> int:
             "active": c.get("active", ""),
         } for c in cs])
     log(f"  「{job_title}」推荐 {len(cs)} 人")
-    return len(cs)
+    return cs
+
+
+def greet_candidates(collected: list[tuple[str, str]]) -> int:
+    """给本轮采到的候选人打招呼。★ **写操作**——会真的发消息。
+
+    - 只在 `GREET_ENABLED` 时才被调用；`GREET_DRY_RUN=1` 时只干跑
+    - 只挑**此刻在「牛人」当屏**的：`flows.greet()` 不往回滚，回滚会刷新推荐流
+      （实测代价见 flows.py 里那段注释）
+    - 单个失败只记日志、继续下一个
+    - 上限 `GREET_CAP`；每次真发后停 20 秒
+    """
+    if not collected:
+        log("  没有可打招呼的候选人")
+        return 0
+
+    xml = phone.ensure_tab("牛人")
+    on_screen = [(n, j) for n, j in collected if phone.find_exact(xml, n)]
+    off = len(collected) - len(on_screen)
+    if off:
+        log(f"  {off} 人不在当屏（不往回滚，跳过）")
+
+    sent = 0
+    for name, job_title in on_screen:
+        if sent >= GREET_CAP:
+            log(f"  已达本轮上限 {GREET_CAP}")
+            break
+        try:
+            res = flows.greet(name, allow_send=not GREET_DRY_RUN)
+        except flows.FlowMismatch as exc:
+            log(f"  给「{name}」打招呼失败：{exc}")
+            continue
+        if res.get("skipped"):
+            log(f"  「{name}」已在本地账本里（{res.get('first_at')}），跳过")
+            continue
+        if res.get("dry_run"):
+            log(f"  [干跑] 将发给「{res['candidate']}」按钮坐标 {res['would_tap']}")
+            continue
+        if not res.get("sent"):
+            log(f"  「{name}」结果未知：{res}")
+            continue
+
+        sent += 1
+        log(f"  ✅ 已发给「{res['candidate']}」（屏上我方消息 {res['messages_on_screen']} 条）")
+        boss_name = str(res["candidate"]).split("｜")[0]
+        for path, payload in (
+            ("/api/ingest/greet-log", [{"boss_key": res["candidate"], "job": job_title}]),
+            ("/api/ingest/interactions", [{
+                "boss_name": boss_name,
+                "job_title": job_title,
+                "direction": "out",
+                "msg_type": "greet",
+                "content": "",
+            }]),
+        ):
+            try:
+                _post(path, payload)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  （{path} 上报失败：{exc}）")
+        time.sleep(20)
+
+    if sent:
+        log(f"  本轮共发出 {sent} 条招呼")
+    return sent
 
 
 def collect_conversations(limit: int = 20) -> int:
@@ -391,14 +458,17 @@ def main_round() -> int:
             log(f"  抓「{job['title']}」的 JD 失败：{exc}")
 
     jobs = usable_jobs()
+    collected: list[tuple[str, str]] = []  # (姓名, 职位名) —— 供本轮打招呼用
     if not jobs:
         log("  没有可用职位（要 启用 + 开放中 + JD 读全），跳过候选人采集")
     else:
         for job in jobs[:3]:
             try:
-                collect_candidates(job["title"])
+                cs = collect_candidates(job["title"])
             except flows.FlowMismatch as exc:
                 log(f"  采「{job['title']}」的候选人失败：{exc}")
+                continue
+            collected += [(c["name"], job["title"]) for c in cs]
 
     state = load_inbound_state()
     n_unread = collect_conversations()
@@ -416,6 +486,8 @@ def main_round() -> int:
 
     if not GREET_ENABLED:
         log("  ★ 自动打招呼是关的（BOSS_GREET_ENABLED 未设）——这一轮只采集，不发消息")
+    else:
+        greet_candidates(collected)
     return 0
 
 

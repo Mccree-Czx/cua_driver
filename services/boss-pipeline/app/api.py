@@ -347,3 +347,45 @@ def ingest_tasklog(item: TaskLogIn, session: SessionDep) -> dict[str, int]:
     session.add(row)
     session.commit()
     return {"id": row.id}
+
+
+class InteractionIn(BaseModel):
+    boss_name: str
+    job_title: str = ""
+    direction: str = "out"          # out | in
+    msg_type: str = ""              # greet 等，见 INTERACTION_MSG_TYPES
+    content: str = ""
+
+
+@router.post("/api/ingest/interactions", dependencies=[Depends(_token_header)])
+def ingest_interactions(items: list[InteractionIn], session: SessionDep) -> dict[str, int]:
+    """采数端推「系统动作流水」。
+
+    ★ `hr_tools.has_out_greet()`（一人一消息联锁）读的就是这张表：
+      `direction=out` + `msg_type=greet`。而在此之前**没有任何写入者**——
+      服务端的重复打招呼联锁等于从未生效。
+
+    ★ 与 `messages` 的分工见 models.Interaction 的 docstring：这里只记
+      **我们做过什么**，不把对方说的话并进来（那会污染联锁）。
+    """
+    created = skipped = 0
+    for item in items:
+        jc = session.scalar(
+            select(models.JobCandidate)
+            .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+            .join(models.Job, models.Job.id == models.JobCandidate.job_id)
+            .where(models.Candidate.name == item.boss_name)
+            .where(models.Job.title == item.job_title)
+        )
+        if jc is None:
+            skipped += 1
+            continue
+        session.add(models.Interaction(
+            job_candidate_id=jc.id,
+            direction=item.direction,
+            msg_type=item.msg_type,
+            content=item.content,
+        ))
+        created += 1
+    session.commit()
+    return {"created": created, "skipped": skipped}
