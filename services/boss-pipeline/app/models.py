@@ -307,6 +307,9 @@ class JobCandidate(Base):
         server_default=_text(f"'{CandidateStatus.NEW.value}'"), index=True,
     )
     judge_reason: Mapped[str] = mapped_column(Text, default="")
+    #: screening 服务给的匹配分（1-5 星）。**可空**：没评过分前是 None。
+    #: 镜像猎聘 pipeline 的同名列（Integer，nullable）。
+    match_score: Mapped[int | None] = mapped_column(Integer)
     last_touch_at: Mapped[datetime | None] = mapped_column(DateTime)
     #: 「求过简历」的时刻。**72h 无人回应的锚点**（照猎聘的 sweep）。
     resume_requested_at: Mapped[datetime | None] = mapped_column(DateTime)

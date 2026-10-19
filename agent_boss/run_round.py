@@ -615,6 +615,22 @@ def daily_round() -> int:
         except flows.FlowMismatch as exc:
             log(f"  抓「{job['title']}」的 JD 失败：{exc}")
     collect_conversations(limit=50)
+
+    # ★ 服务端收尾：72h 无人回应关闭 + 延迟补评分（照猎聘的 daily sweep）。
+    try:
+        swept = _post("/api/ingest/daily-sweep", {})
+        log(f"  日常收尾：关闭 {swept.get('closed', 0)} 个，补评分 {swept.get('scored', 0)} 个")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  日常收尾失败（{exc}）——不阻塞")
+
+    # 配额可见：把今天的打招呼余量打到日志（不自动纠偏，只报告）。
+    try:
+        ov = _get("/api/hr/overview")
+        q = ov.get("today", {})
+        log(f"  今日打招呼配额 {q.get('quota_used', '?')}/{q.get('quota_cap', '?')}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  取配额失败（{exc}）")
+
     log("daily_round 结束")
     return 0
 

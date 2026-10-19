@@ -110,6 +110,7 @@ def _jc_out(jc: models.JobCandidate) -> dict[str, Any]:
         "id": jc.id,
         "status": jc.status,
         "judge_reason": jc.judge_reason,
+        "match_score": jc.match_score,
         "job_id": jc.job_id,
         "job_title": jc.job.title if jc.job else "",
         "candidate_id": jc.candidate_id,

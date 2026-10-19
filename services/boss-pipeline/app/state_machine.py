@@ -9,27 +9,26 @@
 
 ## BOSS 上真正能走通的链
 
-    new ──greet──▶ greeted ──request_resume──▶ resume_requested
-                                                     │
-                                               await_resume
-                                                     ▼
-                                               awaiting_resume ──receive_resume──▶ resume_received
-                                                     │                                     │
-                                               no_response                           hr_review
-                                                     │                                     ▼
-                                                     └───────────close────────▶ closed ◀──┘
+    new ──screen_pass──▶ screened_pass ──greet──▶ greeted ──request_resume──▶ resume_requested
+                                                                                 │
+                                                                           await_resume
+                                                                                 ▼
+                                                                           awaiting_resume ──receive_resume──▶ resume_received
+                                                                                 │                                     │
+                                                                           no_response                           hr_review
+                                                                                 │                                     ▼
+                                                                                 └───────────close────────▶ closed ◀──┘
 
 ## 与猎聘的三处实质差异
 
-1. **`rejected_hard` / `rejected_llm` 永不进入。**
-   BOSS 没有 hard_rules、也没有 LLM 打分（用户已定「先不做打分」）。
-   枚举值**保留**（跨端一致、以后接打分不用改枚举），但代码里不留进它们的边。
-   真要表达「不合适」时用 `override → closed`。
+1. **评分闸门重新打开（P2）。**
+   BOSS 复用猎聘的 screening 服务，牛人推荐流进来的候选人**先评分、通过才打招呼**：
+   `new → screened_pass / rejected_hard / rejected_llm`，再 `screened_pass → greeted`。
+   **对方主动开口（inbound）不评分**——对方先找上门，先回应，别用打分挡人。
 
-2. **`screened_pass` 保留但不用。**
-   BOSS 从牛人推荐流进来的候选人**已经被 BOSS 自己筛过一遍了**，
-   再插一个 sys 侧筛选态是多余的。所以 **`new → greeted` 直连**。
-   将来若做人工初筛再接回来。
+2. **`new → greeted` 直连已拆掉。**
+   打分启用后 `greet` 只能从 `screened_pass` 出发；没评过分或没过的 `new` 打不了招呼。
+   评分在 `hr_tools.screen_candidate` 里按需跑（打招呼前、逐候选人一次）。
 
 3. **★ BOSS 独有的「inbound 直收」边**：`(new, RECEIVE_RESUME) → resume_received`。
    对方在会话里**主动**发来简历、我们根本没求过——这是 BOSS 上很常见的一种开场。
@@ -61,8 +60,7 @@ INBOUND = "inbound"
 SOURCES = (RECOMMENDED, INBOUND)
 
 #: 终态。跟猎聘一致：进去了就不再迁移。
-#: 注意 `rejected_hard` / `rejected_llm` 在 BOSS 上**进不去**，但仍算终态
-#: （万一将来接打分，语义不能变）。
+#: `rejected_hard` / `rejected_llm` 现在**能进**（评分判拒），进了就锁死。
 TERMINAL = frozenset({S.REJECTED_HARD, S.REJECTED_LLM, S.CLOSED})
 
 
@@ -73,7 +71,10 @@ class InvalidTransition(Exception):
 class StateEvent(str, Enum):
     """状态机事件。★ 只保留 BOSS 上**有生产者**的那些。"""
 
-    GREET = "greet"                    # outbound: new → greeted
+    GREET = "greet"                    # outbound: screened_pass → greeted
+    SCREEN_PASS = "screen_pass"        # outbound: new → screened_pass（评分通过）
+    REJECT_HARD = "reject_hard"        # outbound: new → rejected_hard（硬规则不通过）
+    REJECT_LLM = "reject_llm"          # outbound: new → rejected_llm（LLM 打分低于门槛）
     REQUEST_RESUME = "request_resume"  # greeted → resume_requested
     AWAIT_RESUME = "await_resume"      # resume_requested → awaiting_resume
     RECEIVE_RESUME = "receive_resume"  # awaiting_resume → resume_received；inbound 可从 new 直收
@@ -118,8 +119,12 @@ _EDGES: dict[tuple[CandidateStatus, StateEvent], CandidateStatus] = {
 
 # 路径相关边：(当前状态, 事件) → {路径: 目标状态}
 _PATH_EDGES: dict[tuple[CandidateStatus, StateEvent], dict[str, CandidateStatus]] = {
-    # greet 恒 outbound：BOSS 上只有牛人列表的「立即沟通」能打招呼
-    (S.NEW, StateEvent.GREET): {RECOMMENDED: S.GREETED},
+    # 评分三步（照猎聘）：只有牛人推荐流才打分，对方主动开口（inbound）不打
+    (S.NEW, StateEvent.SCREEN_PASS): {RECOMMENDED: S.SCREENED_PASS},
+    (S.NEW, StateEvent.REJECT_HARD): {RECOMMENDED: S.REJECTED_HARD},
+    (S.NEW, StateEvent.REJECT_LLM): {RECOMMENDED: S.REJECTED_LLM},
+    # greet 恒 outbound：BOSS 上只有牛人列表的「立即沟通」能打招呼，且必须先评分通过
+    (S.SCREENED_PASS, StateEvent.GREET): {RECOMMENDED: S.GREETED},
     # ★ BOSS 独有：对方主动发来简历，我们没求过
     (S.NEW, StateEvent.RECEIVE_RESUME): {INBOUND: S.RESUME_RECEIVED},
 }

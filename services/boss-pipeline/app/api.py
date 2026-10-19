@@ -16,7 +16,7 @@ HR 面（驾驶舱/候选人/会话/人工队列/日志/日报/评分偏好）�
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -388,6 +388,15 @@ def ingest_interactions(items: list[InteractionIn], session: SessionDep) -> dict
             msg_type=item.msg_type,
             content=item.content,
         ))
+        # ★ 真发了招呼 → 状态推进到 greeted（让闸门与控制台都看得到）。
+        #   已经在终态/非 screened_pass 的只落流水、不推进（忽略 InvalidTransition）。
+        if item.direction == "out" and item.msg_type == "greet":
+            try:
+                hr_tools.apply_transition(
+                    session, jc, StateEvent.GREET, TransitionContext(source="recommended")
+                )
+            except InvalidTransition:
+                pass
         created += 1
     session.commit()
     return {"created": created, "skipped": skipped}
@@ -402,11 +411,14 @@ class GreetCheckIn(BaseModel):
 
 @router.post("/api/greet/check", dependencies=[Depends(_token_header)])
 def greet_check(item: GreetCheckIn, session: SessionDep) -> dict[str, Any]:
-    """打招呼前的服务端联锁：**风控熔断 → 重复打招呼 → 扣配额**。
+    """打招呼前的服务端联锁：**风控熔断 → 重复打招呼 → 评分 → 扣配额**。
 
     ★ `hr_tools.may_greet()` 的唯一调用方。在加这个端点之前**没有任何人调它**，
       于是每日配额和风控熔断对 BOSS 执行端形同虚设——只要本地账本没记过，
       想发多少条就发多少条。
+
+    ★ 评分闸门（P2）：`may_greet` 会在 `new` 上**按需评一次分**，只有
+      `screened_pass` 才放行；评分服务不可用则 fail-closed。
 
     ★ 真发路径在「检查通过」时就 `quota_acquire()` 扣一次配额；即使随后手机
       点击失败，这个名额也算用掉。保守方向，可接受。
@@ -422,11 +434,13 @@ def greet_check(item: GreetCheckIn, session: SessionDep) -> dict[str, Any]:
         return {"allowed": False, "reason": "库里没有这个候选人/职位的档案（先采集）"}
 
     if item.dry_run:
+        # 干跑不评分（评分是有副作用的落库动作）、不扣配额。
         if hr_tools.risk_check():
             return {"allowed": False, "reason": f"风控熔断中（{hr_tools.risk_reason()}）"}
         if hr_tools.has_out_greet(session, jc):
             return {"allowed": False, "reason": "这个人已经打过招呼了（系统账本）"}
-        return {"allowed": True, "reason": "", "dry_run": True}
+        reason = "未评分（干跑不评分）" if jc.status == "new" else ""
+        return {"allowed": True, "reason": reason, "dry_run": True}
 
     ok, why = hr_tools.may_greet(session, jc)
     return {"allowed": ok, "reason": why}
@@ -491,3 +505,46 @@ def ingest_attachment(item: AttachmentIn, session: SessionDep) -> dict[str, Any]
     ))
     session.commit()
     return {"object_key": key, "size": len(raw), "status": jc.status}
+
+
+@router.post("/api/ingest/daily-sweep", dependencies=[Depends(_token_header)])
+def daily_sweep(session: SessionDep) -> dict[str, int]:
+    """日常轮的服务端收尾：**72h 无人回应关闭 + 延迟补评分**。
+
+    ★ 72h 关闭照猎聘的 sweep：求过简历（`resume_requested_at`）超 72h 还没收到
+      → `no_response` → `closed`。锚点由 `apply_transition` 的 REQUEST_RESUME 打。
+
+    ★ 延迟补评分：`new` 且（summary/description 非空）且还没分 → 逐个 `screen_candidate`。
+      单次上限 20 条防 LLM 跑太久；漏下的下一轮再补（幂等，只评没分过的）。
+    """
+    # — 72h 无人回应 → 关闭 —
+    cutoff = datetime.now() - timedelta(hours=72)
+    stale = list(session.scalars(
+        select(models.JobCandidate)
+        .where(models.JobCandidate.status == "awaiting_resume")
+        .where(models.JobCandidate.resume_requested_at.is_not(None))
+        .where(models.JobCandidate.resume_requested_at < cutoff)
+    ))
+    closed = 0
+    for jc in stale:
+        try:
+            hr_tools.apply_transition(session, jc, StateEvent.NO_RESPONSE)
+            hr_tools.apply_transition(session, jc, StateEvent.CLOSE)
+            closed += 1
+        except InvalidTransition:
+            pass
+
+    # — 延迟补评分 —
+    scored = 0
+    pending = list(session.scalars(
+        select(models.JobCandidate)
+        .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .where(models.JobCandidate.status == "new")
+        .where(models.JobCandidate.match_score.is_(None))
+        .where((models.Candidate.summary != "") | models.Candidate.description.is_not(None))
+        .limit(20)
+    ))
+    for jc in pending:
+        if hr_tools.screen_candidate(session, jc) is not None:
+            scored += 1
+    return {"closed": closed, "scored": scored}

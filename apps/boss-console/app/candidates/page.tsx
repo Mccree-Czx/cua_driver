@@ -36,11 +36,20 @@ type Row = {
   expect_salary: string;
   tags: string[];
   last_touch_at: string | null;
+  /** screening 服务的匹配分（1-5 星）；没评过是 null */
+  match_score: number | null;
+  /** 评分判定的说明（为什么过 / 不过） */
+  judge_reason: string;
+  /** 附件简历的 MinIO 对象键；没收到是 null */
+  minio_object_key: string | null;
 };
 
 type Detail = Row & {
   description: string | null;
   company_history: string[];
+  /** 附件简历的预签名 MinIO 链接（15 分钟有效）；没收到是 null */
+  resume_url: string | null;
+  resume_downloaded_at: string | null;
   /** 系统动作流水 —— **我们对候选人做了什么** */
   interactions: { direction: string; msg_type: string; content: string; sent_at: string }[];
   overrides: { old_status: string; new_status: string; operator: string; reason: string; created_at: string }[];
@@ -174,17 +183,17 @@ export default function CandidatesPage() {
       render: (s: string) => <StatusCapsule status={s} />,
     },
     {
-      // ★ BOSS 还没接打分，这一列现在恒为空星——**结构先对齐**，接上就不用改版面。
+      // ★ 评分已接（screening 服务）。没评过是空星。
       title: "评分",
       key: "score",
       width: 110,
-      render: () => <StarRating score={null} />,
+      render: (_: unknown, r: Row) => <StarRating score={r.match_score ?? null} />,
     },
     {
-      title: "简历截图",
-      key: "snapshot",
-      width: 90,
-      render: () => "—",
+      title: "简历",
+      key: "resume",
+      width: 70,
+      render: (_: unknown, r: Row) => (r.minio_object_key ? "已收到" : "—"),
     },
     {
       title: "最近互动",
@@ -203,6 +212,8 @@ export default function CandidatesPage() {
             <div className="detail-grid">
               {[
                 ["状态", statusLabel(detail.status)],
+                ["评分", detail.match_score != null ? `${detail.match_score} 星` : "—"],
+                ["评分说明", detail.judge_reason || "—"],
                 ["职位", detail.job_title],
                 ["当前公司·职位", detail.job_and_company || "—"],
                 ["经验 / 学历 / 年龄",
@@ -223,6 +234,17 @@ export default function CandidatesPage() {
           label: "简历资料",
           children: (
             <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+              <div>
+                <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>附件简历</div>
+                {detail.resume_url ? (
+                  <a href={detail.resume_url} target="_blank" rel="noreferrer"
+                     style={{ color: "var(--brand-orange)" }}>
+                    打开简历 PDF（预签名，15 分钟有效）
+                  </a>
+                ) : (
+                  <span className="muted">未收到附件</span>
+                )}
+              </div>
               <div>
                 <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>自我描述</div>
                 <div className="multiline-box">{detail.description || "—"}</div>

@@ -69,6 +69,7 @@ def test_risk_gate_is_fail_closed_when_redis_is_down(session, use_broken_redis):
 def test_risk_set_blocks_greeting(session, fake_redis):
     job, cand = seed(session)
     jc = hr_tools.jc_get_or_create(session, job.id, cand.id)
+    hr_tools.apply_transition(session, jc, StateEvent.SCREEN_PASS, TransitionContext(source=RECOMMENDED))
 
     assert hr_tools.may_greet(session, jc)[0] is True
     hr_tools.risk_set("撞到滑块验证码")
@@ -116,6 +117,7 @@ def test_boss_keys_are_prefixed(monkeypatch):
 def test_one_message_guard(session, fake_redis):
     job, cand = seed(session)
     jc = hr_tools.jc_get_or_create(session, job.id, cand.id)
+    hr_tools.apply_transition(session, jc, StateEvent.SCREEN_PASS, TransitionContext(source=RECOMMENDED))
 
     assert hr_tools.has_out_greet(session, jc) is False
     assert hr_tools.may_greet(session, jc)[0] is True
@@ -158,6 +160,7 @@ def test_apply_transition_persists_and_stamps(session, fake_redis):
     job, cand = seed(session)
     jc = hr_tools.jc_get_or_create(session, job.id, cand.id)
 
+    hr_tools.apply_transition(session, jc, StateEvent.SCREEN_PASS, TransitionContext(source=RECOMMENDED))
     hr_tools.apply_transition(session, jc, StateEvent.GREET, TransitionContext(source=RECOMMENDED))
     assert jc.status == "greeted"
     assert jc.last_touch_at is not None
@@ -171,6 +174,7 @@ def test_apply_transition_stamps_resume_requested(session, fake_redis):
     """★ `resume_requested_at` 是 72h 无人回应的锚点，必须打上。"""
     job, cand = seed(session)
     jc = hr_tools.jc_get_or_create(session, job.id, cand.id)
+    hr_tools.apply_transition(session, jc, StateEvent.SCREEN_PASS, TransitionContext(source=RECOMMENDED))
     hr_tools.apply_transition(session, jc, StateEvent.GREET, TransitionContext(source=RECOMMENDED))
     hr_tools.apply_transition(session, jc, StateEvent.REQUEST_RESUME)
     assert jc.resume_requested_at is not None

@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     #: 留空 = 不校验（仅限本机开发）。生产必须设。
     ingest_token: str = ""
 
+    #: 复用猎聘的 screening 评分服务（197 上的 8001）。BOSS 打分走同一套契约。
+    #: 默认值指向本机；生产与 pipeline 一样由环境变量注入。
+    screening_url: str = "http://127.0.0.1:8001"
+
     #: 简历对象存储：**复用 197 上的 MinIO**，但 bucket 与猎聘刻意分开。
     #: ★ 与 DATABASE_URL 同一个理由：一次敲错名字就会覆盖对方的东西。
     minio_endpoint: str = "127.0.0.1:9000"

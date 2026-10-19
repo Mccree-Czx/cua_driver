@@ -227,3 +227,117 @@ def test_ingest_attachment_unknown_candidate_is_404(client, monkeypatch):
         "content_b64": base64.b64encode(b"%PDF-1.4 x").decode(),
     })
     assert r.status_code == 404
+
+
+# ——— 评分闸门 + 日常收尾（P2）———
+
+
+def _fake_screening(status, score=4, reason="匹配"):
+    """替换 `app.hr_tools._screening`，返回固定判定的替身客户端。"""
+    from hr_workbuddy import ScreeningResult
+
+    result = ScreeningResult(
+        hard_pass=True, hard_reasons=[], score=score,
+        judge_reason=reason, status=status, degraded=False,
+    )
+    return type("_FakeClient", (), {"screen": staticmethod(lambda req: result)})()
+
+
+def test_greet_check_screens_then_allows(client, monkeypatch, fake_redis):
+    """★ 评分闸门：new 候选人在打招呼前按需评分，通过才放行并落库。"""
+    from hr_workbuddy import CandidateStatus
+    monkeypatch.setattr(
+        "app.hr_tools._screening",
+        lambda: _fake_screening(CandidateStatus.SCREENED_PASS),
+    )
+    _candidate_and_job(client)
+
+    r = client.post("/api/greet/check", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+    })
+    assert r.status_code == 200
+    assert r.json()["allowed"] is True, r.json()
+
+    row = client.get("/api/hr/candidates").json()["items"][0]
+    assert row["status"] == "screened_pass"
+    assert row["match_score"] == 4
+    assert row["judge_reason"] == "匹配"
+
+
+def test_greet_check_blocks_rejected(client, monkeypatch, fake_redis):
+    """★ 评分不过 → 打招呼被拦，不扣配额、状态停在 rejected_llm。"""
+    from hr_workbuddy import CandidateStatus
+    monkeypatch.setattr(
+        "app.hr_tools._screening",
+        lambda: _fake_screening(CandidateStatus.REJECTED_LLM, score=2, reason="经验不匹配"),
+    )
+    _candidate_and_job(client)
+
+    r = client.post("/api/greet/check", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+    }).json()
+    assert r["allowed"] is False
+    assert "评分未通过" in r["reason"]
+
+    row = client.get("/api/hr/candidates").json()["items"][0]
+    assert row["status"] == "rejected_llm"
+
+
+def test_greet_check_fails_closed_when_screening_down(client, monkeypatch, fake_redis):
+    """★ 评分服务不可用 → fail-closed：不放行、不推进，仍停在 new。"""
+    def boom(req):
+        raise RuntimeError("screening down")
+    monkeypatch.setattr(
+        "app.hr_tools._screening",
+        lambda: type("_Down", (), {"screen": staticmethod(boom)})(),
+    )
+    _candidate_and_job(client)
+
+    r = client.post("/api/greet/check", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+    }).json()
+    assert r["allowed"] is False
+    assert "评分服务不可用" in r["reason"]
+
+    row = client.get("/api/hr/candidates").json()["items"][0]
+    assert row["status"] == "new"
+    assert row["match_score"] is None
+
+
+def test_daily_sweep_closes_stale_and_rescores(client, session, monkeypatch):
+    """★ 日常收尾：72h 没回应的 awaiting_resume 关闭；new 且没分的补评分。"""
+    from datetime import datetime, timedelta
+
+    from hr_workbuddy import CandidateStatus
+    from sqlalchemy import select
+
+    from app import models
+
+    monkeypatch.setattr(
+        "app.hr_tools._screening",
+        lambda: _fake_screening(CandidateStatus.SCREENED_PASS),
+    )
+    _ingest_job(client)
+    job = session.scalar(select(models.Job))
+
+    stale_cand = models.Candidate(boss_key="stale", name="老候选人")
+    session.add(stale_cand)
+    session.flush()
+    jc_stale = models.JobCandidate(
+        job_id=job.id, candidate_id=stale_cand.id, status="awaiting_resume",
+        resume_requested_at=datetime.now() - timedelta(hours=80),
+    )
+    session.add(jc_stale)
+
+    fresh_cand = models.Candidate(boss_key="fresh", name="新候选人", summary="5年｜本科｜面议")
+    session.add(fresh_cand)
+    session.flush()
+    jc_fresh = models.JobCandidate(job_id=job.id, candidate_id=fresh_cand.id, status="new")
+    session.add(jc_fresh)
+    session.commit()
+
+    body = client.post("/api/ingest/daily-sweep", json={}).json()
+    assert body == {"closed": 1, "scored": 1}
+
+    assert session.get(models.JobCandidate, jc_stale.id).status == "closed"
+    assert session.get(models.JobCandidate, jc_fresh.id).status == "screened_pass"

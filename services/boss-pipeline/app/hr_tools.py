@@ -29,15 +29,18 @@ BOSS 这边不一样：只读流程与打招呼**都是确定性的**（`agent_b
 from __future__ import annotations
 
 from datetime import date, datetime
+from functools import lru_cache
 from typing import Any
 
 import redis
+from hr_workbuddy import CandidateStatus, MinimalResume, ScreenRequest, ScreeningResult
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import keys, models
 from app.config import get_settings
-from app.state_machine import StateEvent, TransitionContext, transition
+from app.screening_client import ScreeningClient
+from app.state_machine import RECOMMENDED, StateEvent, TransitionContext, transition
 
 # ——— Redis ———
 
@@ -197,6 +200,66 @@ def interaction_log(
     return row
 
 
+# ——— 评分（复用猎聘 screening 服务）———
+
+
+_VERDICT_EVENT = {
+    CandidateStatus.SCREENED_PASS: StateEvent.SCREEN_PASS,
+    CandidateStatus.REJECTED_HARD: StateEvent.REJECT_HARD,
+    CandidateStatus.REJECTED_LLM: StateEvent.REJECT_LLM,
+}
+
+
+@lru_cache
+def _screening() -> ScreeningClient:
+    return ScreeningClient()
+
+
+def screen_candidate(session: Session, jc: models.JobCandidate) -> ScreeningResult | None:
+    """给一个**还没评过分的 jc** 打分并落库（status + match_score + judge_reason）。
+
+    ★ 只在 `status == new` 时执行——已评分 / 已推进的不再重复评（幂等）。
+    ★ 服务不可用（网络 / HTTP 错）→ 返回 None、**不落库、不迁移**，调用方 fail-closed。
+
+    评分数据来源：列表卡 `summary`（形如「10年以上｜本科｜面议」，按 ｜ best-effort 拆）
+    + `tags`。详情页字段（degree/description 等）没接采集，有就优先用，没有退回拆出来的。
+    """
+    if jc.status != CandidateStatus.NEW.value:
+        return None
+
+    cand = jc.candidate
+    job = jc.job
+    parts = [p.strip() for p in (cand.summary or "").split("｜")]
+    resume = MinimalResume(
+        name=cand.name,
+        liepin_user_id=cand.boss_key or f"boss:{cand.id}",
+        education=cand.degree or (parts[1] if len(parts) > 1 else ""),
+        years_of_experience=cand.work_year or (parts[0] if len(parts) > 0 else ""),
+        city=cand.expect_job_city or "",
+        salary=cand.expect_salary or (parts[2] if len(parts) > 2 else ""),
+        experience_summary=cand.description or cand.summary or "",
+    )
+    prefs = job.scoring_prefs if isinstance(job.scoring_prefs, dict) else {}
+    request = ScreenRequest(
+        job_id=job.id,
+        resume=resume,
+        jd_text=job.jd_text or "",
+        hard_rules={},
+        min_stars=prefs.get("min_stars", 3),
+        scoring_prefs=prefs,
+        llm_scoring=True,
+    )
+    try:
+        result = _screening().screen(request)
+    except Exception:  # noqa: BLE001 —— 网络 / HTTP / 解析错都算「服务不可用」
+        return None
+
+    jc.match_score = result.score
+    jc.judge_reason = result.judge_reason
+    apply_transition(session, jc, _VERDICT_EVENT[result.status], TransitionContext(source=RECOMMENDED))
+    return result
+
+
 # ——— 一人一消息 ———
 
 def has_out_greet(session: Session, jc: models.JobCandidate) -> bool:
@@ -223,13 +286,19 @@ def has_out_greet(session: Session, jc: models.JobCandidate) -> bool:
 def may_greet(session: Session, jc: models.JobCandidate) -> tuple[bool, str]:
     """打招呼的总闸门。返回 `(能不能, 原因)`。
 
-    ★ 顺序是刻意的：**先查熔断，再查重复，最后才扣配额**。
-      扣配额是有副作用的（计数 +1），不能在一个注定要拒的场景里白扣。
+    ★ 顺序是刻意的：**先查熔断，再查重复，再评分，最后才扣配额**。
+      扣配额是有副作用的（计数 +1），不能在一个注定要拒的场景里白扣；
+      评分也有成本（一次 LLM），所以排在「已经打过招呼」之后、只在 `new` 上跑。
     """
     if risk_check():
         return False, f"风控熔断中（{risk_reason()}）——停手，等人处理"
     if has_out_greet(session, jc):
         return False, "这个人已经打过招呼了（系统账本里有）"
+    if jc.status == CandidateStatus.NEW.value:
+        if screen_candidate(session, jc) is None:
+            return False, "评分服务不可用——停手，等人处理"
+    if jc.status != CandidateStatus.SCREENED_PASS.value:
+        return False, f"评分未通过（{jc.status}：{jc.judge_reason}）"
     if not quota_acquire():
         return False, "今天的打招呼配额用完了"
     return True, ""
