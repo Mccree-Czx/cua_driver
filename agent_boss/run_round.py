@@ -46,6 +46,7 @@ BOSS 不一样：登录有**三道人工关卡**（易盾滑块 / 短信 / 人�
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -79,6 +80,12 @@ GREET_CAP = int(os.environ.get("BOSS_GREET_CAP", "5"))
 #: 干跑开关：只走到「立即沟通」按钮前、打印将发给谁，**不点**。
 #: 开启 `BOSS_GREET_ENABLED=1` 之前先用它确认目标（`greet()` 自身默认也是干跑）。
 GREET_DRY_RUN = os.environ.get("BOSS_GREET_DRY_RUN", "") == "1"
+
+#: 一轮最多处理几个简历（同意请求 + 下载已投递）。附件链路一步要 ~30–60 秒。
+RESUME_CAP = int(os.environ.get("BOSS_RESUME_CAP", "3"))
+
+#: 已取过的简历账本（本地；服务端另有一份 minio_object_key 兜底）。
+RESUME_LEDGER = AGENT_DIR / ".resumes.json"
 
 WORK_WINDOW_START = (8, 0)
 WORK_WINDOW_END = (23, 0)
@@ -364,6 +371,20 @@ def greet_candidates(collected: list[tuple[str, str]]) -> int:
         if sent >= GREET_CAP:
             log(f"  已达本轮上限 {GREET_CAP}")
             break
+
+        # ★ 真发前必须先过服务端联锁（风控熔断 → 重复打招呼 → 扣配额）。
+        #   fail-closed：服务端不可达就不发——宁可少发一条，也不要绕过闸门。
+        #   干跑不调它（不消耗配额）。
+        if not GREET_DRY_RUN:
+            try:
+                chk = _post("/api/greet/check", {"boss_name": name, "job_title": job_title})
+            except Exception as exc:  # noqa: BLE001
+                log(f"  服务端联锁不可用（{exc}）——本轮跳过「{name}」")
+                continue
+            if not chk.get("allowed"):
+                log(f"  服务端拒绝给「{name}」打招呼：{chk.get('reason')}")
+                continue
+
         try:
             res = flows.greet(name, allow_send=not GREET_DRY_RUN)
         except flows.FlowMismatch as exc:
@@ -401,6 +422,94 @@ def greet_candidates(collected: list[tuple[str, str]]) -> int:
     if sent:
         log(f"  本轮共发出 {sent} 条招呼")
     return sent
+
+
+def _back_to_main() -> None:
+    for _ in range(6):
+        if phone.current_activity().endswith("MainActivity"):
+            return
+        phone.back()
+    log(f"  （退不回主界面，当前 {phone.current_activity()}）")
+
+
+def _load_resumes() -> dict:
+    if RESUME_LEDGER.exists():
+        try:
+            return json.loads(RESUME_LEDGER.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+def _save_resumes(data: dict) -> None:
+    RESUME_LEDGER.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def resume_work() -> int:
+    """同意「对方想发送简历」的请求，并下载已投递的附件简历。
+
+    ★ 只处理**候选人主动提出**的简历；主动「求简历」是另一种触达，本轮不做。
+    ★ 每轮最多 `RESUME_CAP` 个：附件链路（预览 → 分享 → UC → pull）一步 30–60 秒。
+    """
+    convs = flows.scan_conversations(limit=30)
+    # ★ 列表预览文本有两种形态（实测）：「[附件简历]」或「对方想发送附件简历给您…」，
+    #   而且有时是同一行里并排的两个节点——只认「附件简历」这个共同子串最稳。
+    offers = [c["name"] for c in convs if "附件简历" in (c.get("last_msg") or "")]
+    delivered = [
+        (c["name"], (c.get("last_msg") or "").strip())
+        for c in convs
+        if ".pdf" in (c.get("last_msg") or "").lower()
+    ]
+    if not offers and not delivered:
+        return 0
+
+    approved = 0
+    for name in offers[:RESUME_CAP]:
+        try:
+            flows.open_conversation(name)
+            if flows.approve_resume_offer():
+                approved += 1
+                log(f"  已同意「{name}」发送附件简历")
+        except flows.FlowMismatch as exc:
+            log(f"  同意「{name}」的简历请求失败：{exc}")
+        finally:
+            _back_to_main()
+
+    book = _load_resumes()
+    saved = 0
+    for name, preview in delivered[:RESUME_CAP]:
+        if f"{name}｜{preview}" in book:
+            continue
+        try:
+            flows.open_conversation(name)
+            got = flows.fetch_resume()
+        except flows.FlowMismatch as exc:
+            log(f"  取「{name}」的简历失败：{exc}")
+            continue
+        finally:
+            _back_to_main()
+
+        try:
+            _post("/api/ingest/attachment", {
+                "boss_name": name,
+                "job_title": got.get("job_title", ""),
+                "filename": got["filename"],
+                "content_b64": base64.b64encode(
+                    Path(got["local_path"]).read_bytes()
+                ).decode("ascii"),
+            })
+            book[f"{name}｜{got['filename']}"] = {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "size": got["size"],
+            }
+            _save_resumes(book)
+            saved += 1
+            log(f"  ✅ 已归档「{name}」的简历：{got['filename']}（{got['size']} 字节）")
+        except Exception as exc:  # noqa: BLE001
+            log(f"  （「{name}」的简历上传失败：{exc}）")
+
+    log(f"  简历：同意 {approved} 个请求，归档 {saved} 份")
+    return approved + saved
 
 
 def collect_conversations(limit: int = 20) -> int:
@@ -483,6 +592,11 @@ def main_round() -> int:
         log(f"  连续 {state['empty_streak']} 轮没读到会话——这一轮不读未读了（退避 {BACKOFF_MINUTES} 分钟）")
     else:
         log(f"  读了 {read_unread_conversations()} 个未读会话")
+
+    try:
+        resume_work()
+    except flows.FlowMismatch as exc:
+        log(f"  简历处理中断：{exc}")
 
     if not GREET_ENABLED:
         log("  ★ 自动打招呼是关的（BOSS_GREET_ENABLED 未设）——这一轮只采集，不发消息")

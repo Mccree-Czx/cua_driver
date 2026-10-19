@@ -153,3 +153,77 @@ def test_missing_ids_are_404_not_500(client):
     assert client.get("/api/jobs/9999").status_code == 404
     assert client.get("/api/candidates/9999").status_code == 404
     assert client.get("/api/conversations/9999").status_code == 404
+
+
+def _candidate_and_job(client):
+    """造一个 jc（职位 + 候选人），供附件测试用。"""
+    _ingest_job(client)
+    key = "侯怡旭｜北京擎天创世科技·数据开发"
+    client.post("/api/ingest/candidates", json=[{
+        "boss_key": key, "name": "侯怡旭", "job_title": "高级大数据开发工程师",
+        "job_and_company": "北京擎天创世科技·数据开发",
+        "work_year": "5年", "degree": "本科", "age": "28岁",
+        "description": "数据开发", "expect_salary": "15-17K",
+    }])
+    return key
+
+
+def test_ingest_attachment_stores_and_advances(client, monkeypatch):
+    """★ 附件简历：存 MinIO → 写 object_key → 状态推进 resume_received → 记 interaction。"""
+    monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
+    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: f"https://minio/{key}")
+    _candidate_and_job(client)
+
+    pdf = b"%PDF-1.4 fake resume bytes"
+    import base64
+    r = client.post("/api/ingest/attachment", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+        "filename": "侯怡旭-数据开发-5年.pdf",
+        "content_b64": base64.b64encode(pdf).decode(),
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["size"] == len(pdf)
+    assert body["status"] == "resume_received"
+    assert body["object_key"].startswith("resumes/")
+
+    # 落库：object_key / resume_downloaded_at / interaction(attachment)
+    row = client.get("/api/hr/candidates").json()["items"][0]
+    detail = client.get(f"/api/hr/candidates/{row['id']}").json()
+    assert detail["status"] == "resume_received"
+    assert detail["resume_downloaded_at"] is not None
+    assert detail["minio_object_key"] == body["object_key"]
+
+    # 幂等：再推一遍同一个，直接返回 skipped
+    r2 = client.post("/api/ingest/attachment", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+        "filename": "侯怡旭-数据开发-5年.pdf",
+        "content_b64": base64.b64encode(pdf).decode(),
+    }).json()
+    assert r2 == {"skipped": True, "object_key": body["object_key"]}
+
+
+def test_ingest_attachment_rejects_non_pdf(client, monkeypatch):
+    monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
+    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: None)
+    _candidate_and_job(client)
+    import base64
+    r = client.post("/api/ingest/attachment", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+        "filename": "x.pdf",
+        "content_b64": base64.b64encode(b"not a pdf").decode(),
+    })
+    assert r.status_code == 400
+
+
+def test_ingest_attachment_unknown_candidate_is_404(client, monkeypatch):
+    monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
+    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: None)
+    _candidate_and_job(client)
+    import base64
+    r = client.post("/api/ingest/attachment", json={
+        "boss_name": "不存在的人", "job_title": "高级大数据开发工程师",
+        "filename": "x.pdf",
+        "content_b64": base64.b64encode(b"%PDF-1.4 x").decode(),
+    })
+    assert r.status_code == 404

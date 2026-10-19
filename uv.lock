@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -146,6 +146,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "hr-workbuddy-contracts" },
+    { name = "minio" },
     { name = "pydantic-settings" },
     { name = "pymysql" },
     { name = "redis" },
@@ -165,6 +166,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "hr-workbuddy-contracts", editable = "packages/contracts" },
+    { name = "minio", specifier = ">=7.2" },
     { name = "pydantic-settings", specifier = ">=2.2" },
     { name = "pymysql", specifier = ">=1.1" },
     { name = "redis", specifier = ">=5.0" },

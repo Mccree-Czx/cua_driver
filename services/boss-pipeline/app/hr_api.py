@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from hr_workbuddy import CandidateStatus
 
-from app import hr_tools, keys, models
+from app import hr_tools, keys, models, storage
 from app.deps import get_session
 from app.state_machine import InvalidTransition, StateEvent, TransitionContext
 
@@ -125,6 +125,9 @@ def _jc_out(jc: models.JobCandidate) -> dict[str, Any]:
         "tags": (cand.tags or []) if cand else [],
         "last_touch_at": jc.last_touch_at.isoformat() if jc.last_touch_at else None,
         "resume_requested_at": jc.resume_requested_at.isoformat() if jc.resume_requested_at else None,
+        "resume_downloaded_at": jc.resume_downloaded_at.isoformat() if jc.resume_downloaded_at else None,
+        #: 附件简历的 MinIO 对象键（空 = 还没收到）。控制台据此判断要不要给「简历」链接。
+        "minio_object_key": jc.minio_object_key,
     }
 
 
@@ -160,6 +163,8 @@ def get_candidate(jc_id: int, session: SessionDep) -> dict[str, Any]:
     out = _jc_out(jc)
     out["description"] = jc.candidate.description if jc.candidate else None
     out["company_history"] = (jc.candidate.company_history or []) if jc.candidate else []
+    # 附件简历的预签名链接（只有收到简历才有；15 分钟有效）
+    out["resume_url"] = storage.presigned_get_url(jc.minio_object_key)
     # 系统动作流水（不是聊天记录——聊天在 /conversations 那边）
     out["interactions"] = [
         {"direction": i.direction, "msg_type": i.msg_type, "content": i.content,

@@ -104,6 +104,12 @@ _EDGES: dict[tuple[CandidateStatus, StateEvent], CandidateStatus] = {
     (S.GREETED, StateEvent.REQUEST_RESUME): S.RESUME_REQUESTED,
     (S.RESUME_REQUESTED, StateEvent.AWAIT_RESUME): S.AWAITING_RESUME,
     (S.AWAITING_RESUME, StateEvent.RECEIVE_RESUME): S.RESUME_RECEIVED,
+    # ★ BOSS 实测（2026-10-19）：打招呼之后，候选人可以**主动**提出发附件简历
+    #   （聊天页出现「对方想发送附件简历给您，您是否同意」）。我们没求过，所以
+    #   不能强行走 request_resume → await_resume 那条链——直接从 greeted /
+    #   resume_requested 收下。
+    (S.GREETED, StateEvent.RECEIVE_RESUME): S.RESUME_RECEIVED,
+    (S.RESUME_REQUESTED, StateEvent.RECEIVE_RESUME): S.RESUME_RECEIVED,
     (S.AWAITING_RESUME, StateEvent.NO_RESPONSE): S.NO_RESPONSE,
     (S.NO_RESPONSE, StateEvent.CLOSE): S.CLOSED,
     (S.RESUME_RECEIVED, StateEvent.HR_REVIEW): S.HR_REVIEWED,

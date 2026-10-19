@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     #: 留空 = 不校验（仅限本机开发）。生产必须设。
     ingest_token: str = ""
 
+    #: 简历对象存储：**复用 197 上的 MinIO**，但 bucket 与猎聘刻意分开。
+    #: ★ 与 DATABASE_URL 同一个理由：一次敲错名字就会覆盖对方的东西。
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_bucket: str = "boss-workbuddy"
+
 
 @lru_cache
 def get_settings() -> Settings:

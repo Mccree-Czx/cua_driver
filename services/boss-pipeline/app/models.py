@@ -311,6 +311,9 @@ class JobCandidate(Base):
     #: 「求过简历」的时刻。**72h 无人回应的锚点**（照猎聘的 sweep）。
     resume_requested_at: Mapped[datetime | None] = mapped_column(DateTime)
     resume_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    #: 附件简历在 MinIO 里的对象键（`resumes/{job_id}/{candidate_id}/{filename}`）。
+    #: 空 = 还没收到简历。收到后由 `/api/ingest/attachment` 写入。
+    minio_object_key: Mapped[str | None] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=_text("CURRENT_TIMESTAMP"))
 
     job: Mapped["Job"] = relationship()

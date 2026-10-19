@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -881,6 +882,153 @@ def greet(candidate: str, *, allow_send: bool = False) -> dict[str, Any]:
         phone.back()
     return {"ok": True, "sent": True, "candidate": key, "in_chat_room": True,
             "messages_on_screen": len(outgoing)}
+
+
+# —— 附件简历（2026-10-19 实测摸通）——
+#
+# 真实链路（与猎聘不同）：
+#   1. 候选人主动发来「对方想发送附件简历给您，您是否同意」→ 我们点「同意」
+#   2. 之后聊天页出现简历卡：「对方已投递简历，您可至邮箱中查看和下载」+
+#      `tv_resume_name`（文件名）+「点击预览附件简历」
+#   3. 点卡片 → `WebViewActivity` PDF 预览
+#   4. 预览页右上 `iv_action_1` → 华为分享面板 → UC浏览器
+#   5. UC 弹「PDF阅读器(推荐)」→ 点它 → 文件落到 **UC 缓存目录**
+#   6. `adb pull` 该文件（与猎聘 `_fetch_via_uc` 同一个目录）
+#
+# ★ 注意：BOSS 说「可至邮箱中查看」，但 App 本体确实把 PDF 落到了 UC 缓存，
+#   所以不需要读邮箱——除非哪天 App 改成只发邮件。
+
+UC_CACHE_DIR = "/sdcard/Android/data/com.UCMobile/cache"
+
+
+def _find_label_containing(xml: str, sub: str) -> dict[str, Any] | None:
+    return next((n for n in phone.nodes(xml) if sub in phone.label(n)), None)
+
+
+def _find_resume_card(xml: str) -> dict[str, Any] | None:
+    """聊天页里「附件简历」卡片的可点容器。
+
+    卡片本身没有 rid，靠它内部的 `tv_resume_desc`（「点击预览附件简历」）定位，
+    再找 bounds 包含它的那个可点 `ll_card_view`。
+    """
+    desc = phone.find_rid(xml, "tv_resume_desc")
+    if desc is None:
+        return None
+    cx, cy = desc["center"]
+    for node in phone.nodes(xml):
+        if not (node["rid"].endswith("ll_card_view") and node["clickable"]):
+            continue
+        x1, y1, x2, y2 = node["bounds"]
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            return node
+    return None
+
+
+def open_conversation(name: str, step: str = "打开会话") -> str:
+    """在「消息」列表里按姓名找到会话并点进去，返回聊天页 dump。"""
+    xml = phone.ensure_tab("消息")
+    for _ in range(8):
+        node = phone.find_exact(xml, name)
+        if node is not None:
+            x1, y1, x2, y2 = node["bounds"]
+            phone.tap((x1 + 40, (y1 + y2) // 2), pause=6)
+            xml = phone.dump_stable()
+            if "ChatRoomActivity" not in phone.current_activity():
+                raise FlowMismatch(step, f"点了「{name}」但没进聊天页", phone.texts(xml))
+            _guard_risk(xml, step)
+            return xml
+        phone.swipe_v(0.5, 0.72, 0.38)
+        xml = phone.dump_stable()
+    raise FlowMismatch(step, f"消息列表里找不到「{name}」", phone.texts(xml))
+
+
+def approve_resume_offer(step: str = "同意简历") -> bool:
+    """如果当前聊天页在问「对方想发送附件简历…您是否同意」，点「同意」。
+
+    返回 True = 点了；False = 本来就没有这个请求。
+    ★ 只认 `tv_dialog_btn_right` 且文字必须精确是「同意」——左侧是「拒绝」。
+    """
+    xml = phone.dump_stable()
+    _guard_risk(xml, step)
+    btn = phone.find_rid(xml, "tv_dialog_btn_right")
+    if btn is None:
+        return False
+    if phone.label(btn) != "同意":
+        raise FlowMismatch(step, f"右侧按钮不是「同意」而是 {phone.label(btn)!r}", phone.texts(xml))
+    phone.tap_node(btn, pause=5)
+    return True
+
+
+def fetch_resume(step: str = "取简历") -> dict[str, Any]:
+    """从当前聊天页取附件简历，返回 {filename, local_path, size}。
+
+    前提：聊天页上已经有「附件简历」卡片（候选人同意发送之后才会出现）。
+    全程只读 App 内容；最后一步是 `adb pull` UC 的缓存文件。
+    """
+    xml = phone.dump_stable()
+    _guard_risk(xml, step)
+    card = _find_resume_card(xml)
+    if card is None:
+        raise FlowMismatch(step, "聊天页上没有「附件简历」卡片", phone.texts(xml))
+    name_node = phone.find_rid(xml, "tv_resume_name")
+    filename = phone.label(name_node).strip() if name_node else ""
+    job_node = phone.find_rid(xml, "tv_sub_title")
+    job_title = phone.label(job_node).strip() if job_node else ""
+
+    before = _uc_pdf_paths()
+    phone.tap_node(card, pause=8)
+    if "WebViewActivity" not in phone.current_activity():
+        raise FlowMismatch(step, "点简历卡后没进 PDF 预览", phone.texts(phone.dump_stable()))
+
+    share = phone.find_rid(phone.dump_stable(), "iv_action_1")
+    if share is None:
+        raise FlowMismatch(step, "PDF 预览页上没有分享按钮 iv_action_1")
+    phone.tap_node(share, pause=5)
+
+    # 华为分享面板 → UC浏览器（点图标区域；标签在下方）
+    xml = phone.dump_stable()
+    _guard_risk(xml, step)
+    uc = phone.find_exact(xml, "UC浏览器")
+    if uc is None:
+        raise FlowMismatch(step, "分享面板里没有「UC浏览器」", phone.texts(xml))
+    x1, y1, x2, y2 = uc["bounds"]
+    phone.tap(((x1 + x2) // 2, y1 - 60), pause=6)
+
+    # UC 的「打开方式」弹窗 → PDF阅读器(推荐)
+    xml = phone.dump_stable()
+    reader = _find_label_containing(xml, "PDF阅读器")
+    if reader is None:
+        # 有些机型直接把 PDF 当网页打开，没有弹窗——继续等缓存即可
+        pass
+    else:
+        phone.tap_node(reader, pause=8)
+
+    remote = _wait_new_uc_pdf(before, timeout=45.0)
+    if remote is None:
+        raise FlowMismatch(step, "UC 缓存里没等到新的 PDF（分享链路可能没走通）", phone.texts(phone.dump_stable()))
+
+    local = Path(tempfile.mkdtemp(prefix="boss_resume_")) / (filename or Path(remote).name)
+    phone.adb("pull", remote, str(local))
+    data = local.read_bytes()
+    if not data.startswith(b"%PDF"):
+        raise FlowMismatch(step, f"拉下来的不是 PDF（前 8 字节 {data[:8]!r}）")
+    return {"filename": filename or Path(remote).name, "local_path": str(local),
+            "size": len(data), "remote": remote, "job_title": job_title}
+
+
+def _uc_pdf_paths() -> set[str]:
+    out = phone.shell(f"ls {UC_CACHE_DIR} 2>/dev/null")
+    return {line.strip() for line in out.splitlines() if line.strip().lower().endswith(".pdf")}
+
+
+def _wait_new_uc_pdf(before: set[str], timeout: float = 45.0) -> str | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        new = _uc_pdf_paths() - before
+        if new:
+            return max(new, key=lambda p: int(phone.shell(f"stat -c %Y '{UC_CACHE_DIR}/{p}' 2>/dev/null") or 0))
+        time.sleep(1.5)
+    return None
 
 
 # —— ★ 没有的东西（写给下一个改这个文件的人）——

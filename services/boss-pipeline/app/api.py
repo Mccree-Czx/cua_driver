@@ -15,6 +15,7 @@ HR 面（驾驶舱/候选人/会话/人工队列/日志/日报/评分偏好）�
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -23,8 +24,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import hr_tools, models
+from app import hr_tools, models, storage
 from app.deps import get_session, require_ingest_token
+from app.state_machine import InvalidTransition, StateEvent, TransitionContext
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -389,3 +391,103 @@ def ingest_interactions(items: list[InteractionIn], session: SessionDep) -> dict
         created += 1
     session.commit()
     return {"created": created, "skipped": skipped}
+
+
+class GreetCheckIn(BaseModel):
+    boss_name: str
+    job_title: str = ""
+    #: 干跑：只查风控与重复，**不扣配额**。
+    dry_run: bool = False
+
+
+@router.post("/api/greet/check", dependencies=[Depends(_token_header)])
+def greet_check(item: GreetCheckIn, session: SessionDep) -> dict[str, Any]:
+    """打招呼前的服务端联锁：**风控熔断 → 重复打招呼 → 扣配额**。
+
+    ★ `hr_tools.may_greet()` 的唯一调用方。在加这个端点之前**没有任何人调它**，
+      于是每日配额和风控熔断对 BOSS 执行端形同虚设——只要本地账本没记过，
+      想发多少条就发多少条。
+
+    ★ 真发路径在「检查通过」时就 `quota_acquire()` 扣一次配额；即使随后手机
+      点击失败，这个名额也算用掉。保守方向，可接受。
+    """
+    jc = session.scalar(
+        select(models.JobCandidate)
+        .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .join(models.Job, models.Job.id == models.JobCandidate.job_id)
+        .where(models.Candidate.name == item.boss_name)
+        .where(models.Job.title == item.job_title)
+    )
+    if jc is None:
+        return {"allowed": False, "reason": "库里没有这个候选人/职位的档案（先采集）"}
+
+    if item.dry_run:
+        if hr_tools.risk_check():
+            return {"allowed": False, "reason": f"风控熔断中（{hr_tools.risk_reason()}）"}
+        if hr_tools.has_out_greet(session, jc):
+            return {"allowed": False, "reason": "这个人已经打过招呼了（系统账本）"}
+        return {"allowed": True, "reason": "", "dry_run": True}
+
+    ok, why = hr_tools.may_greet(session, jc)
+    return {"allowed": ok, "reason": why}
+
+
+class AttachmentIn(BaseModel):
+    boss_name: str
+    job_title: str = ""
+    filename: str
+    #: PDF 的 base64（采数端从 UC 缓存 pull 出来再编码）
+    content_b64: str
+
+
+@router.post("/api/ingest/attachment", dependencies=[Depends(_token_header)])
+def ingest_attachment(item: AttachmentIn, session: SessionDep) -> dict[str, Any]:
+    """采数端推回一份附件简历。
+
+    ★ BOSS 的简历是**候选人主动提出、我们同意后**才送达的（聊天页卡片
+      「对方已投递简历」）。采数端走「点卡片预览 → 分享到 UC → pull 缓存」
+      拿到真 PDF，这里负责：落 MinIO、写 `minio_object_key` /
+      `resume_downloaded_at`、状态推进到 `resume_received`、
+      并记一条 `interaction(attachment)`。
+
+    幂等：jc 已有 object_key 就直接返回，不重复上传。
+    """
+    try:
+        raw = base64.b64decode(item.content_b64, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"content_b64 解不开：{exc}") from exc
+    if not raw.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="不是 PDF（魔数不符）")
+
+    jc = session.scalar(
+        select(models.JobCandidate)
+        .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .join(models.Job, models.Job.id == models.JobCandidate.job_id)
+        .where(models.Candidate.name == item.boss_name)
+        .where(models.Job.title == item.job_title)
+    )
+    if jc is None:
+        raise HTTPException(status_code=404, detail="找不到候选人/职位的档案")
+    if jc.minio_object_key:
+        return {"skipped": True, "object_key": jc.minio_object_key}
+
+    key = f"resumes/{jc.job_id}/{jc.candidate_id}/{item.filename}"
+    storage.put_object(key, raw)
+    jc.minio_object_key = key
+
+    ctx = TransitionContext(source="inbound") if jc.status == "new" else None
+    try:
+        hr_tools.apply_transition(session, jc, StateEvent.RECEIVE_RESUME, ctx)
+    except InvalidTransition:
+        # 当前状态不在「可收」的起点上（例如已进终态）：只落简历，不改状态
+        jc.resume_downloaded_at = jc.resume_downloaded_at or datetime.now()
+        session.add(jc)
+
+    session.add(models.Interaction(
+        job_candidate_id=jc.id,
+        direction="in",
+        msg_type="attachment",
+        content=f"附件简历 {item.filename}（{len(raw)} 字节）",
+    ))
+    session.commit()
+    return {"object_key": key, "size": len(raw), "status": jc.status}

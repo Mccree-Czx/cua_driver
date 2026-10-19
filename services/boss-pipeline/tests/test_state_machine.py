@@ -108,6 +108,19 @@ def test_receive_resume_from_awaiting_needs_no_source():
     assert row.status == S.RESUME_RECEIVED.value
 
 
+def test_receive_resume_after_greet():
+    """★ BOSS 实测（2026-10-19）：打过招呼后，候选人可以**主动**发附件简历，
+    我们没求过——不能强走 request_resume 那条链，直接从 greeted 收下。"""
+    row = transition(jc(S.GREETED), StateEvent.RECEIVE_RESUME)
+    assert row.status == S.RESUME_RECEIVED.value
+
+
+def test_receive_resume_after_request():
+    """求过简历、对方还没正式投之前，也可以直接收到附件（不经过 awaiting_resume）。"""
+    row = transition(jc(S.RESUME_REQUESTED), StateEvent.RECEIVE_RESUME)
+    assert row.status == S.RESUME_RECEIVED.value
+
+
 # ——— BOSS 上刻意没有的东西 ———
 
 def test_scoring_states_are_unreachable():
