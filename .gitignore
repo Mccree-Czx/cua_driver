@@ -43,3 +43,6 @@ agent_boss/.inbound_state.json
 agent_boss/.round.lock
 agent_boss/.login_gate_in_flight
 agent_boss/.greeted.json
+agent_boss/.round_*.log
+agent_boss/.smoke_*.log
+agent_boss/.greet_*.log

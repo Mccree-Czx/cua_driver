@@ -337,6 +337,9 @@ DEFAULT_ROUND_TIMEOUT = 3600  # 一轮最长 3600s；login_round 不经 Pi，不
 FORCE_INBOUND = os.environ.get("BOSS_FORCE_INBOUND", "").strip() == "1"
 ROUND_MAX_ITEMS = os.environ.get("BOSS_ROUND_MAX_ITEMS", "").strip()
 ROUND_MAX_GREETS = os.environ.get("BOSS_ROUND_MAX_GREETS", "").strip()
+#: 人工锁定的**唯一**招呼对象（真机验证/人工指定单发时用）。配合 BOSS_GREET_ENABLED=1。
+FORCE_GREET_JC = os.environ.get("BOSS_FORCE_GREET_JC", "").strip()
+FORCE_GREET_NAME = os.environ.get("BOSS_FORCE_GREET_NAME", "").strip()
 
 #: 本轮 Pi 消耗的 token/cost，由 _run_pi_round 在跑完后填，__main__ 落库一次。
 _pi_tokens = 0
@@ -526,6 +529,17 @@ def _append_round_caps(prompt: str) -> str:
             "只采集候选人、读详情、读未读会话；`greet_check` / `gated_tap(touch=True)` / "
             "`interaction_log(out, greet)` 一律不要做。`@@RESULT@@` 的 outbound 填 0。"
         )
+    if FORCE_GREET_JC:
+        target = f"jc_id={FORCE_GREET_JC}"
+        if FORCE_GREET_NAME:
+            target += f"（姓名={FORCE_GREET_NAME}）"
+        caps.append(
+            f"**本轮触达对象被人工锁定为唯一一个：{target}。**"
+            "除此之外**任何**候选人都不许打招呼 / 发消息 / 索要简历。"
+            "先在「牛人」列表里按姓名找到这个人、点进详情页，`jc_status` 确认 jc_id 无误后，"
+            "再走 `greet_check → gated_tap(touch=True) 点「立即沟通」→ interaction_log(out,greet)`。"
+            "完成这一个后立即收手，`@@RESULT@@` 的 outbound 按实际打招呼数（0 或 1）填。"
+        )
     if FORCE_INBOUND:
         caps.append(
             "**本轮强制只走 inbound（处理未读消息），跳过 outbound（打招呼/采候选人）。**"
@@ -612,6 +626,7 @@ def _run_pi_round(name: str) -> int:
                 cmd,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,  # ★ 否则 node 继承父进程打开的 stdin，pi CLI 会阻塞在读 stdin 上（真机验证踩过）
                 text=True,
                 cwd=str(AGENT_DIR),
                 env=env,
