@@ -1,35 +1,42 @@
 """安全联锁 + 状态落库。
 
-## 为什么不复刻猎聘的 MCP 工具层
+BOSS 现在和猎聘一样走 **Pi（LLM）+ MCP 控制层**：`agent_boss/run_round.py` 拉起 Pi，
+Pi 调 `services/boss-pipeline/tools_mcp_server.py`。Pi 只负责「看和决定」，
+**所有真机写动作仍走这里的联锁**——本模块是这些联锁的**唯一实现**，MCP 层只是薄封装。
 
-猎聘有 **32 个 MCP 工具**（`services/pipeline/tools_mcp_server.py`），那是为
-「**Pi 是唯一决策者**」服务的——每一步点哪里都交给 LLM 现算。
+## 与猎聘的差异（BOSS 语义）
 
-BOSS 这边不一样：只读流程与打招呼**都是确定性的**（`agent_boss/flows.py`，
-已在真机上验证过，不依赖 LLM）。再套一层 MCP + LLM，**只增成本与故障面**。
-
-所以这里把猎聘 32 个工具里真正有价值的那部分——**安全联锁与状态落库**——
-抽成**普通 Python 函数**，谁都能调（服务端直调、执行端经 HTTP 调）。
+- **单账号**：无 `account_id` / 无 `Account` 模型，Redis 键都 `boss:` 前缀。
+- **候选人主键 = `boss_key`**：实测退回只用 `name`（`api.py::_boss_key`）。
+- **评分闸门**：牛人推荐流先评分、`screened_pass` 才允许打招呼（`may_greet`）。
+- **附件简历**走确定性路径（HTTP `/api/ingest/attachment`），不进 MCP/不进 Pi。
+- **登录三道人工关卡**（易盾滑块/短信/人脸）不进 Pi。
 
 ## 与猎聘工具的对照
 
 | 猎聘 MCP 工具 | BOSS | 说明 |
 |---|---|---|
-| `gated_tap` | `may_greet()` + `quota_acquire()` | 触达的唯一闸门 |
+| `gated_tap` | 同名（本模块新增） | 触达点击的风控闸门；限额由 `may_greet` 扣 |
 | `risk_check` / `risk_set` / `risk_clear` | 同名 | 风控熔断 |
 | `ensure_one_message` / `candidate_has_out_message` | `has_out_greet()` | 一人一消息 |
 | `state_transition` | `apply_transition()` | 推进 + 落库 |
 | `interaction_log` | 同名 | 动作流水 |
 | `tasklog_add` | 同名 | 轮次成本 |
 | `job_list_active` | 同名 | 非 active 的职位在这里就看不见 |
+| `candidate_get_or_create` | 同名（本模块新增） | 建档（boss_key，空值不盖已有） |
+| `close_stale_awaiting` / 补评分 | `daily_sweep()`（本模块新增） | 72h 关闭 + 补评分 |
 | `login_fill_phone` / `login_req_*` / `login_map_get` | —— | ❌ 不复刻：BOSS 登录是人过的关卡 |
 | 全部带 `account_id` 的 | —— | ❌ 不复刻：BOSS 单账号 |
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+import os
+import shutil
+import subprocess
+from datetime import date, datetime, timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import redis
@@ -40,7 +47,13 @@ from sqlalchemy.orm import Session
 from app import keys, models
 from app.config import get_settings
 from app.screening_client import ScreeningClient
-from app.state_machine import RECOMMENDED, StateEvent, TransitionContext, transition
+from app.state_machine import (
+    RECOMMENDED,
+    InvalidTransition,
+    StateEvent,
+    TransitionContext,
+    transition,
+)
 
 # ——— Redis ———
 
@@ -115,6 +128,54 @@ def quota_acquire(n: int = 1) -> bool:
         return False                       # fail-closed
 
 
+# ——— 触达写动作（adb）———
+
+def _resolve_adb() -> str:
+    """定位 adb 可执行文件。照猎聘 `tools_mcp_server._resolve_adb` 同一套探测。
+
+    ★ 不赌 PATH：计划任务/服务拉起的 PATH 未必带 platform-tools，
+      按「部署时的实际位置」逐个探测，可用 `HR_ADB` 显式覆盖。
+    """
+    candidates = [
+        os.environ.get("HR_ADB"),
+        "/opt/homebrew/bin/adb",
+        str(Path.home() / "Library/Android/sdk/platform-tools/adb"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
+        r"C:\platform-tools\adb.exe",
+        shutil.which("adb"),
+    ]
+    for exe in candidates:
+        if exe and Path(exe).exists():
+            return str(exe)
+    return "adb"                            # 交给 PATH，失败时报错更直白
+
+
+ADB = _resolve_adb()
+
+
+def gated_tap(x: int, y: int, touch: bool = False) -> dict[str, Any]:
+    """闸门 + 原子 tap：触达类点击的强制前置检查。
+
+    `touch=True`（立即沟通/发送/索要等会触达候选人的点击）→ 先过风控熔断，
+    熔断中**不执行 tap**。`touch=False`（浏览/进详情等读操作）直接执行。
+
+    ★ BOSS 单账号、每日限额由 `may_greet`/`greet_check` 的 `quota_acquire` 管，
+      这里不重复扣（与猎聘的 `counts_daily` 不同——BOSS 的配额语义在 greet_check）。
+    """
+    if touch and risk_check():
+        return {"executed": False, "reason": f"risk_paused（{risk_reason()}）"}
+    try:
+        result = subprocess.run(
+            [ADB, "shell", "input", "tap", str(int(x)), str(int(y))],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"executed": False, "reason": f"adb 调用失败：{type(exc).__name__}"}
+    if result.returncode != 0:
+        return {"executed": False, "reason": (result.stderr or "").strip()[:200]}
+    return {"executed": True, "reason": None, "touch_checked": touch}
+
+
 # ——— 职位 ———
 
 def job_list_active(session: Session) -> list[models.Job]:
@@ -135,6 +196,83 @@ def job_list_active(session: Session) -> list[models.Job]:
         .where(models.Job.jd_complete.is_(True))
         .order_by(models.Job.title)
     ))
+
+
+# ——— 建档 ———
+
+def candidate_get_or_create(
+    session: Session,
+    *,
+    name: str,
+    boss_key: str = "",
+    job_title: str = "",
+    job_and_company: str = "",
+    work_status: str = "",
+    work_year: str = "",
+    degree: str = "",
+    age: str = "",
+    description: str | None = None,
+    expect_job_city: str = "",
+    expect_salary: str = "",
+    expect_industry: str = "",
+    summary: str = "",
+    tags: list[str] | None = None,
+    company_history: list[str] | None = None,
+    active: str = "",
+) -> dict[str, Any]:
+    """取或建候选人，并把详情页字段叠上去。
+
+    ★ 主键 = `boss_key or name`（BOSS 实测退回只用 `name`——列表卡与详情页的
+      公司串会不一样，别把公司串拼进主键）。Pi 建档时**留 `boss_key` 为空**即可。
+    ★ **空值不盖已有**：列表页推上来的缺详情字段（degree/description/…），
+      不能用空值冲掉详情页已采到的值（照 `api.ingest_candidates` 同一套规则）。
+    ★ 给了 `job_title` 且职位存在 → 顺带建 jc，返回里带 `jc_id`。
+    """
+    if not name.strip():
+        return {"error": "name 不能为空（BOSS 主键退回只用 name）"}
+    key = boss_key.strip() or name.strip()
+    cand = session.scalar(
+        select(models.Candidate).where(models.Candidate.boss_key == key)
+    )
+    created = cand is None
+    if cand is None:
+        cand = models.Candidate(boss_key=key, name=name.strip())
+        session.add(cand)
+        session.flush()
+
+    for field, value in (
+        ("name", name.strip()),
+        ("job_and_company", job_and_company),
+        ("work_status", work_status),
+        ("work_year", work_year),
+        ("degree", degree),
+        ("age", age),
+        ("description", description),
+        ("expect_job_city", expect_job_city),
+        ("expect_salary", expect_salary),
+        ("expect_industry", expect_industry),
+        ("summary", summary),
+        ("tags", tags),
+        ("company_history", company_history),
+        ("active", active),
+    ):
+        if value in (None, "", [], {}) and getattr(cand, field, None):
+            continue
+        setattr(cand, field, value)
+
+    out: dict[str, Any] = {
+        "candidate_id": cand.id, "boss_key": cand.boss_key, "created": created,
+    }
+    if job_title:
+        job = session.scalar(select(models.Job).where(models.Job.title == job_title))
+        if job is not None:
+            jc = jc_get_or_create(session, job.id, cand.id)
+            out["jc_id"] = jc.id
+            out["job_id"] = job.id
+        else:
+            out["warning"] = f"职位 {job_title!r} 不存在——候选人已建档但没建 jc（先补职位）"
+    session.commit()
+    return out
 
 
 # ——— 状态落库 ———
@@ -342,3 +480,42 @@ def counts(session: Session) -> dict[str, Any]:
         "quota_cap": get_settings().daily_greet_cap,
         "risk_paused": risk_check(),
     }
+
+
+# ——— 每日收尾 ———
+
+def daily_sweep(session: Session) -> dict[str, int]:
+    """日常收尾：72h 无人回应的 awaiting_resume 关闭 + 给没分的 new 补评分。
+
+    照 `api.ingest_daily_sweep`（api.py:510-550）同一套逻辑，抽出来给 MCP 的
+    `daily_round` 用。幂等：关闭只挑超 72h 的 awaiting_resume；补评分只挑没分的 new。
+    """
+    cutoff = datetime.now() - timedelta(hours=72)
+    stale = list(session.scalars(
+        select(models.JobCandidate)
+        .where(models.JobCandidate.status == "awaiting_resume")
+        .where(models.JobCandidate.resume_requested_at.is_not(None))
+        .where(models.JobCandidate.resume_requested_at < cutoff)
+    ))
+    closed = 0
+    for jc in stale:
+        try:
+            apply_transition(session, jc, StateEvent.NO_RESPONSE)
+            apply_transition(session, jc, StateEvent.CLOSE)
+            closed += 1
+        except InvalidTransition:
+            pass
+
+    scored = 0
+    pending = list(session.scalars(
+        select(models.JobCandidate)
+        .join(models.Candidate, models.Candidate.id == models.JobCandidate.candidate_id)
+        .where(models.JobCandidate.status == "new")
+        .where(models.JobCandidate.match_score.is_(None))
+        .where((models.Candidate.summary != "") | models.Candidate.description.is_not(None))
+        .limit(20)
+    ))
+    for jc in pending:
+        if screen_candidate(session, jc) is not None:
+            scored += 1
+    return {"closed": closed, "scored": scored}

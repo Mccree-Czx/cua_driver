@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """BOSS 轮次运行器。
 
-## 与猎聘 `agent/run_round.py` 最大的不同：**不拉 Pi**
+## 控制层：Pi（LLM）+ MCP，与猎聘一致
 
-猎聘的轮次会 `node pi --append-system-prompt ... -p <轮次提示词>`，让 LLM
-**实时决定每一步点哪里**。BOSS 这边不用：`agent_boss/flows.py` 的流程
-**全是确定性的**（已在真机上验证过），所以这里直接调函数——
-少一个 LLM、少一层不确定、少一份 token 账单。
+轮次正文 spawn Pi：`node pi --provider deepseek --model deepseek-flash
+--append-system-prompt system-prompt.md -p <轮次提示词>`，Pi 挂两个 MCP
+server（`mobile` 看屏/点/滑 + `hr-tools` 状态/联锁/触达），**实时决定每一步**。
+真机写动作仍走服务端闸门（`gated_tap(touch=True)` / `greet_check` / 配额），
+LLM 只负责「看和决定」。
+
+逃生口 `BOSS_USE_PI=0` 退回旧的确定性 `flows.*` 路径（`_*_legacy`），
+真机验证 Pi 出问题时一键回退。默认 `BOSS_USE_PI=1`。
 
 ## 闸门顺序（照猎聘的 7 道，逐条说明哪里改了）
 
@@ -41,7 +45,7 @@ BOSS 不一样：登录有**三道人工关卡**（易盾滑块 / 短信 / 人�
     python3 agent_boss/run_round.py login_round      # 人工兜底，只检查不动作
 
 环境变量：`BOSS_SERVER_URL`（默认 http://127.0.0.1:8100）、
-`BOSS_INGEST_TOKEN`、`ANDROID_SERIAL`、`BOSS_GREET_ENABLED`。
+`BOSS_INGEST_TOKEN`、`ANDROID_SERIAL`、`BOSS_GREET_ENABLED`、`BOSS_USE_PI`。
 """
 
 from __future__ import annotations
@@ -49,6 +53,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -293,6 +300,350 @@ def jobs_needing_jd() -> list[dict]:
       判断条件是「在招 **且** 还没读全」，不是「已经读全了」。
     """
     return [j for j in _all_jobs() if _is_on(j) and not j.get("jd_complete")]
+
+
+# ——— Pi（LLM）控制层 ———
+#
+# 对齐猎聘：轮次正文不再直接调 flows.*，而是 spawn Pi（node + DeepSeek），
+# Pi 挂两个 MCP server（mobile + hr-tools）实时决定每一步。所有真机写动作
+# 仍走服务端闸门（gated_tap / greet_check / 配额）——LLM 只负责「看和决定」。
+# 逃生口 BOSS_USE_PI=0 退回旧的确定性路径（_*_legacy）。
+
+USE_PI = os.environ.get("BOSS_USE_PI", "1") == "1"
+
+PROVIDER = "deepseek"
+MODEL = "deepseek-flash"
+
+SYSTEM_PROMPT = AGENT_DIR / "system-prompt.md"
+ROUNDS_FILE = AGENT_DIR / "rounds.md"
+
+# Pi 配置目录：BOSS 用自己的一份（mcp.json 指向 mobile + BOSS hr-tools），
+# 与猎聘 ~/.pi/hr-agent 隔离——两边不会互拉对方的 MCP server。
+PI_AGENT_DIR = Path(os.environ.get("HR_PI_AGENT_DIR") or (Path.home() / ".pi" / "hr-agent-boss"))
+
+# rounds.md 中的轮次标题 → 节号（extract_round_prompt 解析用）
+ROUND_SECTIONS = [
+    ("main_round", "## 1."),
+    ("daily_round", "## 2."),
+    ("backfill_round", "## 3."),
+    ("login_round", "## 4."),
+]
+
+DEFAULT_ROUND_TIMEOUT = 3600  # 一轮最长 3600s；login_round 不经 Pi，不受此限
+
+# 可选的单轮上限（默认不设 = 真机行为零变化）。语义同猎聘 HR_ROUND_MAX_*：
+# 云机大列表扫描慢、或做带触达的验证时，用提示词里的硬限制让 Pi 自己数着做、
+# 按顺序落账后收尾——硬 kill 会打断一次「已点出但还没落账」的触达。
+FORCE_INBOUND = os.environ.get("BOSS_FORCE_INBOUND", "").strip() == "1"
+ROUND_MAX_ITEMS = os.environ.get("BOSS_ROUND_MAX_ITEMS", "").strip()
+ROUND_MAX_GREETS = os.environ.get("BOSS_ROUND_MAX_GREETS", "").strip()
+
+#: 本轮 Pi 消耗的 token/cost，由 _run_pi_round 在跑完后填，__main__ 落库一次。
+_pi_tokens = 0
+_pi_cost = 0.0
+
+
+def _resolve_pi_cli() -> str:
+    """定位 pi 的 JS 入口，跨平台（照猎聘 agent/run_round.py 抄）。
+
+    HR_PI_CLI 可显式指定入口（固定版本、与机器上其它 Pi 隔离）。
+    Windows 下 npm 的 pi.cmd shim 不能被 CreateProcess 直跑，必须用 node + JS 入口。
+    """
+    candidates = [os.environ.get("HR_PI_CLI"), shutil.which("pi")]
+    candidates += [
+        "/opt/homebrew/bin/pi",   # Apple Silicon Homebrew
+        "/usr/local/bin/pi",      # Intel Homebrew
+        str(Path.home() / ".npm-global/bin/pi"),
+    ]
+    for exe in candidates:
+        if not exe:
+            continue
+        real = Path(exe).resolve()
+        if real.suffix == ".js" and real.exists():
+            return str(real)
+    try:
+        root = subprocess.run(
+            ["npm", "root", "-g"], capture_output=True, text=True, timeout=30
+        ).stdout.strip()
+        if root:
+            cand = Path(root) / "@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+            if cand.exists():
+                return str(cand)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # 兜底：Windows 的 npm 全局目录
+    return str(
+        Path(os.environ.get("APPDATA", ""))
+        / "npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+    )
+
+
+PI_CLI = _resolve_pi_cli()
+
+
+def _resolve_node() -> str:
+    """定位 node。不赌 PATH（计划任务/非交互 shell 的 PATH 常缺 Homebrew）。"""
+    candidates = [os.environ.get("HR_NODE"), shutil.which("node")]
+    candidates += [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        str(Path.home() / ".npm-global/bin/node"),
+    ]
+    for exe in candidates:
+        if exe and Path(exe).exists():
+            return str(exe)
+    here = Path(PI_CLI).parent
+    for _ in range(6):
+        cand = here / "bin" / "node"
+        if cand.exists():
+            return str(cand)
+        if here.parent == here:
+            break
+        here = here.parent
+    return "node"
+
+
+NODE = _resolve_node()
+
+
+def _load_api_key() -> str:
+    """从环境变量或 cua_driver/.env 读 DeepSeek key（不硬编码）。"""
+    key = os.environ.get("SCREENING_LLM_API_KEY", "")
+    if key:
+        return key
+    env_file = AGENT_DIR.parent / ".env"
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("SCREENING_LLM_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+API_KEY = _load_api_key()
+
+
+def _session_dir() -> Path | None:
+    """找 Pi 的 session 目录（agent 目录，排除 pi-agent/mobile_spike）。"""
+    root = PI_AGENT_DIR / "sessions"
+    try:
+        for d in root.iterdir():
+            if d.is_dir() and d.name.endswith("agent--") and "pi-agent" not in d.name:
+                return d
+    except OSError:
+        pass
+    return None
+
+
+def _summarize_tokens(session_file: Path) -> tuple[int, float]:
+    """逐条累加 session jsonl 的 input/output/cacheRead/reasoning 与 cost.total。"""
+    total_tokens = 0
+    total_cost = 0.0
+    try:
+        text = session_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0, 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        stack = [d]
+        while stack:
+            obj = stack.pop()
+            if isinstance(obj, dict):
+                u = obj.get("usage")
+                if isinstance(u, dict):
+                    total_tokens += (
+                        int(u.get("input", 0) or 0)
+                        + int(u.get("output", 0) or 0)
+                        + int(u.get("cacheRead", 0) or 0)
+                        + int(u.get("reasoning", 0) or 0)
+                    )
+                    c = u.get("cost", {})
+                    if isinstance(c, dict):
+                        total_cost += float(c.get("total", 0) or 0)
+                    continue
+                stack.extend(obj.values())
+            elif isinstance(obj, list):
+                stack.extend(obj)
+    return total_tokens, total_cost
+
+
+def _session_tokens_since(sdir: Path | None, before_mtime: float) -> tuple[int, float] | None:
+    """本轮新产生的 session 文件的 (tokens, cost)；没有就返回 None。"""
+    if not sdir:
+        return None
+    try:
+        new_files = [f for f in sdir.glob("*.jsonl") if f.stat().st_mtime > before_mtime]
+    except OSError:
+        return None
+    if not new_files:
+        return None
+    return _summarize_tokens(max(new_files, key=lambda f: f.stat().st_mtime))
+
+
+def extract_round_prompt(name: str) -> str:
+    try:
+        text = ROUNDS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        raise SystemExit(f"rounds.md 不存在：{ROUNDS_FILE}")
+    sections = {n: marker for n, marker in ROUND_SECTIONS}
+    markers = sorted(sections.values(), key=text.find)
+    start_marker = sections[name]
+    start = text.find(start_marker)
+    if start < 0:
+        raise SystemExit(f"rounds.md 中找不到轮次 {name}")
+    next_pos = len(text)
+    for m in markers:
+        pos = text.find(m, start + 1)
+        if pos > start and pos < next_pos:
+            next_pos = pos
+    return text[start:next_pos].strip()
+
+
+def parse_round_result(output: str):
+    m = re.search(r"@@RESULT@@\s+inbound=(\d+)\s+outbound=(\d+)", output)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _append_round_caps(prompt: str) -> str:
+    """把可选上限拼到本轮提示词末尾；没设就原样返回（真机行为零变化）。"""
+    caps: list[str] = []
+    if not GREET_ENABLED:
+        # ★ 服务端 may_greet 不读 BOSS_GREET_ENABLED（那是 agent 侧闸门），
+        #   所以 Pi 模式下必须在这里把「默认关打招呼」显式塞给 Pi——否则 Pi 会
+        #   默认去打招呼，直接绕过这条铁律。这是写动作的兜底，不是提示词的软约束。
+        caps.append(
+            "**本轮禁止一切打招呼 / 发消息（`BOSS_GREET_ENABLED` 未设，自动打招呼默认关）。**"
+            "只采集候选人、读详情、读未读会话；`greet_check` / `gated_tap(touch=True)` / "
+            "`interaction_log(out, greet)` 一律不要做。`@@RESULT@@` 的 outbound 填 0。"
+        )
+    if FORCE_INBOUND:
+        caps.append(
+            "**本轮强制只走 inbound（处理未读消息），跳过 outbound（打招呼/采候选人）。**"
+            "即使 `quota_status()` 返回 remaining > 0 也照此执行——这是人工指定的测试轮。"
+            "不要为了消耗额度去打招呼；先把未读会话按 inbound 流程处理完，"
+            "再按 `@@RESULT@@` 格式报告（inbound 填实际处理数、outbound 填 0）。"
+        )
+    if ROUND_MAX_ITEMS:
+        caps.append(
+            f"本轮最多处理 {ROUND_MAX_ITEMS} 个候选人/会话，超出的**留待下一轮**"
+            "（下一轮会重新取到未完成的部分），不要为了做完而赶工。"
+        )
+    if ROUND_MAX_GREETS:
+        caps.append(
+            f"本轮**最多完成 {ROUND_MAX_GREETS} 次触达**（打招呼 / 索要简历等一切会触达真人的动作）。"
+            "数到上限就**立即停止一切触达**；已经发出去的那几次，务必按"
+            "「验证上屏 → interaction_log(out) → state_transition → tasklog_add」"
+            "顺序落完账再结束本轮。**不要重试、不要补发。**"
+        )
+    if not caps:
+        return prompt
+    lines = "\n".join(f"- {c}" for c in caps)
+    return (
+        f"{prompt}\n\n---\n\n## ★ 本轮硬限制（优先级高于上文的一般性描述）\n\n"
+        f"{lines}\n\n"
+        "达到限制后**不要继续操作手机**，按上述顺序落账，输出 `@@RESULT@@` 行后结束。"
+    )
+
+
+def _write_token_summary(
+    name: str, tokens: int, cost: float, outcome: str, duration: float = 0.0, note: str = ""
+) -> None:
+    """用 HTTP 记一行轮次成本/结果。BOSS 单账号：无 account_id，走 round_name。
+
+    与猎聘不同：BOSS 的 run_round 本就用 `/api/ingest/tasklog` 上报运行记录，
+    这里把 token/cost 并进同一行，不额外起子进程、不重复上报。
+    """
+    try:
+        _post("/api/ingest/tasklog", {
+            "round_name": name,
+            "outcome": outcome,
+            "tokens": tokens,
+            "cost": cost,
+            "duration": round(duration, 1),
+            "note": note,
+        })
+    except Exception as exc:  # noqa: BLE001
+        log(f"（运行记录上报失败，不影响本轮：{exc}）")
+
+
+def _run_pi_round(name: str) -> int:
+    """spawn Pi 跑一轮，返回 Pi 退出码（124 = 超时）。
+
+    镜像猎聘 agent/run_round.py 的 main()：拼 prompt → spawn node pi →
+    落日志 → 数 token → 解析 @@RESULT@@。差别：
+    - 轮次闸门 + 全局锁仍由本文件 main() 负责，这里只负责跑 Pi。
+    - token/cost 只记到模块级 _pi_tokens/_pi_cost，落库统一在 __main__ 做一次。
+    """
+    global _pi_tokens, _pi_cost
+    prompt = _append_round_caps(extract_round_prompt(name))
+    cmd = [
+        NODE, str(PI_CLI),
+        "--provider", PROVIDER,
+        "--model", MODEL,
+        "--api-key", API_KEY,
+        "--append-system-prompt", str(SYSTEM_PROMPT),
+        "-p", prompt,
+    ]
+    sdir = _session_dir()
+    before_mtime = 0.0
+    if sdir:
+        try:
+            files = list(sdir.glob("*.jsonl"))
+            if files:
+                before_mtime = max(f.stat().st_mtime for f in files)
+        except OSError:
+            pass
+    started = time.time()
+    log_path = AGENT_DIR / f".round_{name}.log"
+    try:
+        with open(log_path, "w", encoding="utf-8") as logf:
+            env = {**os.environ, "PI_CODING_AGENT_DIR": str(PI_AGENT_DIR)}
+            result = subprocess.run(
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(AGENT_DIR),
+                env=env,
+                timeout=DEFAULT_ROUND_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
+        log(f"[{name}] 超时（{DEFAULT_ROUND_TIMEOUT}s）强制结束")
+        got = _session_tokens_since(sdir, before_mtime)
+        if got:
+            _pi_tokens, _pi_cost = got
+            log(f"[{name}] tokens={got[0]}, cost={got[1]:.6f}（超时结束）")
+        return 124
+    output = log_path.read_text(encoding="utf-8")
+    if output:
+        print(output, end="")
+    log(f"[{name}] 退出码 {result.returncode}，耗时 {time.time()-started:.0f}s")
+    got = _session_tokens_since(sdir, before_mtime)
+    if got:
+        _pi_tokens, _pi_cost = got
+        log(f"[{name}] tokens={got[0]}, cost={got[1]:.6f}")
+    if name == "main_round":
+        parsed = parse_round_result(output)
+        if parsed is not None:
+            inbound, outbound = parsed
+            state = load_inbound_state()
+            if outbound > 0 or inbound > 0:
+                state["empty_streak"] = 0
+            else:
+                state["empty_streak"] = state.get("empty_streak", 0) + 1
+                state["last_empty_at"] = datetime.now().isoformat()
+            save_inbound_state(state)
+    return result.returncode
 
 
 # ——— 采集 ———
@@ -546,7 +897,7 @@ def read_unread_conversations(limit: int = 5) -> int:
 
 # ——— 轮次 ———
 
-def main_round() -> int:
+def _main_round_legacy() -> int:
     log(f"main_round 开始（自动打招呼：{'开' if GREET_ENABLED else '**关**'}）")
 
     collect_jobs()
@@ -605,7 +956,7 @@ def main_round() -> int:
     return 0
 
 
-def daily_round() -> int:
+def _daily_round_legacy() -> int:
     log("daily_round 开始")
     collect_jobs()
     # ★ 抓的是「在招但 JD 还没读全」的那批，不是「已经可用的」——否则死锁，见 jobs_needing_jd
@@ -658,7 +1009,7 @@ def login_round() -> int:
     return 0
 
 
-def backfill_round() -> int:
+def _backfill_round_legacy() -> int:
     log("backfill_round 开始")
     collect_jobs()
     for job in jobs_needing_jd():
@@ -667,6 +1018,24 @@ def backfill_round() -> int:
         except flows.FlowMismatch as exc:
             log(f"  抓「{job['title']}」的 JD 失败：{exc}")
     return 0
+
+
+def main_round() -> int:
+    if USE_PI:
+        return _run_pi_round("main_round")
+    return _main_round_legacy()
+
+
+def daily_round() -> int:
+    if USE_PI:
+        return _run_pi_round("daily_round")
+    return _daily_round_legacy()
+
+
+def backfill_round() -> int:
+    if USE_PI:
+        return _run_pi_round("backfill_round")
+    return _backfill_round_legacy()
 
 
 RUNNERS = {
@@ -770,7 +1139,9 @@ if __name__ == "__main__":
         note = f"{type(exc).__name__}: {exc}"[:400]
         code = 1
     else:
-        if code != 0:
+        if code == 124:
+            outcome = "timeout"
+        elif code != 0:
             outcome = "failed"
 
     duration = time.time() - started
@@ -780,14 +1151,6 @@ if __name__ == "__main__":
     # ★ 只报真正跑过的轮次——闸门跳过的别报，否则日志会被 [skip] 刷满。
     # ★ fail-soft：上报失败只记日志，绝不改退出码。
     if _ran_round:
-        try:
-            _post("/api/ingest/tasklog", {
-                "round_name": round_name,
-                "outcome": outcome,
-                "duration": round(duration, 1),
-                "note": note,
-            })
-        except Exception as exc:  # noqa: BLE001
-            log(f"（运行记录上报失败，不影响本轮：{exc}）")
+        _write_token_summary(round_name, _pi_tokens, _pi_cost, outcome, duration, note)
 
     sys.exit(code)
