@@ -21,17 +21,23 @@
    - 退回牛人列表继续；**绝不往回滚**（往回滚会刷新推荐流）
 3. 每打 3-5 个批量 dump 验证上屏；漏发者标「可能未发送」，绝不补发/重试。
 
-### 1b. inbound（未读消息）
-1. 切「消息」tab，读会话列表（未读 badge rid `badge_view`），只处理未读会话（单轮上限由外部 `BOSS_ROUND_MAX_ITEMS` 控制）。
-2. 对每个未读会话：
-   - 点进会话读对方消息（BOSS 打开会话会自动标已读）
-   - `candidate_get_or_create(name)` 建档（inbound，不评分）
-   - 对方已发简历 → `state_transition(jc_id, "receive_resume", source="inbound")`
-   - 对方想发附件简历 → 检测「附件简历」气泡 → 汇报让确定性路径下载，不逐步微操
-   - 需要回应 → `greet_check` → `gated_tap(touch=True)` → `interaction_log(out)`
-   - 落账 tasklog_add
+### 1b. inbound（未读消息）——**先「仅沟通」后「新招呼」**
 
-输出：本轮 outbound 打招呼几人、inbound 处理几个未读会话、每个的结果（含已收简历者的去向）。
+切「消息」tab；子 tab 按 `tv_title` 文本找「仅沟通」「新招呼」切换（无 selected 标记、切子 tab 不清筛选）。单轮上限由外部 `BOSS_ROUND_MAX_ITEMS` 控制。
+
+**1b-1 仅沟通（高优先）**：切「仅沟通」→ 逐条未读会话：
+- 点进读对方消息（打开自动标已读）→ `candidate_get_or_create(name)` 建档
+- 对方想发附件简历（「对方想发送附件简历…」/「[附件简历]」气泡）→ 找「同意」按钮（`tv_dialog_btn_right` 文字精确「同意」）→ `gated_tap(touch=True)`；下载留确定性路径，不微操
+- 对方已直接发简历 → `state_transition(jc_id, "receive_resume", source="inbound")`
+
+**1b-2 新招呼（低优先）**：切「新招呼」→ 逐条未读会话：
+- 读消息 → 点**第一条消息里嵌着的候选人卡片**（`mRootViewLayout`，含 mJobIntent/mSalary/mGeekInfo/mContentView）开「在线简历」（`BossViewGeekResumePagerActivity`）→ 读详情 → `candidate_get_or_create(name, job_title)` 建档（job_title 取会话 `tv_position`/聊天页 `tv_sub_title`）。★别点顶部姓名 tv_title（进的是聊天设置 ChatSettingsNewActivity）
+- 无职位关联 → 跳过评分/求简历，报告（fail-closed）
+- `screen(jc_id, source="inbound")`：
+  - `screened_pass` → 触达索要简历：先「求简历」按钮 `gated_tap(touch=True)`（快捷操作区 mTextView 文字精确「求简历」，clickable=false，tap 其中心）；找不到/点不了 → `mobile_type`「您能发一份简历给我们吗」→ 点「发送」`gated_tap(touch=True)`（输入框 editText_with_scrollbar 右侧 clickable 无 rid 的 LinearLayout，随键盘浮动现找）。然后 `interaction_log(out, "request_resume")` → `state_transition(jc_id, "request_resume", source="inbound")`（先落账后推进）
+  - `rejected_*` / 服务不可用 → 不发，报告
+
+输出：本轮 outbound 打招呼几人、inbound 处理几个未读会话（仅沟通几个 / 新招呼几个、各自同意/求简历/评分结果）。
 
 **末尾必须单独输出一行机器可读结果**（供调度脚本判定空轮退避，格式固定、数字为整数）：
 `@@RESULT@@ inbound=<N> outbound=<M>`

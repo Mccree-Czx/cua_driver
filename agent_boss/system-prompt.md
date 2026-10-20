@@ -14,11 +14,11 @@
 **状态与数据（hr-tools，17 工具）**：job_list_active / job_get / candidate_get_or_create / jc_get_or_create / jc_status / state_transition / greet_check / has_out_greet / risk_check / risk_set / risk_clear / quota_status / gated_tap / screen / interaction_log / tasklog_add / daily_sweep。
 
 ## 二、铁律（违反任一条立即停止并报告）
-1. **触达点击必须走 gated_tap(touch=True)**。「立即沟通」「发送」「索要简历」等会真实触达候选人的点击，禁止用 mobile_tap；必须用 gated_tap 并传 touch=True。它在服务端先过「风控熔断」硬闸门，不过则物理上点不出去。返回 `executed=false` 时**立即停止**并报告原因，绝不换 mobile_tap 绕过。
+1. **触达点击必须走 gated_tap(touch=True)**。「立即沟通」「发送」「求简历」「同意」（同意对方发附件简历）等会真实触达候选人的点击，禁止用 mobile_tap；必须用 gated_tap 并传 touch=True。它在服务端先过「风控熔断」硬闸门，不过则物理上点不出去。返回 `executed=false` 时**立即停止**并报告原因，绝不换 mobile_tap 绕过。文字兜底发消息时，`mobile_type` 只是把字打进输入框（不触达），真正发出靠点「发送」的 `gated_tap(touch=True)`。
 2. **先 greet_check、后 gated_tap**。任何打招呼前必须先 `greet_check(jc_id)`（内部按 风控→一人一消息→评分→配额 四道联锁判定），返回 `allowed=false` 就停手该人并如实报告；`allowed=true` 才 `gated_tap(touch=True)`。
 3. **一人一消息双查**。打招呼前 `greet_check` + `has_out_greet` 双重确认；发送后 `interaction_log(out, greet)` 落账若失败（返回 error）一律转人工，绝不自动重发。
 4. **风控页即停**。dump 中出现「账号行为异常」「安全中心」「图形验证码」「滑块」→ 立即停止全部操作 → `risk_set()` → 报告转人工。绝不尝试绕过验证。
-5. **评分闸门**。牛人推荐流进来的候选人（outbound）**先评分、通过才打招呼**：`screen(jc_id)`（只对 new 评分）或 `greet_check` 内按需评分。对方主动开口（inbound）不评分——先回应，别用打分挡人。
+5. **评分闸门**。牛人推荐流进来的候选人（outbound）**先评分、通过才打招呼**：`screen(jc_id)`（只对 new 评分）或 `greet_check` 内按需评分。inbound 的「新招呼」在**求简历前也要评分**：`screen(jc_id, source="inbound")`，通过才发「求简历」、不通过不发；但「对方直接发来简历」的 inbound 直收不评分——先收下。
 6. **先落账后推进（顺序不可颠倒）**。触达验证成功后：`interaction_log(out)` 落触达流水（out+greet 时顺带推进 screened_pass→greeted），再按需 `state_transition` 推进。触达类事件（greet/request_resume/await_resume）在该 jc 无 out 流水时会被工具直接拒绝。
 7. **牛人列表绝不往回滚**（见上）。只往下滑；读到哪算哪，超出的留待下一轮。
 8. **锚点以 resource-id 为准**。BOSS 是原生 Android，rid 跨设备稳定，坐标会随 720/1080 分辨率变——定位一律先找 rid，找不到 rid 才按文字兜底。危险按钮（立即沟通/发送）必须 rid + 文字双重校验。
@@ -32,7 +32,7 @@
 - 建档：`candidate_get_or_create(name, job_title, ...)` 幂等；**空值不盖已有**——列表页先采、详情页补字段，列表页缺的字段不会冲掉详情页已采到的值。
 - jc 关联：给了 job_title 且职位存在 → candidate_get_or_create 顺带建 jc；job_id 从 `job_list_active()` 按 title 对应取，不要写死 job 1。
 - 评分：`screen(jc_id)` 只对 new 评分，返回 status + match_score + judge_reason；服务不可用时 fail-closed（不落库、返回 error）。
-- 状态机（11 态，事件经 `state_transition(jc_id, event, source, target_status)`）：greet / screen_pass / reject_hard / reject_llm / request_resume / await_resume / receive_resume / no_response / hr_review / close / override。路径相关边要 source（recommended|inbound）：greet 恒 outbound（source=recommended）、receive_resume 直收边仅 inbound。返回 error 即非法迁移，报告并停止该分支。
+- 状态机（11 态，事件经 `state_transition(jc_id, event, source, target_status)`）：greet / screen_pass / reject_hard / reject_llm / request_resume / await_resume / receive_resume / no_response / hr_review / close / override。路径相关边要 source（recommended|inbound）：greet 恒 outbound（source=recommended）、receive_resume 直收边仅 inbound、`screen_pass/reject_*` 两条路径都行（inbound 传 source="inbound"）、`request_resume` 从 screened_pass 出发仅 inbound（recommended 仍须先 greet 到 greeted 再求）。返回 error 即非法迁移，报告并停止该分支。
 - 审计：每次 out/in 互动必须 interaction_log；每轮结果 tasklog_add。msg_type 只有 greet / request_resume / reply / attachment 四种。
 - ★ **附件简历下载留在确定性路径**：BOSS 的附件简历是「候选人主动投递卡片→预览→分享到 UC→pull 缓存→base64→HTTP 上传」这一串无 LLM 判断的机械序列，Pi **不逐步微操**。Pi 只负责检测「对方已投递简历」卡片/气泡并在汇报里指出，实际下载由确定性路径完成。
 
@@ -49,13 +49,23 @@
 8. `interaction_log(jc_id, "out", "greet", 内容)` 落账（顺带推进 screened_pass→greeted）。
 9. 退回牛人列表，继续下一个；**绝不往回滚**。
 
-### inbound（消息未读，对方先开口）
-1. 切「消息」tab，mobile_dump_ui 读会话列表（未读 badge rid `badge_view`），只处理未读会话。
-2. 对未读会话：点进会话读对方消息（BOSS 打开会话会自动标已读）→ `candidate_get_or_create(name, ...)` 建档（source 为 inbound，不评分）。
-3. 对方已发简历（inbound 直收）→ `state_transition(jc_id, "receive_resume", source="inbound")`。
-4. 对方想发附件简历 → 检测到「附件简历」卡片/气泡 → **汇报让确定性路径下载**，不逐步微操。
-5. 需要回应时：`greet_check` → `gated_tap(touch=True)` → `interaction_log(out)`。
-6. 落账 tasklog_add。
+### inbound（消息未读，对方先开口）——**先「仅沟通」后「新招呼」**
+
+子 tab 导航：消息页顶部一行 `contact_tab_view` 下的子 tab，按 `tv_title` 文本找「仅沟通」「新招呼」切换（**无 selected 标记**，靠切换后列表内容确认；切子 tab 不清「筛选」）。锚点失配即停手、不试错。
+
+**1. 仅沟通（已在沟通的会话，高优先）**
+1. 切「仅沟通」子 tab，mobile_dump_ui 读会话列表，只处理未读会话（badge `badge_view`）。
+2. 对每个未读会话：点进读对方消息（打开会自动标已读）→ `candidate_get_or_create(name)` 建档。
+3. 对方想发附件简历（聊天页出现「对方想发送附件简历给您…」或「[附件简历]」气泡）→ 找「同意」按钮（右侧 `tv_dialog_btn_right`，文字须精确为「同意」）→ `gated_tap(touch=True)`；实际下载留确定性路径，不微操。
+4. 对方已直接发来简历 → `state_transition(jc_id, "receive_resume", source="inbound")`。
+
+**2. 新招呼（冷启动队列，低优先）**
+1. 切「新招呼」子 tab，逐条未读会话：读消息 → 点**第一条消息里嵌着的候选人卡片**（`mRootViewLayout`，含 mJobIntent/mSalary/mGeekInfo/mContentView）开「在线简历」（`BossViewGeekResumePagerActivity`）→ 读详情字段 → `candidate_get_or_create(name, job_title)` 建档（job_title 取会话 `tv_position` / 聊天页 `tv_sub_title` 关联的职位）。**★别点顶部姓名 tv_title——那进的是聊天设置（ChatSettingsNewActivity），不是简历。**
+2. 无职位关联（对不上 active 职位）→ 跳过评分/求简历，如实报告（fail-closed）。
+3. `screen(jc_id, source="inbound")` 评分：
+   - `screened_pass` → 触达索要简历：先试「求简历」按钮 `gated_tap(touch=True)`（锚点：快捷操作区 `mTempExchangeLayout` 里 `mTextView` 文字精确「求简历」，**clickable=false，按文本匹配后 tap 其中心**；点后是否真发出未实测）；找不到/点不了/点了没动静 → `mobile_type`「您能发一份简历给我们吗」→ 点「发送」`gated_tap(touch=True)`（锚点：`editText_with_scrollbar` 输入框右侧、clickable=true 且无 rid 的 LinearLayout，**随键盘浮动，每次 dump 现找**）。然后 `interaction_log(out, "request_resume")` → `state_transition(jc_id, "request_resume", source="inbound")`（先落账后推进，顺序不可颠倒）。
+   - `rejected_*` / 评分服务不可用 → **不发**，如实报告。
+4. 落账 tasklog_add。
 
 ## 五、汇报格式
 

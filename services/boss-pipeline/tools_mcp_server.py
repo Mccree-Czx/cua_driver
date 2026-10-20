@@ -295,10 +295,12 @@ def gated_tap(x: int, y: int, touch: bool = False) -> dict:
 # ——— 评分 ———
 
 @mcp.tool()
-def screen(jc_id: int) -> dict:
+def screen(jc_id: int, source: str = RECOMMENDED) -> dict:
     """给一个还没评过分的 jc 打分并落库（status + match_score + judge_reason）。
 
     ★ 只在 `new` 上执行；已评分/已推进的不重复评。服务不可用 → error（fail-closed，不落库）。
+    ★ `source`：路径判定。推荐流打招呼打分用默认 `recommended`；
+      inbound 的「新招呼」求简历前打分传 `source="inbound"`。
     """
     with SessionLocal() as session:
         jc = session.get(models.JobCandidate, jc_id)
@@ -306,7 +308,7 @@ def screen(jc_id: int) -> dict:
             return {"error": f"job_candidate {jc_id} 不存在"}
         if jc.status != CandidateStatus.NEW.value:
             return {"error": f"job_candidate {jc_id} 状态 {jc.status} 不是 new，不重复评分"}
-        result = hr_tools.screen_candidate(session, jc)
+        result = hr_tools.screen_candidate(session, jc, source=source)
         if result is None:
             return {"error": "评分服务不可用（fail-closed，未落库）"}
         return {

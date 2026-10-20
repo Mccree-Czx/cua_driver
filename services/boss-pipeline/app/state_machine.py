@@ -21,10 +21,11 @@
 
 ## 与猎聘的三处实质差异
 
-1. **评分闸门重新打开（P2）。**
+1. **评分闸门（P2）。**
    BOSS 复用猎聘的 screening 服务，牛人推荐流进来的候选人**先评分、通过才打招呼**：
    `new → screened_pass / rejected_hard / rejected_llm`，再 `screened_pass → greeted`。
-   **对方主动开口（inbound）不评分**——对方先找上门，先回应，别用打分挡人。
+   inbound 的「新招呼」在**求简历前也评分**（`screen(jc_id, source="inbound")`），
+   通过才发「求简历」、不通过不发——但「对方直接发来简历」的 inbound 直收仍不评分。
 
 2. **`new → greeted` 直连已拆掉。**
    打分启用后 `greet` 只能从 `screened_pass` 出发；没评过分或没过的 `new` 打不了招呼。
@@ -35,13 +36,20 @@
 
 ## 路径消歧
 
-`greet` **恒为 outbound**（BOSS 上只有牛人列表「立即沟通」一条路能打招呼），
-`receive_resume` 的直收边**仅 inbound**。所以这两个事件必须显式给 `ctx.source`：
+路径相关的事件必须显式给 `ctx.source`，推不出来就抛 `InvalidTransition`，**不猜**：
 
 - `recommended` —— 从牛人推荐流来的
 - `inbound` —— 从消息 tab 先开口的
 
-推不出来就抛 `InvalidTransition`，**不猜**。
+各事件的路径约束：
+
+- `greet` **恒 outbound**（BOSS 上只有牛人列表「立即沟通」一条路能打招呼）。
+- `screen_pass` / `reject_hard` / `reject_llm` **两条路径都行**——推荐流打分放行打招呼，
+  inbound 打分放行「求简历」（对方主动开口先看过在线简历再决定求不求）。
+- `request_resume` 从 `greeted` 出发**与路径无关**（两条路径最终都汇到 greeted），
+  但从 `screened_pass` 出发**仅 inbound**——inbound 跳过 greet，评分通过后直接求简历；
+  recommended 仍必须走 `screened_pass → greet → greeted → request_resume`。
+- `receive_resume` 的直收边**仅 inbound**（对方没等我们求就发来简历）。
 """
 
 from __future__ import annotations
@@ -119,12 +127,14 @@ _EDGES: dict[tuple[CandidateStatus, StateEvent], CandidateStatus] = {
 
 # 路径相关边：(当前状态, 事件) → {路径: 目标状态}
 _PATH_EDGES: dict[tuple[CandidateStatus, StateEvent], dict[str, CandidateStatus]] = {
-    # 评分三步（照猎聘）：只有牛人推荐流才打分，对方主动开口（inbound）不打
-    (S.NEW, StateEvent.SCREEN_PASS): {RECOMMENDED: S.SCREENED_PASS},
-    (S.NEW, StateEvent.REJECT_HARD): {RECOMMENDED: S.REJECTED_HARD},
-    (S.NEW, StateEvent.REJECT_LLM): {RECOMMENDED: S.REJECTED_LLM},
+    # 评分三步：推荐流打分放行打招呼，inbound 打分放行求简历（2026-10-20 起 inbound 也评分）
+    (S.NEW, StateEvent.SCREEN_PASS): {RECOMMENDED: S.SCREENED_PASS, INBOUND: S.SCREENED_PASS},
+    (S.NEW, StateEvent.REJECT_HARD): {RECOMMENDED: S.REJECTED_HARD, INBOUND: S.REJECTED_HARD},
+    (S.NEW, StateEvent.REJECT_LLM): {RECOMMENDED: S.REJECTED_LLM, INBOUND: S.REJECTED_LLM},
     # greet 恒 outbound：BOSS 上只有牛人列表的「立即沟通」能打招呼，且必须先评分通过
     (S.SCREENED_PASS, StateEvent.GREET): {RECOMMENDED: S.GREETED},
+    # ★ inbound 跳过 greet：评分通过后直接从 screened_pass 求简历（recommended 仍走 greet）
+    (S.SCREENED_PASS, StateEvent.REQUEST_RESUME): {INBOUND: S.RESUME_REQUESTED},
     # ★ BOSS 独有：对方主动发来简历，我们没求过
     (S.NEW, StateEvent.RECEIVE_RESUME): {INBOUND: S.RESUME_RECEIVED},
 }

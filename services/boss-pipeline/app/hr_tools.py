@@ -353,7 +353,9 @@ def _screening() -> ScreeningClient:
     return ScreeningClient()
 
 
-def screen_candidate(session: Session, jc: models.JobCandidate) -> ScreeningResult | None:
+def screen_candidate(
+    session: Session, jc: models.JobCandidate, source: str = RECOMMENDED
+) -> ScreeningResult | None:
     """给一个**还没评过分的 jc** 打分并落库（status + match_score + judge_reason）。
 
     ★ 只在 `status == new` 时执行——已评分 / 已推进的不再重复评（幂等）。
@@ -361,6 +363,9 @@ def screen_candidate(session: Session, jc: models.JobCandidate) -> ScreeningResu
 
     评分数据来源：列表卡 `summary`（形如「10年以上｜本科｜面议」，按 ｜ best-effort 拆）
     + `tags`。详情页字段（degree/description 等）没接采集，有就优先用，没有退回拆出来的。
+
+    ★ `source`：路径判定（recommended|inbound）。推荐流打分默认 recommended；
+      inbound 的「新招呼」求简历前打分传 `source=INBOUND`。
     """
     if jc.status != CandidateStatus.NEW.value:
         return None
@@ -394,7 +399,7 @@ def screen_candidate(session: Session, jc: models.JobCandidate) -> ScreeningResu
 
     jc.match_score = result.score
     jc.judge_reason = result.judge_reason
-    apply_transition(session, jc, _VERDICT_EVENT[result.status], TransitionContext(source=RECOMMENDED))
+    apply_transition(session, jc, _VERDICT_EVENT[result.status], TransitionContext(source=source))
     return result
 
 

@@ -91,6 +91,16 @@ GREET_DRY_RUN = os.environ.get("BOSS_GREET_DRY_RUN", "") == "1"
 #: 一轮最多处理几个简历（同意请求 + 下载已投递）。附件链路一步要 ~30–60 秒。
 RESUME_CAP = int(os.environ.get("BOSS_RESUME_CAP", "3"))
 
+#: 收简历时扫会话列表的上限（默认对齐旧值，运行时调大以够到「全部」未读）。
+RESUME_SCAN_LIMIT = int(os.environ.get("BOSS_RESUME_SCAN_LIMIT", "30"))
+RESUME_SCAN_SCROLLS = int(os.environ.get("BOSS_RESUME_SCAN_SCROLLS", "6"))
+#: 一轮读未读会话的上限（默认对齐旧值 5，运行时调大）。
+UNREAD_LIMIT = int(os.environ.get("BOSS_UNREAD_LIMIT", "5"))
+
+#: 读未读时的子 tab 顺序：先「仅沟通」（活跃对话，高优先）再「新招呼」（招呼积压）。
+#: ★ 用户定的顺序（2026-10-20），不要动。
+UNREAD_SUB_TABS = ("仅沟通", "新招呼")
+
 #: 已取过的简历账本（本地；服务端另有一份 minio_object_key 兜底）。
 RESUME_LEDGER = AGENT_DIR / ".resumes.json"
 
@@ -817,7 +827,7 @@ def resume_work() -> int:
     ★ 只处理**候选人主动提出**的简历；主动「求简历」是另一种触达，本轮不做。
     ★ 每轮最多 `RESUME_CAP` 个：附件链路（预览 → 分享 → UC → pull）一步 30–60 秒。
     """
-    convs = flows.scan_conversations(limit=30)
+    convs = flows.scan_conversations(limit=RESUME_SCAN_LIMIT, max_scroll=RESUME_SCAN_SCROLLS)
     # ★ 列表预览文本有两种形态（实测）：「[附件简历]」或「对方想发送附件简历给您…」，
     #   而且有时是同一行里并排的两个节点——只认「附件简历」这个共同子串最稳。
     offers = [c["name"] for c in convs if "附件简历" in (c.get("last_msg") or "")]
@@ -889,8 +899,17 @@ def collect_conversations(limit: int = 20) -> int:
     return len(cs)
 
 
-def read_unread_conversations(limit: int = 5) -> int:
-    """把未读会话的消息读回来。★ 打开会话会把它标记为已读（BOSS 的行为）。"""
+def _post_conversation_messages(d: dict) -> None:
+    _post("/api/ingest/conversations", [{
+        "boss_name": d["name"], "job_title": d["position"], "last_msg": "",
+        "status": "", "boss_time": "", "unread": 0,
+        "messages": [{"direction": m["direction"], "text": m["text"], "boss_y": m["y"]}
+                     for m in d["messages"]],
+    }])
+
+
+def _read_unread_deep_scroll(limit: int) -> int:
+    """旧深滚兜底：滚回顶部、顺读未读会话（筛不出未读/切不到子 tab 时才走这条）。"""
     done = 0
     for c in flows.scan_conversations(limit=limit):
         if not c.get("unread"):
@@ -900,13 +919,69 @@ def read_unread_conversations(limit: int = 5) -> int:
         except flows.FlowMismatch as exc:
             log(f"  读「{c['name']}」失败：{exc}")
             continue
-        _post("/api/ingest/conversations", [{
-            "boss_name": d["name"], "job_title": d["position"], "last_msg": "",
-            "status": "", "boss_time": "", "unread": 0,
-            "messages": [{"direction": m["direction"], "text": m["text"], "boss_y": m["y"]}
-                         for m in d["messages"]],
-        }])
+        _post_conversation_messages(d)
         done += 1
+    return done
+
+
+def _read_top_unread(limit: int) -> int:
+    """在「已筛未读」列表上读最顶上那条，直到读完或到 `limit`。
+
+    打开会话会把它标已读，返回后它就从筛选列表消失、下一条顶上（实测）。
+    """
+    done = 0
+    tried: set[str] = set()
+    while done < limit:
+        convs = [c for c in flows.screen_conversations() if c["name"] not in tried]
+        if not convs:
+            # 当前屏没有还没读的：往下滚一屏；屏不变说明读完了
+            before = phone.texts(phone.dump_stable())
+            phone.swipe_v(0.5, 0.71, 0.31)
+            if phone.texts(phone.dump_stable()) == before:
+                break
+            continue
+        c = convs[0]
+        tried.add(c["name"])
+        try:
+            d = flows.read_conversation(c["name"], from_top=False)
+        except flows.FlowMismatch as exc:
+            log(f"  读「{c['name']}」失败：{exc}")
+            continue
+        _post_conversation_messages(d)
+        done += 1
+    return done
+
+
+def read_unread_conversations(limit: int = 0) -> int:
+    """把未读会话的消息读回来。★ 打开会话会把它标记为已读（BOSS 的行为）。
+
+    「筛选→未读」+ 子 tab 排序（2026-10-20）：
+      1. `flows.filter_unread()` 把列表筛成只剩未读；
+      2. 按 `UNREAD_SUB_TABS` 顺序（先「仅沟通」再「新招呼」）逐个 `flows.switch_sub_tab`；
+      3. 每个子 tab 里读**最顶上**那条，打开会标已读、返回后从筛选列表消失、下一条顶上；
+      4. 循环直到读完或到总 `limit`（两个子 tab 共享这份预算）。
+    全程不深滚、不 `ensure_main_tabs`（那会清筛选）。筛不出/切不到子 tab 才退回旧深滚路径。
+    """
+    if limit <= 0:
+        limit = UNREAD_LIMIT
+    try:
+        flows.filter_unread()
+    except flows.FlowMismatch as exc:
+        log(f"  筛未读失败，退回旧深滚路径：{exc}")
+        return _read_unread_deep_scroll(limit)
+
+    done = 0
+    for tab in UNREAD_SUB_TABS:
+        if done >= limit:
+            break
+        try:
+            flows.switch_sub_tab(tab)
+        except flows.FlowMismatch as exc:
+            log(f"  切「{tab}」子tab失败，退回旧深滚路径：{exc}")
+            return done + _read_unread_deep_scroll(limit - done)
+        n = _read_top_unread(limit - done)
+        log(f"  「{tab}」读了 {n} 个未读会话")
+        done += n
     return done
 
 

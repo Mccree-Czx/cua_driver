@@ -520,6 +520,123 @@ def _read_card(bounds: tuple[int, int, int, int]) -> dict[str, Any]:
 
 # —— 消息（收件箱，纯只读）——
 
+def _node_selected(xml: str, text: str) -> bool:
+    """某个文字节点在原始 XML 里是否 `selected="true"`。
+
+    `nodes()` 不暴露 selected（见 shared/android_ui.py），而筛选面板里「未读」
+    选中与否只挂在 selected 上——只能直接正则原始 XML。
+    """
+    for raw in re.findall(r"<node\b[^>]*>", xml):
+        if f'text="{text}"' in raw:
+            return 'selected="true"' in raw
+    return False
+
+
+def filter_unread() -> str:
+    """把「消息」列表筛成「只显示未读」。返回筛选后的 dump。
+
+    锚点见 `boss_map.json`「消息 → 筛选（消息类型=未读）」。
+
+    步骤：点子 tab 行最右的「筛选」→ 等底部面板出来 → 点「未读」→ 点「确定」。
+    每一步都 dump 校验，锚点失配就 `FlowMismatch`。
+
+    ★ 全程不 `ensure_main_tabs`/不 `home`/不 `open_app`/不回滚顶部——那些会把
+      筛好的列表刷回「全部」。进出一个会话（BACK）**不会**清筛选，所以读未读时
+      可以筛一次读到底。
+    """
+    xml = phone.ensure_tab("消息")
+
+    btn = phone.find_rid(xml, "tv_filter")
+    if btn is None:
+        raise FlowMismatch("筛未读", "消息页上找不到「筛选」按钮 tv_filter", phone.texts(xml))
+
+    # 面板渲染慢（实测约 3s），点开要多等一会
+    phone.tap_node(btn, pause=4)
+    xml = phone.dump_stable()
+    _guard_risk(xml, "筛未读")
+    if phone.find_rid(xml, "btn_confirm") is None:
+        raise FlowMismatch("筛未读", "点了「筛选」但面板没出来（找不到「确定」）", phone.texts(xml))
+
+    # ★ 先清一遍——「未读」是 toggle，若它已选中再点会取消；且若残留别的筛选
+    #   （如学历），不清会叠成「未读 AND 学历」，把列表筛得太窄。
+    reset = phone.find_rid_text(xml, "btn_reset", "清除")
+    if reset is not None:
+        phone.tap_node(reset, pause=2)
+        xml = phone.dump_stable()
+        _guard_risk(xml, "筛未读")
+
+    opt = phone.find_exact(xml, "未读")
+    if opt is None:
+        raise FlowMismatch("筛未读", "筛选面板里没有「未读」选项", phone.texts(xml))
+    phone.tap_node(opt, pause=2)
+
+    xml = phone.dump_stable()
+    if not _node_selected(xml, "未读"):
+        raise FlowMismatch("筛未读", "点了「未读」但没选中", phone.texts(xml))
+
+    confirm = phone.find_rid_text(xml, "btn_confirm", "确定")
+    if confirm is None:
+        raise FlowMismatch("筛未读", "选完「未读」后找不到「确定」", phone.texts(xml))
+    phone.tap_node(confirm, pause=3)
+
+    xml = phone.dump_stable()
+    _guard_risk(xml, "筛未读")
+    if phone.find_rid(xml, "btn_confirm") is not None:
+        raise FlowMismatch("筛未读", "点了「确定」但面板没关", phone.texts(xml))
+    fb = phone.find_rid(xml, "tv_filter")
+    if fb is not None and "·" not in phone.label(fb):
+        raise FlowMismatch("筛未读", "确认后「筛选」文案没变成生效态（应带「·N」）", phone.texts(xml))
+    return xml
+
+
+def switch_sub_tab(name: str) -> str:
+    """切到「消息」列表顶部的子 tab（全部/新招呼/仅沟通/有交换）。返回切换后的 dump。
+
+    锚点见 `boss_map.json`「消息 → 子tab」：每个子 tab 是 `contact_tab_view` 下
+    `mTitleParent → tv_title`，文本就是 tab 名。
+
+    ★ 只读导航：只点子 tab 标题，不 `home`/不 `ensure_main_tabs`/不 `open_app`——
+      那些会清掉「筛选→未读」。实测（2026-10-20）子 tab 切换**不清**筛选，
+      两者是叠加（AND）：在「仅沟通」筛好未读、再切「新招呼」，「筛选·N」一直生效。
+
+    ★ 子 tab **没有** `selected="true"` 标记（实测：整屏只有底部 `tv_tab_3` 带
+      selected），所以「选中态」没法像筛选面板那样校验。这里只保证点到了
+      「tv_title 文本精确等于 name」的那个节点；是否真的切过去，由调用方读
+      列表时自然体现（读到的会话名/数量随子 tab 变）。
+    """
+    xml = phone.ensure_tab("消息")
+    node = phone.find_exact(xml, name)
+    if node is None:
+        raise FlowMismatch("切子tab", f"消息页上没有「{name}」子tab", phone.texts(xml))
+    phone.tap_node(node, pause=3)
+    xml = phone.dump_stable()
+    _guard_risk(xml, f"切子tab:{name}")
+    return xml
+
+
+def screen_conversations(xml: str | None = None) -> list[dict[str, Any]]:
+    """当前一屏的会话（不含系统通知那条伪会话），按列表顺序（上→下）。"""
+    xml = xml or phone.dump_stable()
+    out: dict[str, dict[str, Any]] = {}
+    _collect_conversations(xml, out)
+    return [v for k, v in out.items() if not v.get("_sys_desc")]
+
+
+def _scroll_message_list_to_top() -> str:
+    """把「消息」列表滚回顶部，返回顶部这一屏的 dump。
+
+    ★ 99+ 未读列表可能 >20 屏，上限放宽到 40；到顶（屏没变）就停。
+    """
+    phone.ensure_tab("消息")
+    for _ in range(40):
+        before = phone.texts(phone.dump_stable())
+        phone.swipe_v(0.5, 0.31, 0.76)          # 往上滚（回顶部）
+        after = phone.texts(phone.dump_stable())
+        if before == after:                      # 到顶了（屏没变）
+            break
+    return phone.dump_stable()
+
+
 def scan_conversations(*, limit: int = 20, max_scroll: int = 6) -> list[dict[str, Any]]:
     """读「消息」tab 的会话列表。**纯只读**。
 
@@ -694,7 +811,7 @@ def _card_message_row(xml: str, name_node: dict[str, Any]) -> dict[str, Any] | N
     return min(rows, key=lambda n: n["bounds"][1]) if rows else None
 
 
-def read_conversation(name: str) -> dict[str, Any]:
+def read_conversation(name: str, *, from_top: bool = True) -> dict[str, Any]:
     """打开一个会话，读消息。**纯只读**。
 
     ★ **聊天页上四个快捷操作（求简历 / 换电话·微信 / 约面试 / 不合适）一律不碰**，
@@ -702,13 +819,16 @@ def read_conversation(name: str) -> dict[str, Any]:
       本函数只点：会话卡片 → 返回。
 
     ★ 打开会话会把它**标记为已读**（BOSS 的行为），这是只读流程里唯一的外部可见副作用。
+
+    `from_top=False`：不先滚回顶部，从**当前位置**往下找（用于「已筛未读」的短列表——
+    滚回顶部没必要，还多一次交互）。
     """
-    xml = phone.ensure_tab("消息")
+    xml = _scroll_message_list_to_top() if from_top else phone.dump_stable()
     # 往下翻着找。★ 这里跟「牛人」列表不同：会话列表往下翻是**安全的**
     #   （那是推荐流才有的刷新问题）。而且新消息会不断把老会话挤下去——
     #   实测刚发完招呼几分钟，张雄瑜（16:36）就被挤出了首屏。
     card = None
-    for _ in range(6):
+    for _ in range(40):
         card = phone.find_exact(xml, name)
         if card:
             break
@@ -718,7 +838,7 @@ def read_conversation(name: str) -> dict[str, Any]:
             break
         xml = after
     if not card:
-        raise FlowMismatch("读会话", f"消息列表里没有「{name}」（找过 6 屏）", phone.texts(xml))
+        raise FlowMismatch("读会话", f"消息列表里没有「{name}」（找过 40 屏）", phone.texts(xml))
 
     # ★★ **绝不能点姓名**（2026-10-16 实测踩到）：点会话的 `tv_name` 会打开
     #    `ChatSettingsNewActivity`——那一页上有「加入黑名单」「标记为不合适」
@@ -926,8 +1046,8 @@ def _find_resume_card(xml: str) -> dict[str, Any] | None:
 
 def open_conversation(name: str, step: str = "打开会话") -> str:
     """在「消息」列表里按姓名找到会话并点进去，返回聊天页 dump。"""
-    xml = phone.ensure_tab("消息")
-    for _ in range(8):
+    xml = _scroll_message_list_to_top()
+    for _ in range(40):
         node = phone.find_exact(xml, name)
         if node is not None:
             x1, y1, x2, y2 = node["bounds"]
@@ -937,8 +1057,11 @@ def open_conversation(name: str, step: str = "打开会话") -> str:
                 raise FlowMismatch(step, f"点了「{name}」但没进聊天页", phone.texts(xml))
             _guard_risk(xml, step)
             return xml
+        prev = phone.dump_stable()
         phone.swipe_v(0.5, 0.72, 0.38)
         xml = phone.dump_stable()
+        if xml == prev:                          # 到底了（屏没变）
+            break
     raise FlowMismatch(step, f"消息列表里找不到「{name}」", phone.texts(xml))
 
 

@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | | 猎聘（第一代之后的 B 方案） | BOSS直聘（当前活跃开发） |
 |---|---|---|
 | 目标 App | `com.lietou.mishu` | `com.hpbr.bosszhipin` |
-| 执行端 | [`agent/`](agent/) — **Pi（LLM）实时决定每一步** | [`agent_boss/`](agent_boss/) — **纯确定性流程，不拉 LLM** |
+| 执行端 | [`agent/`](agent/) — **Pi（LLM）实时决定每一步** | [`agent_boss/`](agent_boss/) — **默认 Pi（LLM）内核，`BOSS_USE_PI=0` 回退确定性 `flows.*`** |
 | 服务 | `services/pipeline` :8000 · `services/screening` :8001 | `services/boss-pipeline` :8100 |
 | 前端 | `apps/hr-console` :3000 | `apps/boss-console` :3200 |
 | 数据库 | `hr_workbuddy` · Redis **db 0** | `boss_workbuddy` · Redis **db 1** |
@@ -48,7 +48,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `docs/architecture/` 是猎聘侧的建模产物（2026-10-14）；其中**调度一节写的是当时的 Windows 任务计划，已被 Mac launchd 取代**，其余基本准确。
 
-`agent_boss/` 下**没有 system-prompt.md 是正常的**——BOSS 侧不经 LLM，流程全在 [`agent_boss/flows.py`](agent_boss/flows.py) 里。
+`agent_boss/` 下**有 system-prompt.md 与 rounds.md 是正常的**——BOSS 侧默认走 Pi（LLM）内核，提示词即产品（同猎聘，改流程先改它们）；[`agent_boss/flows.py`](agent_boss/flows.py) 仍是 `BOSS_USE_PI=0` 的确定性兜底路径。
 
 ## 常用命令
 
@@ -131,11 +131,13 @@ python3 agent_boss/run_round.py main_round
                         └─ hr-tools(stdio MCP, services/pipeline/tools_mcp_server.py)
                                 └─ SQLAlchemy/MinIO/Redis 直连 + HTTP► screening(:8001)
 
-BOSS：Mac 上 agent_boss(无 LLM) ─── HTTP /api/ingest/* ──► boss-pipeline(:8100)
-      手机 BOSS App  ◄── adb + uiautomator dump（flows.py 的确定性点击）
+BOSS：Mac 上 agent_boss(默认 Pi 内核) ─┬─ mobile-mcp ──► 手机 BOSS App
+                                        └─ hr-tools(stdio MCP, services/boss-pipeline/tools_mcp_server.py)
+                                                └─ SQLAlchemy/MinIO/Redis 直连 + HTTP► screening(:8001)
+      （BOSS_USE_PI=0 时回退 flows.* 确定性点击 + HTTP /api/ingest/* ──► boss-pipeline）
 ```
 
-- **BOSS 侧刻意没有 LLM**：`flows.py` 的流程已在真机验证过，直接调函数——少一层不确定、少一份 token 账单。加 LLM 决策是错误的演进方向。
+- **BOSS 侧默认 Pi（LLM）内核**：`run_round.py` 的 `USE_PI` 默认 1，spawn Pi 挂 mobile + hr-tools 两个 MCP 实时决定每一步；真机写动作仍走服务端闸门（gated_tap/greet_check/配额），LLM 只负责「看和决定」。逃生口 `BOSS_USE_PI=0` 退回 `flows.py` 的确定性路径（已在真机验证过的那套，走 HTTP `/api/ingest/*` 落账）。
 - **猎聘侧 Pi 是唯一决策者且不直连数据库**，一切经 hr-tools 工具读写。
 - **`agent/` 与 `agent_boss/` 都不是 uv workspace 成员**，靠 `sys.path` 引入；共用逻辑抽在 [`shared/android_ui.py`](shared/android_ui.py)（adb 原语 + 锚点匹配），该文件**只用标准库**，改动时守住这条。
 
