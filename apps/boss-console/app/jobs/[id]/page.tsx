@@ -3,7 +3,7 @@
 import { use, useEffect, useState } from "react";
 import { Alert, Card, Descriptions, Empty, Spin, Table, Tag, Typography } from "antd";
 import Link from "next/link";
-import { statusLabel, STATUS_COLOR } from "../../status";
+import { StatusCapsule } from "../../status";
 
 /**
  * 职位详情页。**BOSS 特有**——猎聘没有这一页（它的 JD 在抽屉里展开）。
@@ -100,7 +100,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             },
             {
               title: "状态", dataIndex: "status", width: 140,
-              render: (s: string) => <Tag color={STATUS_COLOR[s] ?? "default"}>{statusLabel(s)}</Tag>,
+              render: (s: string) => <StatusCapsule status={s} />,
             },
           ]}
         />
