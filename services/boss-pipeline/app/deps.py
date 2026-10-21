@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -27,4 +28,7 @@ def require_ingest_token(token: str | None) -> None:
     if not expected:
         return
     if token != expected:
-        raise PermissionError("ingest token 不对")
+        #: 403 而不是 500：2026-10-21 配上真令牌后这条路径第一次被走到，
+        #: 原来抛裸 `PermissionError`，FastAPI 对非 HTTPException 一律回 500，
+        #: 采数端会把它和服务器真故障混在一起。
+        raise HTTPException(status_code=403, detail="ingest token 不对")
