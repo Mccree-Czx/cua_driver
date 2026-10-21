@@ -59,6 +59,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -107,8 +108,8 @@ RESUME_LEDGER = AGENT_DIR / ".resumes.json"
 WORK_WINDOW_START = (8, 0)
 WORK_WINDOW_END = (23, 0)
 
-ROUNDS = ("main_round", "daily_round", "login_round", "backfill_round")
-WINDOW_EXEMPT = ("backfill_round", "login_round")
+ROUNDS = ("main_round", "daily_round", "login_round", "backfill_round", "resume_round")
+WINDOW_EXEMPT = ("backfill_round", "login_round", "resume_round")
 
 LOCK_PATH = AGENT_DIR / ".round.lock"
 LOGIN_GATE_PATH = AGENT_DIR / ".login_gate_in_flight"
@@ -668,6 +669,13 @@ def _run_pi_round(name: str) -> int:
                 state["empty_streak"] = state.get("empty_streak", 0) + 1
                 state["last_empty_at"] = datetime.now().isoformat()
             save_inbound_state(state)
+    if name == "main_round":
+        # ★ Pi 已用 gated_tap(touch=True) 点过「同意」，这里只补跑确定性下载+落 MinIO
+        #   （不点同意，避免绕过风控闸门重复同意）。
+        try:
+            resume_work(approve=False)
+        except flows.FlowMismatch as exc:
+            log(f"  简历下载补跑中断：{exc}")
     return result.returncode
 
 
@@ -801,6 +809,17 @@ def greet_candidates(collected: list[tuple[str, str]]) -> int:
 
 
 def _back_to_main() -> None:
+    """退回 BOSS 主界面（MainActivity）。
+
+    ★ 普通页面按 BACK 就退；但「分享到 UC」后手机会留在 UC 浏览器里，
+      那里的 BACK 是网页后退、永远退不回 BOSS——这时 monkey 把 BOSS
+      拉回前台（可能停在聊天页），再按几下 BACK 回主界面。纯导航无触达。
+    """
+    for _ in range(6):
+        if phone.current_activity().endswith("MainActivity"):
+            return
+        phone.back()
+    phone.open_app(flows.PKG)
     for _ in range(6):
         if phone.current_activity().endswith("MainActivity"):
             return
@@ -821,49 +840,122 @@ def _save_resumes(data: dict) -> None:
     RESUME_LEDGER.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def resume_work() -> int:
+#: 列表预览里「附件简历」相关文案的匹配：offer 态是「对方想发送附件简历给您」，
+#:   投递后是「对方已投递简历」，另外文件名可能带 .pdf/.docx 后缀。
+_ATTACH_PREVIEW_RE = re.compile(r"\.(pdf|docx?|wps)\b|附件简历|投递", re.IGNORECASE)
+
+
+def _server_pending_resumes() -> list[str]:
+    """服务端账本里「已收到附件简历、还没落 MinIO」的候选人名。
+
+    ★ 列表预览文案会变（offer 时「对方想发送附件简历」、投递后「对方已投递简历」），
+      纯靠预览子串匹配会静默漏人（2026-10-20 实测：任香帅/陈伟伟/卞志超三份附件
+      一整轮都没被拾取）。服务端 status=resume_received 且 minio_object_key 为空
+      = 附件到了但还没归档，这才是权威账本。查不到就退回预览兜底（返回空表）。
+    """
+    try:
+        data = _get("/api/hr/candidates?status=resume_received&limit=200")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  查服务端待归档候选人失败（退回列表预览兜底）：{exc}")
+        return []
+    return [
+        it["name"] for it in data.get("items", [])
+        if not it.get("minio_object_key") and it.get("name")
+    ]
+
+
+def resume_work(approve: bool = True) -> int:
     """同意「对方想发送简历」的请求，并下载已投递的附件简历。
 
     ★ 只处理**候选人主动提出**的简历；主动「求简历」是另一种触达，本轮不做。
     ★ 每轮最多 `RESUME_CAP` 个：附件链路（预览 → 分享 → UC → pull）一步 30–60 秒。
+    ★ approve=False 时跳过「点同意」那段（Pi 已用 gated_tap 点过），只下载+上传。
     """
+    # ★ Pi 轮次结束时列表常停在「筛选·未读」态（Pi 处理未读后的残留），
+    #   已读会话（刚投递简历的）会被筛掉、扫多少屏都看不到——先退主界面、
+    #   清筛选、切「全部」子 tab 再扫（都是只读导航，无触达）。
+    #   ★ Pi 结束可能停在会话/简历页（没有底部 tab），必须先 ensure_main_tabs
+    #   再动筛选，否则 ensure_tab 的 goto_tab 会抛 RuntimeError。
+    #   ★ 甚至可能停在 UC 浏览器（上一轮「分享到 UC」后 pull 失败留下的）——
+    #   BACK 退不出 UC，此时 open_app 把 BOSS 拉回前台再退（只读导航，无触达）。
+    try:
+        result = flows.ensure_main_tabs()
+        if not result["ok"]:
+            log(f"  退不回主界面（{result.get('seen', [])}），open_app 拉回 BOSS 再试")
+            phone.open_app(flows.PKG)
+            result = flows.ensure_main_tabs()
+        if not result["ok"]:
+            log(f"  仍退不回主界面，按当前列表继续扫：{result}")
+        else:
+            flows.clear_message_filter()
+            flows.switch_sub_tab("全部")
+    except (flows.FlowMismatch, RuntimeError) as exc:
+        log(f"  清筛选/切「全部」失败，按当前列表继续扫：{exc}")
     convs = flows.scan_conversations(limit=RESUME_SCAN_LIMIT, max_scroll=RESUME_SCAN_SCROLLS)
     # ★ 列表预览文本有两种形态（实测）：「[附件简历]」或「对方想发送附件简历给您…」，
     #   而且有时是同一行里并排的两个节点——只认「附件简历」这个共同子串最稳。
     offers = [c["name"] for c in convs if "附件简历" in (c.get("last_msg") or "")]
+    # ★ 拾取已投递简历以**服务端账本**为准（status=resume_received 且没落 MinIO），
+    #   预览正则只当兜底——预览文案在投递后会变，只认预览会静默漏人。
+    pending = _server_pending_resumes()
     delivered = [
         (c["name"], (c.get("last_msg") or "").strip())
         for c in convs
-        if ".pdf" in (c.get("last_msg") or "").lower()
+        if c["name"] in pending or _ATTACH_PREVIEW_RE.search(c.get("last_msg") or "")
     ]
+    log(f"  扫描 {len(convs)} 个会话：附件 offer {len(offers)}，待归档 {len(delivered)}"
+        + (f"（服务端待归档 {len(pending)} 人）" if pending else ""))
+    if pending:
+        seen = {c["name"] for c in convs}
+        missed = [n for n in pending if n not in seen]
+        if missed:
+            log(f"  服务端待归档但本轮列表没扫到：{'、'.join(missed)}")
     if not offers and not delivered:
         return 0
 
     approved = 0
-    for name in offers[:RESUME_CAP]:
-        try:
-            flows.open_conversation(name)
-            if flows.approve_resume_offer():
-                approved += 1
-                log(f"  已同意「{name}」发送附件简历")
-        except flows.FlowMismatch as exc:
-            log(f"  同意「{name}」的简历请求失败：{exc}")
-        finally:
-            _back_to_main()
+    if approve:
+        for name in offers[:RESUME_CAP]:
+            try:
+                flows.open_conversation(name)
+                if flows.approve_resume_offer():
+                    approved += 1
+                    log(f"  已同意「{name}」发送附件简历")
+            except flows.FlowMismatch as exc:
+                log(f"  同意「{name}」的简历请求失败：{exc}")
+            finally:
+                _back_to_main()
 
     book = _load_resumes()
     saved = 0
+    # ★ 上传 500 = 服务端 MinIO 凭证没配好——此时后续每份 fetch（2–5 分钟）都是
+    #   白跑（PDF 落到临时目录即弃）。第一份失败后本轮短路，凭证修好后下一轮自动恢复。
+    storage_dead = False
     for name, preview in delivered[:RESUME_CAP]:
+        if storage_dead:
+            break
         if f"{name}｜{preview}" in book:
+            continue
+        # ★ fetch_resume 走「分享到 UC→等 PDF」链路，doc 类附件拉不下来；
+        #   预览里明说 docx/doc 的就不白开一次会话了，直接转人工。
+        if re.search(r"\.(docx?|wps)\b", preview, re.IGNORECASE) and ".pdf" not in preview.lower():
+            log(f"  「{name}」投的是 doc 类附件（{preview[:40]}），自动下载暂不支持，转人工")
             continue
         try:
             flows.open_conversation(name)
             got = flows.fetch_resume()
-        except flows.FlowMismatch as exc:
+        except (flows.FlowMismatch, RuntimeError) as exc:
+            # ★ RuntimeError（AdbError 等）也要接住——单份简历失败不该炸穿整轮补跑
+            #   （2026-10-20 实测：pull 中文名失败把后面几份也带崩了）。
             log(f"  取「{name}」的简历失败：{exc}")
             continue
         finally:
+            # ★ fetch_resume 会「分享到 UC」——结束时手机常留在 UC 浏览器里，
+            #   BACK 退不出（那是浏览器的网页后退，2026-10-20 实测整轮卡死）。
+            #   不在 BOSS 包里就 open_app 直接拉回。
             _back_to_main()
+            if "InnerUCMobile" in (phone.current_activity() or ""):
+                phone.open_app(flows.PKG)
 
         try:
             _post("/api/ingest/attachment", {
@@ -882,7 +974,17 @@ def resume_work() -> int:
             saved += 1
             log(f"  ✅ 已归档「{name}」的简历：{got['filename']}（{got['size']} 字节）")
         except Exception as exc:  # noqa: BLE001
-            log(f"  （「{name}」的简历上传失败：{exc}）")
+            detail = ""
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail = f" body={exc.read().decode('utf-8', 'replace')[:300]}"
+                except Exception:  # noqa: BLE001
+                    pass
+            log(f"  （「{name}」的简历上传失败：{exc}{detail}）")
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (500, 502):
+                storage_dead = True
+                log("  服务端存储未就绪（500/502）——本轮剩余候选人跳过 fetch，"
+                    "修好 MinIO 凭证后下一轮自动重试")
 
     log(f"  简历：同意 {approved} 个请求，归档 {saved} 份")
     return approved + saved
@@ -1128,11 +1230,22 @@ def backfill_round() -> int:
     return _backfill_round_legacy()
 
 
+def resume_round() -> int:
+    """只跑简历补跑（扫描→下载→上传 MinIO），不点同意、不起 Pi。
+
+    ★ 循环收尾（inbound=0）后，积压的附件简历还要继续归档；每次 main_round
+      都白跑 9 分钟 Pi 初始化不划算。这个 runner 直接调确定性 resume_work。
+      approve=False：同意是触达动作，只能 Pi 用 gated_tap 点，这里绝不碰。
+    """
+    return resume_work(approve=False)
+
+
 RUNNERS = {
     "main_round": main_round,
     "daily_round": daily_round,
     "login_round": login_round,
     "backfill_round": backfill_round,
+    "resume_round": resume_round,
 }
 
 

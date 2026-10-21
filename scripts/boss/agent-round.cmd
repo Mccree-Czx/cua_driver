@@ -2,7 +2,7 @@
 REM ===================================================================
 REM  BOSS executor -- drives the PHYSICAL phone over USB from this box.
 REM
-REM  Usage:  agent-round.cmd [main_round|daily_round|login_round|backfill_round]
+REM  Usage:  agent-round.cmd [main_round|daily_round|login_round|backfill_round|resume_round]
 REM
 REM  ASCII only on purpose: cmd reads scripts as GBK. Chinese docs: README.md.
 REM  CRLF only on purpose: an LF-only .cmd gets mis-parsed by cmd.
@@ -13,7 +13,7 @@ set "REPO=%~dp0..\.."
 set "ROUND=%~1"
 if "%ROUND%"=="" set "ROUND=main_round"
 
-if /i not "%ROUND%"=="main_round" if /i not "%ROUND%"=="daily_round" if /i not "%ROUND%"=="login_round" if /i not "%ROUND%"=="backfill_round" goto usage
+if /i not "%ROUND%"=="main_round" if /i not "%ROUND%"=="daily_round" if /i not "%ROUND%"=="login_round" if /i not "%ROUND%"=="backfill_round" if /i not "%ROUND%"=="resume_round" goto usage
 
 set "LOGDIR=%REPO%\.run\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
@@ -41,5 +41,5 @@ echo [%date% %time%] exit %RC% %ROUND% >> "%LOG%"
 exit /b %RC%
 
 :usage
-echo Usage: agent-round.cmd [main_round^|daily_round^|login_round^|backfill_round]
+echo Usage: agent-round.cmd [main_round^|daily_round^|login_round^|backfill_round^|resume_round]
 exit /b 2

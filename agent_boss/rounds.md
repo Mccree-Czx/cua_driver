@@ -23,18 +23,27 @@
 
 ### 1b. inbound（未读消息）——**先「仅沟通」后「新招呼」**
 
-切「消息」tab；子 tab 按 `tv_title` 文本找「仅沟通」「新招呼」切换（无 selected 标记、切子 tab 不清筛选）。单轮上限由外部 `BOSS_ROUND_MAX_ITEMS` 控制。
+切「消息」tab；子 tab 按 `tv_title` 文本找「仅沟通」「新招呼」切换（无 selected 标记）。仅沟通靠未读 badge、不点筛选；新招呼要点「筛选→未读」（见 1b-2）。单轮上限由外部 `BOSS_ROUND_MAX_ITEMS` 控制。
+
+**索要简历（求简历）的标准动作**（2026-10-20 真机实测，勿再用旧路径）：
+- ❌ 「求简历」快捷按钮**发不出去**：双方未互相回复时，点它只弹 toast「双方回复之后才能使用」，不会真正发出，但按钮会转灰、易误判为已发送。
+- ❌ `mobile_type` **注入不了中文**（adb input text 报 NullPointerException），无效。
+- ✅ 正确：点「常」（常用语入口，dump 按文字找「常」）→ 常用语面板选短语「方便发一份你的简历过来吗？」→ 点面板「发送」按钮 `gated_tap(touch=True)`——**这一步点击即触达**（消息直接发出、气泡上屏、出现「请求附件简历」卡，不经过输入框），**禁止用 mobile_tap**。
+- 发出后验证气泡上屏 → `interaction_log(out, "request_resume")` → `state_transition(jc_id, "request_resume", source="inbound")`（先落账后推进）。
 
 **1b-1 仅沟通（高优先）**：切「仅沟通」→ 逐条未读会话：
 - 点进读对方消息（打开自动标已读）→ `candidate_get_or_create(name)` 建档
 - 对方想发附件简历（「对方想发送附件简历…」/「[附件简历]」气泡）→ 找「同意」按钮（`tv_dialog_btn_right` 文字精确「同意」）→ `gated_tap(touch=True)`；下载留确定性路径，不微操
 - 对方已直接发简历 → `state_transition(jc_id, "receive_resume", source="inbound")`
+- ★ 会话还空着、需我们主动索要 → 先 `screen(jc_id, source="inbound")` 评分：`screened_pass`（或已是 greeted）→ 走上面「索要简历标准动作」（常用语面板发「方便发一份你的简历过来吗？」）；`rejected_*` / 服务不可用 → 不发，报告
+- 检测到「附件简历卡片」（`tv_resume_desc`「点击预览附件简历」）→ 汇报「简历已投递、待下载」，下载存 MinIO 由确定性路径补跑，不微操
 
-**1b-2 新招呼（低优先）**：切「新招呼」→ 逐条未读会话：
+**1b-2 新招呼（低优先）**：切「新招呼」→ **点「筛选」只看未读** → 逐条未读会话：
+- ★ 点「筛选」按钮（`tv_filter`，文字「筛选」）→ 等底部面板（约 3s）→ 先点「清除」（`btn_reset`）清残留 → 点「未读」（`tv_option_name`）→ 点「确定」（`btn_confirm`）；生效后 `tv_filter` 文案变「筛选·N」，列表只剩未读会话
 - 读消息 → 点**第一条消息里嵌着的候选人卡片**（`mRootViewLayout`，含 mJobIntent/mSalary/mGeekInfo/mContentView）开「在线简历」（`BossViewGeekResumePagerActivity`）→ 读详情 → `candidate_get_or_create(name, job_title)` 建档（job_title 取会话 `tv_position`/聊天页 `tv_sub_title`）。★别点顶部姓名 tv_title（进的是聊天设置 ChatSettingsNewActivity）
 - 无职位关联 → 跳过评分/求简历，报告（fail-closed）
 - `screen(jc_id, source="inbound")`：
-  - `screened_pass` → 触达索要简历：先「求简历」按钮 `gated_tap(touch=True)`（快捷操作区 mTextView 文字精确「求简历」，clickable=false，tap 其中心）；找不到/点不了 → `mobile_type`「您能发一份简历给我们吗」→ 点「发送」`gated_tap(touch=True)`（输入框 editText_with_scrollbar 右侧 clickable 无 rid 的 LinearLayout，随键盘浮动现找）。然后 `interaction_log(out, "request_resume")` → `state_transition(jc_id, "request_resume", source="inbound")`（先落账后推进）
+  - `screened_pass` → 走上面「索要简历标准动作」（常用语面板发「方便发一份你的简历过来吗？」）。然后 `interaction_log(out, "request_resume")` → `state_transition(jc_id, "request_resume", source="inbound")`（先落账后推进）
   - `rejected_*` / 服务不可用 → 不发，报告
 
 输出：本轮 outbound 打招呼几人、inbound 处理几个未读会话（仅沟通几个 / 新招呼几个、各自同意/求简历/评分结果）。

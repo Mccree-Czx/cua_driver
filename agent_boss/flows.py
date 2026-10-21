@@ -589,6 +589,46 @@ def filter_unread() -> str:
     return xml
 
 
+def clear_message_filter() -> str:
+    """清掉「消息」列表上残留的筛选（如「未读」），恢复「全部」。返回清理后的 dump。
+
+    锚点同 `filter_unread()`。★ 仅当 `tv_filter` 处于生效态（文案带「·N」）才动面板；
+    没筛选残留就原样返回、不点任何东西。
+
+    ★ 为什么需要它（2026-10-20 真机）：Pi 轮次结束时列表停在「筛选·未读」态，
+    已读会话（比如刚投递了简历的）被筛掉，`scan_conversations` 扫多少屏都看不到，
+    简历补跑会静默漏掉——扫列表前必须先清筛选。
+    """
+    xml = phone.ensure_tab("消息")
+
+    fb = phone.find_rid(xml, "tv_filter")
+    if fb is None or "·" not in phone.label(fb):
+        return xml          # 没筛选残留，什么都不做
+
+    phone.tap_node(fb, pause=4)
+    xml = phone.dump_stable()
+    _guard_risk(xml, "清筛选")
+    if phone.find_rid(xml, "btn_confirm") is None:
+        raise FlowMismatch("清筛选", "点了「筛选」但面板没出来（找不到「确定」）", phone.texts(xml))
+
+    reset = phone.find_rid_text(xml, "btn_reset", "清除")
+    if reset is not None:
+        phone.tap_node(reset, pause=2)
+        xml = phone.dump_stable()
+        _guard_risk(xml, "清筛选")
+
+    confirm = phone.find_rid_text(xml, "btn_confirm", "确定")
+    if confirm is None:
+        raise FlowMismatch("清筛选", "点完「清除」后找不到「确定」", phone.texts(xml))
+    phone.tap_node(confirm, pause=3)
+
+    xml = phone.dump_stable()
+    _guard_risk(xml, "清筛选")
+    if phone.find_rid(xml, "btn_confirm") is not None:
+        raise FlowMismatch("清筛选", "点了「确定」但面板没关", phone.texts(xml))
+    return xml
+
+
 def switch_sub_tab(name: str) -> str:
     """切到「消息」列表顶部的子 tab（全部/新招呼/仅沟通/有交换）。返回切换后的 dump。
 
@@ -670,6 +710,11 @@ def scan_conversations(*, limit: int = 20, max_scroll: int = 6) -> list[dict[str
         after = phone.texts(phone.dump_stable())
         if before == after:            # 到顶了（屏没变）
             break
+    # ★ 滚顶循环之后**必须重新 dump**：下面读循环的第一屏用的是 `xml`，
+    #   而它还是滚顶前（列表中间）捕获的旧屏——不重取的话顶部那几屏
+    #   （最新会话都在顶部）永远读不到（2026-10-20 实测：焦晨涛/张森/
+    #   任香帅等 6 个最新投递的会话整轮漏扫）。
+    xml = phone.dump_stable()
 
     out: dict[str, dict[str, Any]] = {}
     for _ in range(max_scroll + 1):
@@ -1128,10 +1173,27 @@ def fetch_resume(step: str = "取简历") -> dict[str, Any]:
 
     remote = _wait_new_uc_pdf(before, timeout=45.0)
     if remote is None:
-        raise FlowMismatch(step, "UC 缓存里没等到新的 PDF（分享链路可能没走通）", phone.texts(phone.dump_stable()))
+        # ★ 重复补跑时这份 PDF 可能已在 UC 缓存里（上一轮分享过、pull 失败），
+        #   before/after 对比等不到「新」文件——回退取缓存里最新的一份。
+        remote = _latest_uc_pdf()
+    if remote is None:
+        raise FlowMismatch(step, "UC 缓存里没有 PDF（分享链路可能没走通）", phone.texts(phone.dump_stable()))
 
     local = Path(tempfile.mkdtemp(prefix="boss_resume_")) / (filename or Path(remote).name)
-    phone.adb("pull", remote, str(local))
+    # ★ 中文文件名不能进 adb 命令行（Windows adb 按 ANSI 转码，远端 UTF-8 收到
+    #   乱码、stat 不到：2026-10-20 实测 `failed to stat remote object`）。
+    #   让远端 shell 自己 `ls -t` 找到最新 PDF、拷成 ASCII 名，再 pull ASCII 路径。
+    tmp = "/sdcard/boss_resume_tmp.pdf"
+    out = phone.shell(
+        f"cd {UC_CACHE_DIR} && f=$(ls -t *.pdf 2>/dev/null | head -1) && "
+        f"cp \"$f\" {tmp} && stat -c %s {tmp}"
+    )
+    if not (out or "").strip().isdigit():
+        raise FlowMismatch(step, f"远端拷贝最新 PDF 失败：{out!r}", phone.texts(phone.dump_stable()))
+    try:
+        phone.adb("pull", tmp, str(local))
+    finally:
+        phone.shell(f"rm -f {tmp}")
     data = local.read_bytes()
     if not data.startswith(b"%PDF"):
         raise FlowMismatch(step, f"拉下来的不是 PDF（前 8 字节 {data[:8]!r}）")
@@ -1142,6 +1204,17 @@ def fetch_resume(step: str = "取简历") -> dict[str, Any]:
 def _uc_pdf_paths() -> set[str]:
     out = phone.shell(f"ls {UC_CACHE_DIR} 2>/dev/null")
     return {line.strip() for line in out.splitlines() if line.strip().lower().endswith(".pdf")}
+
+
+def _latest_uc_pdf() -> str | None:
+    """UC 缓存里最新的一份 PDF 文件名（没有则 None）。
+
+    ★ 返回值只用于判断「有没有」，**不要**再把它当参数传回 shell/adb——
+    中文文件名过 Windows adb 命令行会乱码（见 `fetch_resume` 的注释）。
+    """
+    out = phone.shell(f"ls -t {UC_CACHE_DIR}/*.pdf 2>/dev/null | head -1")
+    name = (out or "").strip()
+    return name or None
 
 
 def _wait_new_uc_pdf(before: set[str], timeout: float = 45.0) -> str | None:
