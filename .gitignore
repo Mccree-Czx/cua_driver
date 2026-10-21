@@ -46,3 +46,9 @@ agent_boss/.greeted.json
 agent_boss/.round_*.log
 agent_boss/.smoke_*.log
 agent_boss/.greet_*.log
+
+# BOSS 回填账本 + 探针/排查临时输出（含候选人姓名，不入库）
+agent_boss/.resumes.json
+.probe_*.txt
+.probe_*.xml
+.check_*.txt

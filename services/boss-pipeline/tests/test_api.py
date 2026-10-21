@@ -171,7 +171,6 @@ def _candidate_and_job(client):
 def test_ingest_attachment_stores_and_advances(client, monkeypatch):
     """★ 附件简历：存 MinIO → 写 object_key → 状态推进 resume_received → 记 interaction。"""
     monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
-    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: f"https://minio/{key}")
     _candidate_and_job(client)
 
     pdf = b"%PDF-1.4 fake resume bytes"
@@ -193,6 +192,8 @@ def test_ingest_attachment_stores_and_advances(client, monkeypatch):
     assert detail["status"] == "resume_received"
     assert detail["resume_downloaded_at"] is not None
     assert detail["minio_object_key"] == body["object_key"]
+    # ★ resume_url 是稳定相对路径（直出端点），不是 15 分钟过期的预签名 URL
+    assert detail["resume_url"] == f"/api/hr/candidates/{row['id']}/resume"
 
     # 幂等：再推一遍同一个，直接返回 skipped
     r2 = client.post("/api/ingest/attachment", json={
@@ -203,9 +204,58 @@ def test_ingest_attachment_stores_and_advances(client, monkeypatch):
     assert r2 == {"skipped": True, "object_key": body["object_key"]}
 
 
+def test_download_resume_streams_and_404s_without_key(client, monkeypatch):
+    """★ 直出端点：按 key 流式返回 PDF（链接永久有效，无预签名）；没附件 404。"""
+
+    class FakeResp:
+        headers = {"Content-Type": "application/pdf"}
+
+        def stream(self, amt):
+            yield b"%PDF-1.4 hello resume"
+
+        def close(self):
+            pass
+
+        def release_conn(self):
+            pass
+
+    monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
+    monkeypatch.setattr("app.storage.open_object", lambda key: FakeResp())
+    _candidate_and_job(client)
+    import base64
+    client.post("/api/ingest/attachment", json={
+        "boss_name": "侯怡旭", "job_title": "高级大数据开发工程师",
+        "filename": "侯怡旭-数据开发-5年.pdf",
+        "content_b64": base64.b64encode(b"%PDF-1.4 fake resume bytes").decode(),
+    })
+
+    detail = client.get("/api/hr/candidates?q=侯怡旭").json()["items"][0]
+    # detail 接口给出稳定相对路径
+    got = client.get(f"/api/hr/candidates/{detail['id']}").json()
+    assert got["resume_url"] == f"/api/hr/candidates/{detail['id']}/resume"
+
+    r = client.get(got["resume_url"])
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"].startswith("inline; filename*=UTF-8''")
+    assert b"%PDF-1.4 hello resume" in r.content
+
+    # 没收到附件 → 404
+    client.post("/api/ingest/candidates", json=[{
+        "boss_key": "无附件｜北京擎天创世科技·数据开发", "name": "无附件",
+        "job_title": "高级大数据开发工程师",
+        "job_and_company": "北京擎天创世科技·数据开发",
+        "work_year": "5年", "degree": "本科", "age": "28岁",
+        "description": "数据开发", "expect_salary": "15-17K",
+    }])
+    nores = client.get("/api/hr/candidates?q=无附件").json()["items"][0]
+    assert nores["minio_object_key"] is None
+    assert client.get(f"/api/hr/candidates/{nores['id']}").json()["resume_url"] is None
+    assert client.get(f"/api/hr/candidates/{nores['id']}/resume").status_code == 404
+
+
 def test_ingest_attachment_rejects_non_pdf(client, monkeypatch):
     monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
-    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: None)
     _candidate_and_job(client)
     import base64
     r = client.post("/api/ingest/attachment", json={
@@ -218,7 +268,6 @@ def test_ingest_attachment_rejects_non_pdf(client, monkeypatch):
 
 def test_ingest_attachment_unknown_candidate_is_404(client, monkeypatch):
     monkeypatch.setattr("app.storage.put_object", lambda key, raw, **kw: key)
-    monkeypatch.setattr("app.storage.presigned_get_url", lambda key, **kw: None)
     _candidate_and_job(client)
     import base64
     r = client.post("/api/ingest/attachment", json={

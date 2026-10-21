@@ -14,9 +14,12 @@ from io import BytesIO
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from minio.error import S3Error
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from urllib.parse import quote
 
 from hr_workbuddy import CandidateStatus
 
@@ -166,8 +169,10 @@ def get_candidate(jc_id: int, session: SessionDep) -> dict[str, Any]:
     out = _jc_out(jc)
     out["description"] = jc.candidate.description if jc.candidate else None
     out["company_history"] = (jc.candidate.company_history or []) if jc.candidate else []
-    # 附件简历的预签名链接（只有收到简历才有；15 分钟有效）
-    out["resume_url"] = storage.presigned_get_url(jc.minio_object_key)
+    # 附件简历：稳定的相对下载路径（boss-console 的 next 反代 /api/* 到本服务）。
+    # ★ 预签名 URL 15 分钟过期，改直出端点（下面 /candidates/{jc_id}/resume）——
+    #   链接永久有效，桶保持私有。
+    out["resume_url"] = f"/api/hr/candidates/{jc_id}/resume" if jc.minio_object_key else None
     # 系统动作流水（不是聊天记录——聊天在 /conversations 那边）
     out["interactions"] = [
         {"direction": i.direction, "msg_type": i.msg_type, "content": i.content,
@@ -186,6 +191,44 @@ def get_candidate(jc_id: int, session: SessionDep) -> dict[str, Any]:
     ]
     out["conversations"] = _candidate_conversations(session, jc.candidate_id)
     return out
+
+
+@router.get("/candidates/{jc_id}/resume")
+def download_resume(jc_id: int, session: SessionDep) -> StreamingResponse:
+    """附件简历 PDF 直出——无预签名、链接永久有效。
+
+    get_candidate 返回的 resume_url 指向这里（相对路径，经 boss-console
+    反代）；桶保持私有，MinIO 凭证不出内网。没收到附件 → 404。
+    """
+    jc = session.get(models.JobCandidate, jc_id)
+    if jc is None:
+        raise HTTPException(404, "没有这条候选人记录")
+    key = jc.minio_object_key
+    if not key:
+        raise HTTPException(404, "还没收到附件简历")
+    s = get_settings()
+    try:
+        resp = storage.open_object(key)
+    except S3Error as exc:
+        if exc.code == "NoSuchKey":
+            raise HTTPException(404, "对象不存在（可能已清理）") from exc
+        raise HTTPException(502, f"对象存储不可用：{exc.code}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"对象存储不可用：{exc.__class__.__name__}: {exc}") from exc
+    filename = key.rsplit("/", 1)[-1]
+
+    def stream():
+        try:
+            yield from resp.stream(64 * 1024)
+        finally:
+            resp.close()
+            resp.release_conn()
+
+    return StreamingResponse(
+        stream(),
+        media_type=resp.headers.get("Content-Type") or "application/pdf",
+        headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 @router.get("/storage-health")

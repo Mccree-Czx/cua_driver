@@ -47,7 +47,7 @@ type Row = {
 type Detail = Row & {
   description: string | null;
   company_history: string[];
-  /** 附件简历的预签名 MinIO 链接（15 分钟有效）；没收到是 null */
+  /** 附件简历的稳定下载链接（pipeline 直出，永久有效）；没收到是 null */
   resume_url: string | null;
   resume_downloaded_at: string | null;
   /** 系统动作流水 —— **我们对候选人做了什么** */
@@ -104,13 +104,14 @@ function ChatTab({ conversations }: { conversations: Detail["conversations"] }) 
 }
 
 /**
- * 「附件简历」链接：有预签名 URL 就渲染可点击链接，没有就显示「未收到附件」。
+ * 「附件简历」链接：收到附件就渲染可点击链接（pipeline 直出，永久有效），
+ * 没有就显示「未收到附件」。
  * 「基本信息」Tab（默认展开）和「简历资料」Tab 共用，保证两处渲染一致。
  */
 function ResumeLink({ resumeUrl }: { resumeUrl: string | null }) {
   return resumeUrl ? (
     <a href={resumeUrl} target="_blank" rel="noreferrer" style={{ color: "var(--brand-orange)" }}>
-      打开简历 PDF（预签名，15 分钟有效）
+      打开简历 PDF
     </a>
   ) : (
     <span className="muted">未收到附件</span>

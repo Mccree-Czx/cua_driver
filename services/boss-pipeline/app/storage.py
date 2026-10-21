@@ -3,7 +3,7 @@
 复用 197 上同一个 MinIO 实例，但 **bucket 与猎聘分开**（`boss-workbuddy`
 vs `hr-workbuddy`）——理由和数据库分开一样：一次敲错名字就会盖掉对方的对象。
 
-只做三件事：确保 bucket、放对象、签发预签名 URL。
+只做四件事：确保 bucket、放对象、取对象流、签发预签名 URL。
 """
 
 from __future__ import annotations
@@ -44,6 +44,17 @@ def put_object(key: str, data: bytes, content_type: str = "application/pdf") -> 
     client().put_object(s.minio_bucket, key, BytesIO(data), len(data),
                         content_type=content_type)
     return key
+
+
+def open_object(key: str):
+    """对象键 → get_object 响应流（调用方负责 close/release_conn）。
+
+    失败原样抛出——用于直出端点（`/api/hr/candidates/{id}/resume`），
+    那里要把 NoSuchKey 翻译成 404。预签名 URL 15 分钟过期、且把
+    MinIO 凭证的信任边界扩到了浏览器里，直出端点两者都避免。
+    """
+    s = get_settings()
+    return client().get_object(s.minio_bucket, key)
 
 
 def presigned_get_url(key: str, minutes: int = 15) -> str | None:
