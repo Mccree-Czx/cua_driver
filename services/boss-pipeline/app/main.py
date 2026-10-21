@@ -13,6 +13,7 @@
   一次敲错命令的 `systemctl restart` 就会打到另一套。
 """
 
+import logging
 from pathlib import Path
 
 from alembic import command
@@ -20,6 +21,8 @@ from alembic.config import Config
 from fastapi import FastAPI
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
 
@@ -33,6 +36,11 @@ def run_migrations() -> None:
 
 
 settings = get_settings()
+if not (settings.minio_access_key and settings.minio_secret_key):
+    logger.warning(
+        "MinIO 凭证未配置——附件上传会 502、简历链接会消失。"
+        "补 MINIO_ACCESS_KEY / MINIO_SECRET_KEY 后重启。"
+    )
 run_migrations()
 
 app = FastAPI(title="BOSS 招聘 控制面", version="0.1.0")

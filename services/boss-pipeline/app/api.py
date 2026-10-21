@@ -486,7 +486,14 @@ def ingest_attachment(item: AttachmentIn, session: SessionDep) -> dict[str, Any]
         return {"skipped": True, "object_key": jc.minio_object_key}
 
     key = f"resumes/{jc.job_id}/{jc.candidate_id}/{item.filename}"
-    storage.put_object(key, raw)
+    try:
+        storage.put_object(key, raw)
+    except Exception as exc:  # noqa: BLE001
+        # 盲 500 变可读 502：MinIO 凭证/网络问题一眼可见（detail 会进执行端日志）。
+        raise HTTPException(
+            status_code=502,
+            detail=f"对象存储不可用（上传失败）：{exc.__class__.__name__}: {exc}",
+        ) from exc
     jc.minio_object_key = key
 
     ctx = TransitionContext(source="inbound") if jc.status == "new" else None

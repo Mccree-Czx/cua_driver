@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from io import BytesIO
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session
 from hr_workbuddy import CandidateStatus
 
 from app import hr_tools, keys, models, storage
+from app.config import get_settings
 from app.deps import get_session
 from app.state_machine import InvalidTransition, StateEvent, TransitionContext
 
@@ -184,6 +186,42 @@ def get_candidate(jc_id: int, session: SessionDep) -> dict[str, Any]:
     ]
     out["conversations"] = _candidate_conversations(session, jc.candidate_id)
     return out
+
+
+@router.get("/storage-health")
+def storage_health() -> dict[str, Any]:
+    """MinIO 连通/凭证/读写全链路自检（无鉴权，浏览器直开）。
+
+    ok=False 时 detail.error 说明原因——服务端存储类故障不用 SSH 排障。
+    与 ingest_attachment 走同一个 storage.client()，结论等价。
+    """
+    s = get_settings()
+    detail: dict[str, Any] = {
+        "endpoint": s.minio_endpoint,
+        "bucket": s.minio_bucket,
+        "access_key_set": bool(s.minio_access_key),
+        "secret_key_set": bool(s.minio_secret_key),
+    }
+    if not (s.minio_access_key and s.minio_secret_key):
+        detail["error"] = "凭证未配置（MINIO_ACCESS_KEY / MINIO_SECRET_KEY 为空）"
+        return {"ok": False, "detail": detail}
+    try:
+        c = storage.client()
+        detail["bucket_exists"] = c.bucket_exists(s.minio_bucket)
+        key = "healthcheck/pipeline-ping.txt"
+        c.put_object(s.minio_bucket, key, BytesIO(b"ok"), 2, content_type="text/plain")
+        resp = c.get_object(s.minio_bucket, key)
+        try:
+            read_ok = resp.read() == b"ok"
+        finally:
+            resp.close()
+            resp.release_conn()
+        c.remove_object(s.minio_bucket, key)
+        detail["put_get_delete"] = read_ok
+        return {"ok": True, "detail": detail}
+    except Exception as exc:  # noqa: BLE001
+        detail["error"] = f"{exc.__class__.__name__}: {exc}"
+        return {"ok": False, "detail": detail}
 
 
 def _candidate_conversations(session: Session, candidate_id: int | None) -> list[dict[str, Any]]:

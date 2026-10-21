@@ -8,6 +8,7 @@ vs `hr-workbuddy`）——理由和数据库分开一样：一次敲错名字就
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from functools import lru_cache
 from io import BytesIO
@@ -15,6 +16,8 @@ from io import BytesIO
 from minio import Minio
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache
@@ -51,5 +54,7 @@ def presigned_get_url(key: str, minutes: int = 15) -> str | None:
         s = get_settings()
         return client().presigned_get_object(s.minio_bucket, key,
                                              expires=timedelta(minutes=minutes))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("presigned_get_url 失败 key=%s：%s: %s",
+                       key, exc.__class__.__name__, exc)
         return None
