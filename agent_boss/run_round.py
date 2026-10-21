@@ -903,6 +903,10 @@ def resume_work(approve: bool = True) -> int:
         for c in convs
         if c["name"] in pending or _ATTACH_PREVIEW_RE.search(c.get("last_msg") or "")
     ]
+    # ★ 服务端账本里的人排前面：预览正则兜底会把「聊天里提过简历、其实没附件」
+    #   的会话也圈进来（2026-10-21 实测 71 个 vs 账本 37 个），不排序的话
+    #   RESUME_CAP 的额度会被排在前面的人吃光，真正有卡片的永远轮不到。
+    delivered.sort(key=lambda x: x[0] not in pending)
     log(f"  扫描 {len(convs)} 个会话：附件 offer {len(offers)}，待归档 {len(delivered)}"
         + (f"（服务端待归档 {len(pending)} 人）" if pending else ""))
     if pending:
@@ -928,14 +932,19 @@ def resume_work(approve: bool = True) -> int:
 
     book = _load_resumes()
     saved = 0
+    # ★ 先按 book 过滤再切片：上一轮判定「没卡片」/已归档的 (name, preview) 组合
+    #   要跳过，让 CAP 额度落到还没处理过的人头上（2026-10-21 实测：不跳的话
+    #   三轮 CAP 全被「聊天里提过简历、没附件」的人吃光，归档 0 份）。
+    todo = [
+        (name, preview) for name, preview in delivered
+        if f"{name}｜{preview}" not in book
+    ]
     # ★ 上传 500 = 服务端 MinIO 凭证没配好——此时后续每份 fetch（2–5 分钟）都是
     #   白跑（PDF 落到临时目录即弃）。第一份失败后本轮短路，凭证修好后下一轮自动恢复。
     storage_dead = False
-    for name, preview in delivered[:RESUME_CAP]:
+    for name, preview in todo[:RESUME_CAP]:
         if storage_dead:
             break
-        if f"{name}｜{preview}" in book:
-            continue
         # ★ fetch_resume 走「分享到 UC→等 PDF」链路，doc 类附件拉不下来；
         #   预览里明说 docx/doc 的就不白开一次会话了，直接转人工。
         if re.search(r"\.(docx?|wps)\b", preview, re.IGNORECASE) and ".pdf" not in preview.lower():
@@ -948,6 +957,13 @@ def resume_work(approve: bool = True) -> int:
             # ★ RuntimeError（AdbError 等）也要接住——单份简历失败不该炸穿整轮补跑
             #   （2026-10-20 实测：pull 中文名失败把后面几份也带崩了）。
             log(f"  取「{name}」的简历失败：{exc}")
+            # ★ 「聊天页没有附件简历卡片」= 服务端状态污染（这个人根本没收到附件），
+            #   记进 book 让后续轮次跳过，把额度让给真能拉的人。
+            if isinstance(exc, flows.FlowMismatch) and "没有「附件简历」卡片" in str(exc):
+                book[f"{name}｜{preview}"] = {
+                    "no_card": True, "at": datetime.now().isoformat(timespec="seconds"),
+                }
+                _save_resumes(book)
             continue
         finally:
             # ★ fetch_resume 会「分享到 UC」——结束时手机常留在 UC 浏览器里，
@@ -970,6 +986,9 @@ def resume_work(approve: bool = True) -> int:
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "size": got["size"],
             }
+            # ★ 已归档的组合也按「预览键」记一笔：预览兜底还会把人圈进 delivered，
+            #   不记的话下一轮又白拉一遍（ingest 幂等兜底，但每份 2–5 分钟）。
+            book[f"{name}｜{preview}"] = {"uploaded": got["filename"]}
             _save_resumes(book)
             saved += 1
             log(f"  ✅ 已归档「{name}」的简历：{got['filename']}（{got['size']} 字节）")
