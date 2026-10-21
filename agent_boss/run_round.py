@@ -811,20 +811,20 @@ def greet_candidates(collected: list[tuple[str, str]]) -> int:
 def _back_to_main() -> None:
     """退回 BOSS 主界面（MainActivity）。
 
-    ★ 普通页面按 BACK 就退；但「分享到 UC」后手机会留在 UC 浏览器里，
-      那里的 BACK 是网页后退、永远退不回 BOSS——这时 monkey 把 BOSS
-      拉回前台（可能停在聊天页），再按几下 BACK 回主界面。纯导航无触达。
+    ★ 「分享到 UC」后手机会留在 UC 浏览器里，那里的 BACK 是网页后退、
+      永远退不回 BOSS；反复拉回还容易把 UC 逼出「无响应」ANR 弹窗。
+      通用 ensure_main_tabs 先清 ANR 弹窗，再 home+open_app 把 BOSS
+      拉回前台、按底部 tab 的 rid 判定主界面——比「盲按 BACK」确定。
+      纯导航无触达。
     """
-    for _ in range(6):
-        if phone.current_activity().endswith("MainActivity"):
-            return
-        phone.back()
+    result = flows.ensure_main_tabs()
+    if result.get("ok"):
+        return
+    # 一次没退成（UC 还没被释放等）→ open_app 直接拉回再试一次
     phone.open_app(flows.PKG)
-    for _ in range(6):
-        if phone.current_activity().endswith("MainActivity"):
-            return
-        phone.back()
-    log(f"  （退不回主界面，当前 {phone.current_activity()}）")
+    result = flows.ensure_main_tabs()
+    if not result.get("ok"):
+        log(f"  （退不回主界面，屏上：{result.get('seen', [])}）")
 
 
 def _load_resumes() -> dict:

@@ -101,8 +101,32 @@ def _locate_tabs(xml: str) -> list[str]:
     return [rid for rid in MAIN_TAB_RIDS if find_rid(xml, rid)]
 
 
+#: UC 下载简历后常 ANR（2026-10-21 真机实测），系统弹窗浮在一切 App 之上：
+#: BACK 无效、dump 里看不到 BOSS 底部 tab，整轮扫描被跳过。「等待」是唯一
+#: 不杀 UC 的选项（下载链路还要靠 UC 缓存）；「关闭应用」会断链路——所以只点
+#: 「等待」。锚点依据见 boss_map.json「系统弹窗」段。
+_ANR_TITLE = "无响应"
+_ANR_WAIT = "等待"
+
+
 def ensure_main_tabs(package: str = PKG, max_back: int = 5, settle: float = 6.0) -> dict:
-    """退到 BOSS 的主界面（按 rid 判定，理由见 MAIN_TAB_RIDS 的注释）。"""
+    """退到 BOSS 的主界面（按 rid 判定，理由见 MAIN_TAB_RIDS 的注释）。
+
+    ★ 进通用退主流程前先清系统级 ANR 弹窗（锚点：标题含「无响应」+ 可点的
+      「等待」）。点完重 dump 复检，最多两次；两次后仍被弹窗盖着就把
+      屏上所见如实带回去，让调用方走「附屏上所见」的 mismatch 分支。
+    """
+    for _ in range(2):
+        xml = dump()
+        if not any(_ANR_TITLE in t for t in texts(xml)):
+            break
+        wait = next((n for n in nodes(xml) if label(n) == _ANR_WAIT and n.get("clickable")), None)
+        if wait is None:
+            return {
+                "ok": False, "anr": True, "seen": texts(xml),
+                "hint": f"屏上「{_ANR_TITLE}」弹窗但找不到「{_ANR_WAIT}」按钮",
+            }
+        tap_node(wait, pause=settle)
     return _ensure_main_tabs(package, max_back=max_back, settle=settle, locate=_locate_tabs)
 
 
