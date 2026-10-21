@@ -1,7 +1,11 @@
 """boss-pipeline 配置（pydantic-settings）。
 
 默认值指向**本机**的 MySQL（自给自足的开发默认）。
-生产在 10.99.40.197 上，`DATABASE_URL` 由 systemd unit 注入。
+生产在 10.99.40.197 上，`DATABASE_URL`/MINIO 凭证等配置来自 systemd
+WorkingDirectory（/root/boss-workdir）下的 `.env`——unit 本身**只注入
+NO_PROXY**，不注入 DATABASE_URL（2026-10-21 事故确认：覆盖 .env 后服务
+以默认凭据连库崩了 77 次）。★ `.env` 里重复键不覆盖（首现生效），
+改配置要先删旧行再追加。
 
 ★ 表名/库名与猎聘刻意分开（`boss_workbuddy` vs `hr_workbuddy`）：
   两套系统同机部署，**一次敲错名字的迁移就会打到另一套**。
@@ -31,7 +35,7 @@ class Settings(BaseSettings):
     ingest_token: str = ""
 
     #: 复用猎聘的 screening 评分服务（197 上的 8001）。BOSS 打分走同一套契约。
-    #: 默认值指向本机；生产与 pipeline 一样由环境变量注入。
+    #: 默认值指向本机；生产同样来自 .env（见模块 docstring）。
     screening_url: str = "http://127.0.0.1:8001"
 
     #: 简历对象存储：**复用 197 上的 MinIO**，但 bucket 与猎聘刻意分开。

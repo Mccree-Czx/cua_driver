@@ -103,6 +103,20 @@ function ChatTab({ conversations }: { conversations: Detail["conversations"] }) 
   );
 }
 
+/**
+ * 「附件简历」链接：有预签名 URL 就渲染可点击链接，没有就显示「未收到附件」。
+ * 「基本信息」Tab（默认展开）和「简历资料」Tab 共用，保证两处渲染一致。
+ */
+function ResumeLink({ resumeUrl }: { resumeUrl: string | null }) {
+  return resumeUrl ? (
+    <a href={resumeUrl} target="_blank" rel="noreferrer" style={{ color: "var(--brand-orange)" }}>
+      打开简历 PDF（预签名，15 分钟有效）
+    </a>
+  ) : (
+    <span className="muted">未收到附件</span>
+  );
+}
+
 export default function CandidatesPage() {
   const [rows, setRows] = useState<Row[]>([]);
   const [jobs, setJobs] = useState<JobOption[]>([]);
@@ -209,7 +223,8 @@ export default function CandidatesPage() {
           key: "basic",
           label: "基本信息",
           children: (
-            <div className="detail-grid">
+            <>
+              <div className="detail-grid">
               {[
                 ["状态", statusLabel(detail.status)],
                 ["评分", detail.match_score != null ? `${detail.match_score} 星` : "—"],
@@ -226,7 +241,12 @@ export default function CandidatesPage() {
                   <div>{v}</div>
                 </div>
               ))}
-            </div>
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>附件简历</div>
+                <ResumeLink resumeUrl={detail.resume_url} />
+              </div>
+            </>
           ),
         },
         {
@@ -236,14 +256,7 @@ export default function CandidatesPage() {
             <Space direction="vertical" size="middle" style={{ width: "100%" }}>
               <div>
                 <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>附件简历</div>
-                {detail.resume_url ? (
-                  <a href={detail.resume_url} target="_blank" rel="noreferrer"
-                     style={{ color: "var(--brand-orange)" }}>
-                    打开简历 PDF（预签名，15 分钟有效）
-                  </a>
-                ) : (
-                  <span className="muted">未收到附件</span>
-                )}
+                <ResumeLink resumeUrl={detail.resume_url} />
               </div>
               <div>
                 <div className="outin-card-subtitle" style={{ marginBottom: 8 }}>自我描述</div>
