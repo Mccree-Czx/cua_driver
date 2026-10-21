@@ -82,7 +82,8 @@ INGEST_TOKEN = os.environ.get("BOSS_INGEST_TOKEN", "")
 #:   紧接着用脚本批量发消息风险太大。打开它需要显式设 `BOSS_GREET_ENABLED=1`。
 GREET_ENABLED = os.environ.get("BOSS_GREET_ENABLED", "") == "1"
 
-#: 一轮里最多打招呼多少个。★ 保守占位，不是实测值（见 services/boss-pipeline/app/config.py）。
+#: 一轮里最多打招呼多少个。★ 每轮节奏上限，日总预算由服务端
+#:   `daily_greet_cap` 管（150，平台实测：每日主动向推荐人打招呼上限）。
 GREET_CAP = int(os.environ.get("BOSS_GREET_CAP", "5"))
 
 #: 干跑开关：只走到「立即沟通」按钮前、打印将发给谁，**不点**。

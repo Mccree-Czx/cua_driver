@@ -4,7 +4,8 @@
 
 1. **评分闸门重新打开（P2）**：牛人推荐流进来的候选人先评分、
    `new → screened_pass / rejected_hard / rejected_llm`，再 `screened_pass → greeted`。
-   对方主动开口（inbound）不打分——先回应，别用打分挡人。
+   inbound 的「新招呼」在求简历前**也评分**（通过才发求简历，2026-10-20 起）；
+   对方直接发来简历的 inbound 直收仍不评分。
 2. **`new → greeted` 直连已拆掉**：`greet` 只能从 `screened_pass` 出发。
 3. **inbound 直收**（`new → resume_received`）是 BOSS 独有的边——
    对方主动发来简历、我们没求过。
@@ -159,10 +160,14 @@ def test_reject_llm_terminal():
         transition(row, StateEvent.GREET, TransitionContext(source=RECOMMENDED))
 
 
-def test_screen_is_recommended_only():
-    """★ 评分只在牛人推荐流跑，对方主动开口（inbound）不打分。"""
-    with pytest.raises(InvalidTransition):
-        transition(jc(S.NEW), StateEvent.SCREEN_PASS, TransitionContext(source=INBOUND))
+def test_screen_inbound_passes_then_request_resume():
+    """★ 2026-10-20 起 inbound 也评分：通过后**不打分挡人已过时**——
+    inbound 通过评分的下一步是求简历（greet 才是 recommended 专属，
+    见 test_greet_is_outbound_only）。"""
+    row = transition(jc(S.NEW), StateEvent.SCREEN_PASS, TransitionContext(source=INBOUND))
+    assert row.status == S.SCREENED_PASS.value
+    row = transition(row, StateEvent.REQUEST_RESUME, TransitionContext(source=INBOUND))
+    assert row.status == S.RESUME_REQUESTED.value
 
 
 def test_cannot_greet_twice():
